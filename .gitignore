@@ -32,3 +32,6 @@ Thumbs.db
 
 .superpowers/
 output/
+
+# Local release and deployment notes
+/CUSTOM_RELEASE_RUNBOOK.local.md
