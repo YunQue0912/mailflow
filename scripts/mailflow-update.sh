@@ -39,7 +39,7 @@ version="${1#v}"
   die "Version must match X.Y.Z-custom.N (without a mutable tag such as latest)."
 }
 
-for command in awk curl docker pg_restore sha256sum; do
+for command in awk curl docker sha256sum; do
   command -v "$command" >/dev/null 2>&1 || die "Required command is missing: $command"
 done
 docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required.'
@@ -83,7 +83,9 @@ install -d -m 700 "$backup_dir" "$config_backup"
 echo "Backing up PostgreSQL to $database_backup ..."
 docker exec mailflow-postgres pg_dump -U mailflow -d mailflow -Fc > "$database_backup"
 [[ -s "$database_backup" ]] || die 'PostgreSQL backup is empty.'
-pg_restore --list "$database_backup" >/dev/null || die 'PostgreSQL backup validation failed.'
+docker exec -i mailflow-postgres pg_restore --list < "$database_backup" >/dev/null || {
+  die 'PostgreSQL backup validation failed.'
+}
 sha256sum "$database_backup" > "$database_backup.sha256"
 
 cp -a docker-compose.yml .env "$config_backup/"
