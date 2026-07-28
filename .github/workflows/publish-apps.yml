@@ -157,6 +157,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Packaged Electron app is missing packages/shared/custom-release.cjs.'
           }
+          $capacitorAndroid = Join-Path $release 'win-unpacked/resources/app.asar.unpacked/node_modules/@capacitor/android'
+          if (Test-Path -LiteralPath $capacitorAndroid) {
+            throw 'Windows package must not contain Android/Gradle dependencies.'
+          }
+          $longRelativePaths = @(
+            Get-ChildItem -LiteralPath (Join-Path $release 'win-unpacked') -Recurse -Force |
+              Where-Object { $_.FullName.Substring($release.Path.Length + 1).Length -gt 190 }
+          )
+          if ($longRelativePaths.Count -gt 0) {
+            $examples = ($longRelativePaths | Select-Object -First 5 -ExpandProperty FullName) -join "`n"
+            throw "Windows package contains paths that are unsafe for legacy NSIS uninstallers:`n$examples"
+          }
           $updateConfig = Get-Content -Raw -LiteralPath (Join-Path $release 'win-unpacked/resources/app-update.yml')
           if ($updateConfig -match '(?m)^publisherName:') {
             throw 'Unsigned Windows update configuration must not contain publisherName.'

@@ -132,7 +132,38 @@
       const error = document.querySelector('#error');
 
       function installCapacitorNativeBridge() {
+        const android = window.MailFlowAndroid;
         const plugin = window.Capacitor?.Plugins?.MailFlowNative;
+        if (android?.getHost && android?.saveHost) {
+          const parseResult = (value) => {
+            if (typeof value !== 'string') return value || {};
+            try {
+              return JSON.parse(value || '{}');
+            } catch {
+              return {};
+            }
+          };
+
+          window.mailflowNative = {
+            getHost: async () => parseResult(android.getHost())?.host || null,
+            saveHost: async (host) => {
+              const result = parseResult(android.saveHost(host));
+              if (!result?.host) throw new Error('Host could not be saved.');
+              return result.host;
+            },
+            checkNotificationPermission: async () => {
+              const result = await plugin?.checkNotificationPermission?.();
+              return result?.permission || 'default';
+            },
+            requestNotificationPermission: async () => {
+              const result = await plugin?.requestNotificationPermission?.();
+              return result?.permission || 'default';
+            },
+            resetHost: async () => parseResult(android.resetHost?.()),
+          };
+          return;
+        }
+
         if (!plugin || window.mailflowNative) return;
 
         window.mailflowNative = {

@@ -6,18 +6,63 @@ final class WebNavigationPolicy {
     private WebNavigationPolicy() {}
 
     static boolean isConfiguredOrigin(String configuredHost, String candidateUrl) {
-        try {
-            URI configured = new URI(configuredHost);
-            URI candidate = new URI(candidateUrl);
-            if (!isHttp(configured) || !isHttp(candidate)) return false;
-            if (configured.getUserInfo() != null || candidate.getUserInfo() != null) return false;
-            if (configured.getHost() == null || candidate.getHost() == null) return false;
+        return isSameHttpOrigin(configuredHost, candidateUrl);
+    }
 
-            return configured.getScheme().equalsIgnoreCase(candidate.getScheme())
-                && configured.getHost().equalsIgnoreCase(candidate.getHost())
-                && effectivePort(configured) == effectivePort(candidate);
+    static boolean isInitialHostNavigation(
+        String localUrl,
+        String setupFileUrl,
+        String currentUrl,
+        String candidateUrl
+    ) {
+        if (!isHttpUrl(candidateUrl) || currentUrl == null) return false;
+        if (setupFileUrl != null && setupFileUrl.equalsIgnoreCase(stripQueryAndFragment(currentUrl))) {
+            return true;
+        }
+
+        return isSameHttpOrigin(localUrl, currentUrl) && isSetupPath(currentUrl);
+    }
+
+    static boolean isHttpUrl(String value) {
+        try {
+            URI uri = new URI(value);
+            return isHttp(uri) && uri.getUserInfo() == null && uri.getHost() != null;
         } catch (Exception ignored) {
             return false;
+        }
+    }
+
+    private static boolean isSameHttpOrigin(String firstUrl, String secondUrl) {
+        try {
+            URI first = new URI(firstUrl);
+            URI second = new URI(secondUrl);
+            if (!isHttp(first) || !isHttp(second)) return false;
+            if (first.getUserInfo() != null || second.getUserInfo() != null) return false;
+            if (first.getHost() == null || second.getHost() == null) return false;
+
+            return first.getScheme().equalsIgnoreCase(second.getScheme())
+                && first.getHost().equalsIgnoreCase(second.getHost())
+                && effectivePort(first) == effectivePort(second);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isSetupPath(String value) {
+        try {
+            String path = new URI(value).getPath();
+            return path == null || path.isEmpty() || "/".equals(path) || "/index.html".equalsIgnoreCase(path);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static String stripQueryAndFragment(String value) {
+        try {
+            URI uri = new URI(value);
+            return new URI(uri.getScheme(), uri.getAuthority(), uri.getPath(), null, null).toString();
+        } catch (Exception ignored) {
+            return value;
         }
     }
 

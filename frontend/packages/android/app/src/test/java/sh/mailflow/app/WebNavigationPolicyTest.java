@@ -37,4 +37,36 @@ public class WebNavigationPolicyTest {
             "https://user@mail.genoric.com/inbox"
         ));
     }
+
+    @Test
+    public void allowsInitialHostNavigationFromSetupPage() {
+        assertTrue(WebNavigationPolicy.isInitialHostNavigation(
+            "https://localhost",
+            "file:///android_asset/public/index.html",
+            "https://localhost/",
+            "https://mail.genoric.com/login"
+        ));
+        assertTrue(WebNavigationPolicy.isInitialHostNavigation(
+            "https://localhost",
+            "file:///android_asset/public/index.html",
+            "file:///android_asset/public/index.html?fresh=1",
+            "https://mail.genoric.com"
+        ));
+    }
+
+    @Test
+    public void rejectsInitialNavigationOutsideSetupPageOrToUnsafeSchemes() {
+        assertFalse(WebNavigationPolicy.isInitialHostNavigation(
+            "https://localhost",
+            "file:///android_asset/public/index.html",
+            "https://mail.genoric.com/settings",
+            "https://external.example.com"
+        ));
+        assertFalse(WebNavigationPolicy.isInitialHostNavigation(
+            "https://localhost",
+            "file:///android_asset/public/index.html",
+            "https://localhost/",
+            "javascript:alert(1)"
+        ));
+    }
 }

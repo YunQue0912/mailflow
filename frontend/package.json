@@ -1,7 +1,7 @@
 {
   "name": "mailflow-frontend",
   "productName": "MailFlow",
-  "version": "2.8.0-custom.5",
+  "version": "2.8.0-custom.6",
   "description": "A self-hosted, unified webmail client.",
   "homepage": "https://mailflow.sh",
   "author": {
@@ -60,6 +60,7 @@
       "packages/electron/**/*",
       "packages/native-shell/**/*",
       "packages/shared/custom-release.cjs",
+      "!node_modules/@capacitor/android/**/*",
       "package.json"
     ],
     "win": {

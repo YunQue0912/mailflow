@@ -15,6 +15,11 @@ test('runs the Android Gradle wrapper without relying on executable file mode', 
   assert.doesNotMatch(workflow, /^\s+\.\/gradlew test lint assembleRelease bundleRelease$/m);
 });
 
+test('rejects Windows packages containing Android dependencies or unsafe paths', () => {
+  assert.match(workflow, /Windows package must not contain Android\/Gradle dependencies/);
+  assert.match(workflow, /unsafe for legacy NSIS uninstallers/);
+});
+
 test('parses and validates the Android signing certificate across apksigner versions', () => {
   assert.match(workflow, /grep -im1 'certificate SHA-256 digest:'/);
   assert.ok(workflow.includes("sed 's/^.*: //'"));

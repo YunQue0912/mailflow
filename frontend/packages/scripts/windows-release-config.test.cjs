@@ -6,6 +6,10 @@ const path = require('path');
 const test = require('node:test');
 
 const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'));
+const installerInclude = fs.readFileSync(
+  path.join(__dirname, '..', 'electron', 'installer.nsh'),
+  'utf8',
+);
 
 test('keeps Windows packaging explicitly unsigned', () => {
   assert.equal(packageJson.build?.win?.forceCodeSigning, false);
@@ -23,4 +27,11 @@ test('does not inject a Windows publisher into app-update.yml', () => {
 
 test('packages the shared release parser required by the Electron updater', () => {
   assert.ok(packageJson.build?.files?.includes('packages/shared/custom-release.cjs'));
+});
+
+test('excludes Android build files and repairs legacy long-path installations', () => {
+  assert.ok(packageJson.build?.files?.includes('!node_modules/@capacitor/android/**/*'));
+  assert.match(installerInclude, /!macro customInit/);
+  assert.match(installerInclude, /@capacitor\\android\\capacitor\\build/);
+  assert.match(installerInclude, /RD \/S \/Q "\\\\\?\\\$R8"/);
 });

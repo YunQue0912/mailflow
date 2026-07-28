@@ -12,13 +12,16 @@ import com.getcapacitor.Bridge;
 import com.getcapacitor.BridgeWebViewClient;
 
 public class MailFlowWebViewClient extends BridgeWebViewClient {
+    private static final String SETUP_URL = "file:///android_asset/public/index.html";
     private static final String FALLBACK_URL = "file:///android_asset/public/host-unavailable.html";
     private final Context context;
+    private final String localUrl;
     private boolean loadingFallback = false;
 
     public MailFlowWebViewClient(Bridge bridge, Context context) {
         super(bridge);
         this.context = context.getApplicationContext();
+        this.localUrl = bridge.getLocalUrl();
     }
 
     @Override
@@ -26,7 +29,7 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
         Uri uri = request == null ? null : request.getUrl();
         if (request != null && request.isForMainFrame() && uri != null) {
             String url = uri.toString();
-            if (isConfiguredHost(url)) return false;
+            if (shouldStayInWebView(view, url)) return false;
             if (openExternallyIfNeeded(url)) return true;
         }
 
@@ -35,7 +38,7 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
 
     @Override
     public boolean shouldOverrideUrlLoading(WebView view, String url) {
-        if (isConfiguredHost(url)) return false;
+        if (shouldStayInWebView(view, url)) return false;
         if (openExternallyIfNeeded(url)) {
             return true;
         }
@@ -86,6 +89,19 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
     private boolean isConfiguredHost(String url) {
         String host = MailFlowNativePlugin.getSavedHost(context);
         return WebNavigationPolicy.isConfiguredOrigin(host, url);
+    }
+
+    private boolean shouldStayInWebView(WebView view, String url) {
+        if (isConfiguredHost(url)) return true;
+
+        String currentUrl = view == null ? null : view.getUrl();
+        if (!WebNavigationPolicy.isInitialHostNavigation(localUrl, SETUP_URL, currentUrl, url)) {
+            return false;
+        }
+
+        // Fallback for setup pages whose asynchronous Capacitor bridge did not
+        // finish saving before location.replace() started navigation.
+        return MailFlowNativePlugin.saveHost(context, url) != null;
     }
 
     private boolean openExternallyIfNeeded(String url) {

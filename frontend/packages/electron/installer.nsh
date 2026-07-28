@@ -1,3 +1,17 @@
+!macro customInit
+  # Some local/custom builds accidentally bundled Android Gradle intermediates
+  # below app.asar.unpacked. Their paths can exceed the legacy NSIS MAX_PATH
+  # limit, causing the old uninstaller to return error code 2 before an update.
+  # Remove only that known, unused build directory using the Win32 long-path
+  # prefix before electron-builder invokes the old uninstaller.
+  StrCpy $R8 "$INSTDIR\resources\app.asar.unpacked\node_modules\@capacitor\android\capacitor\build"
+  ${If} ${FileExists} "$R8\*.*"
+    DetailPrint "Removing legacy Android build files from the Windows installation..."
+    nsExec::ExecToLog '"$SYSDIR\cmd.exe" /D /C RD /S /Q "\\?\$R8"'
+    Pop $R9
+  ${EndIf}
+!macroend
+
 !macro customInstall
   WriteRegStr SHCTX "Software\RegisteredApplications" "MailFlow" "Software\Clients\Mail\MailFlow\Capabilities"
 

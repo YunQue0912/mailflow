@@ -113,14 +113,13 @@ public class MailFlowNativePlugin extends Plugin {
     @PluginMethod
     public void saveHost(PluginCall call) {
         String host = call.getString("host", "");
-        String normalizedHost = normalizeHost(host);
+        String normalizedHost = saveHost(getContext(), host);
 
         if (normalizedHost == null) {
             call.reject("Host must start with https:// or http://");
             return;
         }
 
-        getPrefs(getContext()).edit().putString(PREF_HOST, normalizedHost).apply();
         MailFlowBackgroundSync.schedule(getContext());
 
         JSObject result = new JSObject();
@@ -511,6 +510,17 @@ public class MailFlowNativePlugin extends Plugin {
 
     static String getSavedHost(Context context) {
         return getPrefs(context).getString(PREF_HOST, null);
+    }
+
+    static String saveHost(Context context, String host) {
+        String normalizedHost = normalizeHost(host);
+        if (normalizedHost == null) return null;
+
+        // The WebView can navigate as soon as this method returns. Persist the
+        // origin synchronously so the navigation policy sees it immediately.
+        return getPrefs(context).edit().putString(PREF_HOST, normalizedHost).commit()
+            ? normalizedHost
+            : null;
     }
 
     static void injectPendingActions(WebView webView, Context context) {
@@ -1493,6 +1503,30 @@ public class MailFlowNativePlugin extends Plugin {
 
         private MailFlowNativePlugin getNativePlugin() {
             return nativePlugin != null ? nativePlugin : instance;
+        }
+
+        @JavascriptInterface
+        public String getHost() {
+            JSObject result = new JSObject();
+            result.put("host", getSavedHost(context));
+            return result.toString();
+        }
+
+        @JavascriptInterface
+        public String saveHost(String host) {
+            String normalizedHost = MailFlowNativePlugin.saveHost(context, host);
+            JSObject result = new JSObject();
+            result.put("host", normalizedHost);
+            if (normalizedHost == null) result.put("error", "invalid-host");
+            return result.toString();
+        }
+
+        @JavascriptInterface
+        public String resetHost() {
+            boolean removed = getPrefs(context).edit().remove(PREF_HOST).commit();
+            JSObject result = new JSObject();
+            result.put("reset", removed);
+            return result.toString();
         }
 
         @JavascriptInterface
