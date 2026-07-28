@@ -91,7 +91,11 @@ public class MailFlowNativePlugin extends Plugin {
     private final AtomicBoolean updateDownloadStarted = new AtomicBoolean(false);
     private boolean installPendingPermission = false;
     private final AtomicBoolean cancelUpdateDownload = new AtomicBoolean(false);
-    private JSObject lastUpdateStatus = updateStatus("idle");
+    // Capacitor constructs the plugin before attaching its Bridge. Any field
+    // initializer that calls getContext() makes reflection-based registration
+    // fail and leaves every native update action unavailable. load() initializes
+    // this state after the Bridge has been attached.
+    private volatile JSObject lastUpdateStatus = null;
 
     @Override
     public void load() {
@@ -1487,22 +1491,29 @@ public class MailFlowNativePlugin extends Plugin {
         return result;
     }
 
+    public interface NativePluginProvider {
+        MailFlowNativePlugin get();
+    }
+
     public static class NotificationBridge {
         private final Context context;
-        private final MailFlowNativePlugin nativePlugin;
+        private final NativePluginProvider nativePluginProvider;
 
         NotificationBridge(Context context) {
             this(context, null);
         }
 
-        NotificationBridge(Context context, MailFlowNativePlugin nativePlugin) {
+        NotificationBridge(Context context, NativePluginProvider nativePluginProvider) {
             this.context = context.getApplicationContext();
-            this.nativePlugin = nativePlugin;
+            this.nativePluginProvider = nativePluginProvider;
             createNotificationChannel(this.context);
         }
 
         private MailFlowNativePlugin getNativePlugin() {
-            return nativePlugin != null ? nativePlugin : instance;
+            MailFlowNativePlugin plugin = nativePluginProvider == null
+                ? null
+                : nativePluginProvider.get();
+            return plugin != null ? plugin : instance;
         }
 
         @JavascriptInterface
