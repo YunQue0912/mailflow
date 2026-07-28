@@ -8,14 +8,17 @@ import android.webkit.CookieManager;
 import android.webkit.WebView;
 import androidx.activity.OnBackPressedCallback;
 import com.getcapacitor.BridgeActivity;
-import com.getcapacitor.PluginHandle;
 
 public class MainActivity extends BridgeActivity {
+    private final MailFlowNativePlugin nativePlugin = new MailFlowNativePlugin();
     private String lastHandledIntentKey = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        registerPlugin(MailFlowNativePlugin.class);
+        // Register the exact instance used by the direct JavaScript interface.
+        // Looking it up by plugin id here is timing-sensitive on remote pages
+        // and can leave update actions unavailable while version reads work.
+        bridgeBuilder.addPluginInstance(nativePlugin);
         super.onCreate(savedInstanceState);
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -26,11 +29,6 @@ public class MainActivity extends BridgeActivity {
 
         if (bridge != null) {
             configureCookies();
-            PluginHandle nativePluginHandle = bridge.getPlugin("MailFlowNative");
-            MailFlowNativePlugin nativePlugin = nativePluginHandle != null
-                && nativePluginHandle.getInstance() instanceof MailFlowNativePlugin
-                ? (MailFlowNativePlugin) nativePluginHandle.getInstance()
-                : null;
             bridge.getWebView().addJavascriptInterface(
                 new MailFlowNativePlugin.NotificationBridge(this, nativePlugin),
                 "MailFlowAndroid"
