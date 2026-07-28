@@ -1262,7 +1262,13 @@
       "sourceCode": "Quellcode",
       "sponsor": "Entwicklung unterstützen",
       "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors"
+      "githubSponsors": "GitHub Sponsors",
+      "updates": {
+        "title": "App-Updates", "autoCheck": "Automatisch nach App-Updates suchen", "currentVersion": "Aktuelle Version", "latestVersion": "Neueste Version", "published": "Veröffentlicht", "size": "Downloadgröße", "notes": "Versionshinweise", "check": "Nach Updates suchen", "download": "Update herunterladen", "later": "Später", "skip": "Diese Version überspringen", "cancel": "Abbrechen", "install": "Neu starten und installieren", "installAndroid": "Installieren", "retry": "Erneut versuchen", "browser": "Im Browser herunterladen",
+        "notificationAvailableTitle": "App-Update verfügbar", "notificationAvailableBody": "MailFlow {{version}} kann heruntergeladen werden.", "notificationReadyTitle": "Update bereit", "notificationReadyBody": "MailFlow {{version}} kann installiert werden.", "notificationErrorTitle": "Update-Prüfung fehlgeschlagen", "notificationInstallErrorTitle": "Installation fehlgeschlagen", "notificationInstallErrorBody": "Das geprüfte Update konnte nicht installiert werden.",
+        "status": { "idle": "Bereit zur Update-Prüfung.", "checking": "Updates werden gesucht...", "up-to-date": "Die App ist aktuell.", "available": "Eine neuere signierte Version ist verfügbar.", "downloading": "Update wird heruntergeladen und geprüft...", "downloaded": "Das Update ist geprüft und installationsbereit.", "installing": "Neustart zur Installation...", "error": "Das Update konnte nicht vorbereitet werden.", "skipped": "Diese Version wird übersprungen. Eine neuere Version wird automatisch angezeigt.", "deferred": "Dieses Update wird morgen erneut angeboten." },
+        "errors": { "genericError": "Der Update-Dienst ist vorübergehend nicht verfügbar.", "downloadError": "Das Update konnte nicht heruntergeladen oder geprüft werden.", "verificationError": "Das Paket hat die Sicherheitsprüfung nicht bestanden.", "invalidRelease": "Die neueste Version hat keine gültige Custom-Versionsnummer.", "packagedOnly": "Update-Prüfungen sind in der installierten App verfügbar." }
+      }
     },
     "rules": {
       "conditionLogicOr": "eine Bedingung (ODER)",

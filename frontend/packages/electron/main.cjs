@@ -1,19 +1,13 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, shell, dialog, Notification, session } = require('electron');
+const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, shell, Notification, session } = require('electron');
 const { execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const { createNativeUpdater } = require('./native-updater.cjs');
 
 const CONFIG_FILE = 'mailflow-host.json';
-const UPDATE_STATUS_CHANNEL = 'mailflow:updates:status';
-const UPDATE_RELEASE_URL = 'https://api.github.com/repos/maathimself/mailflow/releases/latest';
-
-/* Old dev fork url
-const UPDATE_RELEASE_URL = 'https://api.github.com/repos/dcoffin88/mailflow/releases/latest';
-*/
-
-const UPDATE_ERROR_MESSAGE = 'Could not check for MailFlow updates. Please visit the website instead.';
+const UPDATE_RELEASE_URL = 'https://api.github.com/repos/YunQue0912/mailflow/releases/latest';
 const NATIVE_ACTION_CHANNEL = 'mailflow:native-action';
 const NATIVE_ACTION_ARG = '--mailflow-action=';
 const NEW_MAIL_NOTIFICATION_MAX_LENGTH = 240;
@@ -34,11 +28,8 @@ const LINUX_BADGE_DESKTOP_IDS = [
 let mainWindow;
 let tray = null;
 let isQuitting = false;
-let updateInfo = null;
-let downloadedUpdate = null;
-let pendingUpdateDownloadUrl = null;
-let updateDownloadsInitialized = false;
 let nextNativeActionId = 1;
+const nativeUpdater = createNativeUpdater({ app, shell, getWindow: () => mainWindow });
 
 function isAllowedExternalUrl(url) {
   try {
@@ -674,282 +665,16 @@ function showNewMailNotification({ title, body, count, messageId, accountId, fol
   return { shown: true };
 }
 
-function notifyCheckingUpdate(verbose) {
-  if (!verbose) return;
-
-  sendUpdateStatus({ type: 'checking' });
-  notifyUpdateStatus({
-    title: 'Checking for update',
-    message: 'Checking for new MailFlow updates.',
-  });
-}
-
-function notifyUpdateError(message = UPDATE_ERROR_MESSAGE) {
-  sendUpdateStatus({ type: 'error', message });
-  notifyUpdateStatus({
-    title: 'Update Error',
-    message,
-    type: 'negative',
-  });
-}
-
-function notifyUpToDate(verbose) {
-  if (!verbose) return;
-
-  sendUpdateStatus({ type: 'up-to-date' });
-  notifyUpdateStatus({
-    title: 'Up to date',
-    message: 'Your version of MailFlow is up to date.',
-    type: 'positive',
-  });
-}
-
-function notifyUpdateAvailable(verbose = true) {
-  sendUpdateStatus({
-    type: 'available',
-    data: {
-      releaseNotes: updateInfo.releaseNotes,
-      releaseName: updateInfo.releaseName,
-      releaseDate: updateInfo.releaseDate,
-      updateUrl: updateInfo.updateUrl,
-      manual: true,
-    },
-  });
-
-  if (!verbose) return;
-
-  notifyUpdateStatus({
-    title: 'Update Available',
-    message: 'MailFlow is downloading the newest version for you.',
-  });
-}
-
-function notifyUpdateDownloaded() {
-  sendUpdateStatus({
-    type: 'downloaded',
-    data: {
-      releaseNotes: updateInfo && updateInfo.releaseNotes,
-      releaseName: updateInfo && updateInfo.releaseName,
-      releaseDate: updateInfo && updateInfo.releaseDate,
-      updateUrl: updateInfo && updateInfo.updateUrl,
-      filePath: downloadedUpdate,
-      manual: true,
-    },
-  });
-  showInAppNotification({
-    title: 'Update Ready',
-    message: 'MailFlow downloaded the update.',
-    type: 'positive',
-    actionLabel: 'Install',
-    action: 'install-update',
-    persistent: true,
-  });
-}
-
-function filePostfix() {
-  const date = new Date();
-  return `${date.getMonth() + 1}.${date.getDate()}-${date.getHours()}.${date.getMinutes()}.${date.getSeconds()}`;
-}
-
-function getUniqueFilename(filename) {
-  const extension = path.extname(filename);
-  const file = path.basename(filename, extension);
-  return `${file} (${filePostfix()})${extension}`;
-}
-
-function setDownloadProgress(window, value) {
-  try {
-    if (!window || window.isDestroyed()) return;
-    window.setProgressBar(value);
-  } catch {
-    // Download events can outlive the BrowserWindow they started from.
-  }
-}
-
-function getLinuxTerminalCommand() {
-  return getAvailableCommand([
-    'ptyxis',
-    'kgx',
-    'gnome-terminal',
-    'konsole',
-    'xterm',
-    'x-terminal-emulator',
-  ]);
-}
-
-function getTerminalArgs(terminal, command, args = []) {
-  const shellCommand = ['sh', '-lc', 'exec "$@"', 'mailflow-installer', command, ...args];
-  if (['ptyxis', 'kgx', 'gnome-terminal'].includes(terminal)) return ['--', ...shellCommand];
-  return ['-e', ...shellCommand];
-}
-
-function launchTerminalCommand(command, args = []) {
-  const terminal = getLinuxTerminalCommand();
-  if (!terminal) {
-    throw new Error('No supported terminal was found.');
-  }
-
-  const child = spawn(terminal, getTerminalArgs(terminal, command, args), {
-    detached: true,
-    stdio: 'ignore',
-  });
-
-  child.unref();
-}
-
-function isUpdateDownloadItem(item) {
-  if (!pendingUpdateDownloadUrl && !updateInfo?.updateUrl) return false;
-
-  const expectedUrl = pendingUpdateDownloadUrl || updateInfo.updateUrl;
-  try {
-    if (item.getURL() === expectedUrl) return true;
-    if (typeof item.getURLChain === 'function' && item.getURLChain().includes(expectedUrl)) return true;
-  } catch {}
-
-  return false;
-}
-
-function initializeUpdateDownloads(window) {
-  if (updateDownloadsInitialized) return;
-  updateDownloadsInitialized = true;
-
-  window.webContents.session.on('will-download', (_event, item) => {
-    if (!isUpdateDownloadItem(item)) return;
-
-    const totalBytes = item.getTotalBytes();
-    const filePath = path.join(app.getPath('downloads'), getUniqueFilename(item.getFilename()));
-
-    item.setSavePath(filePath);
-
-    item.on('updated', () => {
-      if (totalBytes > 0) {
-        setDownloadProgress(window, item.getReceivedBytes() / totalBytes);
-      }
-    });
-
-    item.on('done', (_event, state) => {
-      setDownloadProgress(window, -1);
-
-      if (state === 'interrupted') {
-        dialog.showErrorBox('Download error', `The download of ${item.getFilename()} was interrupted.`);
-      }
-
-      if (state === 'completed') {
-        downloadedUpdate = item.getSavePath();
-        notifyUpdateDownloaded();
-      }
-
-      pendingUpdateDownloadUrl = null;
-    });
-  });
-}
-
-function downloadUpdate(url) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  pendingUpdateDownloadUrl = url;
-  mainWindow.webContents.downloadURL(url);
-}
-
 async function checkForUpdates(verbose = false) {
-  notifyCheckingUpdate(verbose);
-
-  try {
-    const release = await requestJson(UPDATE_RELEASE_URL);
-    const releaseVersion = release.tag_name || release.name;
-    const installedPackageType = getInstalledLinuxPackageType();
-    const installedVersion = getInstalledAppVersion(installedPackageType);
-    const asset = getUpdateAsset(release);
-
-    if (!isNewerVersion(releaseVersion, installedVersion)) {
-      notifyUpToDate(verbose);
-      return { updateAvailable: false };
-    }
-
-    if (!asset) {
-      notifyUpdateError('A MailFlow update is available, but no installer was found for this platform.');
-      return { updateAvailable: true, downloadAvailable: false };
-    }
-
-    updateInfo = {
-      releaseNotes: release.body || '',
-      releaseName: release.name || release.tag_name,
-      releaseDate: release.published_at,
-      updateUrl: asset.browser_download_url,
-    };
-
-    notifyUpdateAvailable(verbose);
-    downloadUpdate(asset.browser_download_url);
-    return { updateAvailable: true, downloadAvailable: true };
-  } catch (error) {
-    console.error('Update check failed:', error);
-    notifyUpdateError();
-    return { updateAvailable: false, error: error.message };
-  }
-}
-
-function launchDownloadedUpdate(updatePath) {
-  if (process.platform === 'win32' && /\.exe$/i.test(updatePath)) {
-    const child = spawn(updatePath, [], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false,
-    });
-
-    child.unref();
-    return Promise.resolve();
-  }
-
-  if (process.platform === 'linux' && /\.deb$/i.test(updatePath)) {
-    launchTerminalCommand('sudo', ['dpkg', '--install', updatePath]);
-    return Promise.resolve();
-  }
-
-  if (process.platform === 'linux' && /\.rpm$/i.test(updatePath)) {
-    const packageInstaller = getAvailableCommand(['dnf', 'dnf5', 'yum']);
-    if (!packageInstaller) {
-      throw new Error('No RPM package installer was found.');
-    }
-
-    launchTerminalCommand('sudo', [packageInstaller, 'install', updatePath]);
-    return Promise.resolve();
-  }
-
-  return shell.openPath(updatePath).then((error) => {
-    if (error) throw new Error(error);
-  });
+  return nativeUpdater.check(verbose);
 }
 
 function installDownloadedUpdate() {
-  if (!downloadedUpdate) {
-    return Promise.resolve({ installed: false, reason: 'missing-download' });
-  }
-
-  return new Promise((resolve) => {
-    fs.access(downloadedUpdate, fs.constants.F_OK, async (error) => {
-      if (error) {
-        shell.showItemInFolder(downloadedUpdate);
-        resolve({ installed: false, reason: 'missing-file' });
-        return;
-      }
-
-      try {
-        await launchDownloadedUpdate(downloadedUpdate);
-        isQuitting = true;
-        setTimeout(() => app.quit(), 500);
-        resolve({ installed: true });
-      } catch (launchError) {
-        console.error('Could not launch downloaded update:', launchError);
-        shell.showItemInFolder(downloadedUpdate);
-        notifyUpdateError('The update was downloaded, but MailFlow could not start the installer.');
-        resolve({ installed: false, reason: 'launch-failed', error: launchError.message });
-      }
-    });
-  });
+  return Promise.resolve(nativeUpdater.install());
 }
 
 function openDownloadedUpdatePath() {
-  if (!downloadedUpdate) return;
-  shell.showItemInFolder(downloadedUpdate);
+  return nativeUpdater.openDownload();
 }
 
 function isMailtoUrl(value) {
@@ -1476,7 +1201,7 @@ function createWindow() {
     refreshTrayMenu();
   });
 
-  initializeUpdateDownloads(mainWindow);
+  nativeUpdater.initialize();
 
   const host = readHost();
   if (host) {
@@ -1554,6 +1279,12 @@ ipcMain.handle('mailflow:updates:check', async (_event, { verbose } = {}) => {
   return checkForUpdates(verbose);
 });
 
+ipcMain.handle('mailflow:updates:get-state', () => nativeUpdater.getState());
+
+ipcMain.handle('mailflow:updates:download', () => nativeUpdater.download());
+
+ipcMain.handle('mailflow:updates:cancel', () => nativeUpdater.cancel());
+
 ipcMain.handle('mailflow:updates:install-downloaded', () => {
   return installDownloadedUpdate();
 });
@@ -1586,7 +1317,6 @@ if (!gotSingleInstanceLock) {
     setupTaskbarTasks();
     createTray();
     createWindow();
-    scheduleStartupUpdateCheck();
     sendNativeAction(parseNativeActionArg(process.argv));
     sendMailtoAction(parseProtocolUrlArg(process.argv));
     flushPendingProtocolUrls();

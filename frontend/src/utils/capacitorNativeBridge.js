@@ -4,6 +4,11 @@ let registerNativePlugin = null;
 let installPromise = null;
 let pluginUnavailable = false;
 
+function normalizeUpdateStatus(status) {
+  if (!status?.data || typeof status.data !== 'object') return status;
+  return { ...status, ...status.data };
+}
+
 function getPlugin() {
   if (plugin) return plugin;
   plugin = registerNativePlugin('MailFlowNative');
@@ -55,14 +60,17 @@ export async function installCapacitorNativeBridge() {
       },
       updates: {
         ...existingBridge.updates,
+        getState: async () => normalizeUpdateStatus(await callNative('getUpdateState', undefined, { type: 'idle' })),
         check: async (verbose) => callNative('checkForUpdates', { verbose }),
+        download: async () => callNative('downloadUpdate', undefined, { started: false, reason: 'unavailable' }),
+        cancel: async () => callNative('cancelUpdateDownload', undefined, { cancelled: false }),
         installDownloaded: async () => callNative('installDownloadedUpdate', undefined, { installed: false, reason: 'unavailable' }),
         installAuto: async () => callNative('installDownloadedUpdate', undefined, { installed: false, reason: 'unavailable' }),
-        openDownload: async () => callNative('openDownloadedUpdate'),
+        openDownload: async () => callNative('openUpdateInBrowser'),
         onStatus: (callback) => {
           if (pluginUnavailable) return () => {};
           const MailFlowNative = getPlugin();
-          const handlePromise = MailFlowNative.addListener('updateStatus', callback).catch(() => null);
+          const handlePromise = MailFlowNative.addListener('updateStatus', (status) => callback(normalizeUpdateStatus(status))).catch(() => null);
           return () => {
             handlePromise.then((handle) => handle?.remove?.()).catch(() => {});
           };

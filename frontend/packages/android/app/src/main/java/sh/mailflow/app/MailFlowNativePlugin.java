@@ -1,6 +1,7 @@
 package sh.mailflow.app;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -9,10 +10,11 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Environment;
 import android.provider.Settings;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
@@ -38,13 +40,15 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -70,29 +74,33 @@ public class MailFlowNativePlugin extends Plugin {
     private static final String PREF_UPDATE_APK_PATH = "update_apk_path";
     private static final String PREF_UPDATE_VERSION = "update_version";
     private static final String PREF_UPDATE_RELEASE_NAME = "update_release_name";
+    private static final String PREF_UPDATE_SHA256 = "update_sha256";
+    private static final String PREF_UPDATE_VERSION_CODE = "update_version_code";
+    private static final String PREF_LAST_UPDATE_CHECK = "last_update_check";
     private static final String SETUP_URL = "file:///android_asset/public/index.html";
-    private static final String UPDATE_RELEASE_URL = "https://api.github.com/repos/maathimself/mailflow/releases/latest";
-    
-    /* Old dev fork url
-    private static final String UPDATE_RELEASE_URL = "https://api.github.com/repos/dcoffin88/mailflow/releases/latest";
-    */
-    
-    private static final String UPDATE_ERROR_MESSAGE = "Could not check for MailFlow updates. Please visit the website instead.";
-    private static final Pattern VERSION_PATTERN = Pattern.compile("\\d+(?:\\.\\d+){0,2}");
-
+    private static final String UPDATE_RELEASE_URL = "https://api.github.com/repos/YunQue0912/mailflow/releases/latest";
+    private static final long UPDATE_CHECK_INTERVAL_MS = 24L * 60L * 60L * 1000L;
+    private static final int MAX_JSON_BYTES = 1024 * 1024;
+    private static final long MAX_APK_BYTES = 250L * 1024L * 1024L;
+    private static final int MAX_REDIRECTS = 5;
     private static final List<JSObject> pendingActions = new ArrayList<>();
     private static MailFlowNativePlugin instance;
-    private ReleaseInfo updateInfo = null;
-    private File downloadedUpdate = null;
-    private boolean updateCheckStarted = false;
+    private volatile ReleaseInfo updateInfo = null;
+    private volatile File downloadedUpdate = null;
+    private final AtomicBoolean updateCheckStarted = new AtomicBoolean(false);
+    private final AtomicBoolean updateDownloadStarted = new AtomicBoolean(false);
     private boolean installPendingPermission = false;
+    private final AtomicBoolean cancelUpdateDownload = new AtomicBoolean(false);
+    private JSObject lastUpdateStatus = updateStatus("idle");
 
     @Override
     public void load() {
         instance = this;
         createNotificationChannel(getContext());
         restoreDownloadedUpdateState();
-        checkForUpdatesInBackground(false, null);
+        lastUpdateStatus = downloadedUpdate != null && updateInfo != null
+            ? updateStatus("downloaded", updateInfo.toStatusData())
+            : updateStatus("idle");
     }
 
     @PluginMethod
@@ -142,8 +150,46 @@ public class MailFlowNativePlugin extends Plugin {
         checkForUpdatesInBackground(Boolean.TRUE.equals(call.getBoolean("verbose")), call);
     }
 
+    @PluginMethod
+    public void getUpdateState(PluginCall call) {
+        call.resolve(lastUpdateStatus);
+    }
+
+    @PluginMethod
+    public void downloadUpdate(PluginCall call) {
+        if (updateInfo == null || updateInfo.downloadUrl == null) {
+            JSObject result = new JSObject();
+            result.put("started", false);
+            result.put("reason", "not-available");
+            call.resolve(result);
+            return;
+        }
+        if (!updateDownloadStarted.compareAndSet(false, true)) {
+            JSObject result = new JSObject();
+            result.put("started", false);
+            result.put("reason", "already-downloading");
+            call.resolve(result);
+            return;
+        }
+
+        startUpdateDownload(updateInfo);
+        JSObject result = new JSObject();
+        result.put("started", true);
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void cancelUpdateDownload(PluginCall call) {
+        boolean downloading = updateDownloadStarted.get();
+        if (downloading) cancelUpdateDownload.set(true);
+        JSObject result = new JSObject();
+        result.put("cancelled", downloading);
+        call.resolve(result);
+    }
+
     private void checkForUpdatesInBackground(boolean verbose, PluginCall call) {
-        if (!verbose && updateCheckStarted) {
+        long lastCheck = getPrefs(getContext()).getLong(PREF_LAST_UPDATE_CHECK, 0L);
+        if (!verbose && System.currentTimeMillis() - lastCheck < UPDATE_CHECK_INTERVAL_MS) {
             if (call != null) {
                 JSObject result = new JSObject();
                 result.put("updateAvailable", false);
@@ -153,9 +199,20 @@ public class MailFlowNativePlugin extends Plugin {
             return;
         }
 
-        updateCheckStarted = true;
+        if (!updateCheckStarted.compareAndSet(false, true)) {
+            if (call != null) {
+                JSObject result = new JSObject();
+                result.put("updateAvailable", false);
+                result.put("skipped", true);
+                call.resolve(result);
+            }
+            return;
+        }
+
         if (verbose) {
-            sendUpdateStatus(updateStatus("checking"));
+            JSObject checking = updateStatus("checking");
+            checking.put("verbose", true);
+            sendUpdateStatus(checking);
         }
 
         new Thread(() -> {
@@ -163,6 +220,7 @@ public class MailFlowNativePlugin extends Plugin {
                 Log.i(TAG, "Checking for updates from " + UPDATE_RELEASE_URL);
                 ReleaseInfo release = fetchLatestRelease();
                 Log.i(TAG, "Latest release " + release.version + ", installed " + getInstalledVersion() + ", APK " + release.downloadUrl);
+                getPrefs(getContext()).edit().putLong(PREF_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
                 if (!isNewerVersion(release.version, getInstalledVersion())) {
                     clearDownloadedUpdateState();
                     if (verbose) {
@@ -178,7 +236,7 @@ public class MailFlowNativePlugin extends Plugin {
                 }
 
                 if (release.downloadUrl == null) {
-                    sendUpdateError("A MailFlow update is available, but no Android APK was found.");
+                    sendUpdateError("invalidRelease", verbose);
                     if (call != null) {
                         JSObject result = new JSObject();
                         result.put("updateAvailable", true);
@@ -188,8 +246,30 @@ public class MailFlowNativePlugin extends Plugin {
                     return;
                 }
 
+                if (downloadedUpdate != null && downloadedUpdate.exists()
+                    && updateInfo != null && release.version.equals(updateInfo.version)) {
+                    try {
+                        verifyDownloadedPackage(downloadedUpdate, release);
+                        updateInfo = release;
+                        persistDownloadedUpdateState(release, downloadedUpdate);
+                        sendUpdateStatus(updateStatus("downloaded", release.toStatusData()));
+                        if (call != null) {
+                            JSObject result = new JSObject();
+                            result.put("updateAvailable", true);
+                            result.put("downloadAvailable", true);
+                            result.put("downloaded", true);
+                            call.resolve(result);
+                        }
+                        return;
+                    } catch (Exception invalidDownload) {
+                        Log.w(TAG, "Discarding an invalid persisted update APK", invalidDownload);
+                        clearDownloadedUpdateState();
+                    }
+                } else if (downloadedUpdate != null) {
+                    clearDownloadedUpdateState();
+                }
+
                 updateInfo = release;
-                downloadedUpdate = null;
                 sendUpdateStatus(updateStatus("available", release.toStatusData()));
 
                 if (call != null) {
@@ -198,17 +278,17 @@ public class MailFlowNativePlugin extends Plugin {
                     result.put("downloadAvailable", true);
                     call.resolve(result);
                 }
-
-                downloadUpdate(release);
             } catch (Exception error) {
                 Log.e(TAG, "Update check failed", error);
-                sendUpdateError(UPDATE_ERROR_MESSAGE);
+                sendUpdateError("genericError", verbose);
                 if (call != null) {
                     JSObject result = new JSObject();
                     result.put("updateAvailable", false);
-                    result.put("error", error.getMessage());
+                    result.put("error", "update-check-failed");
                     call.resolve(result);
                 }
+            } finally {
+                updateCheckStarted.set(false);
             }
         }).start();
     }
@@ -223,6 +303,21 @@ public class MailFlowNativePlugin extends Plugin {
     public void openDownloadedUpdate(PluginCall call) {
         JSObject result = showUpdateReadyDialog();
         call.resolve(result);
+    }
+
+    @PluginMethod
+    public void openUpdateInBrowser(PluginCall call) {
+        String tag = updateInfo == null ? "" : updateInfo.version;
+        if (parseVersion(tag) == null) tag = "";
+        String url = tag.isEmpty()
+            ? "https://github.com/YunQue0912/mailflow/releases"
+            : "https://github.com/YunQue0912/mailflow/releases/tag/" + tag;
+        try {
+            getContext().startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            call.resolve();
+        } catch (Exception error) {
+            call.reject("Could not open the verified Release page.");
+        }
     }
 
     @PluginMethod
@@ -276,6 +371,7 @@ public class MailFlowNativePlugin extends Plugin {
         call.resolve();
     }
 
+    @SuppressLint("MissingPermission")
     static void postNewMailNotification(Context context, String title, String body, String messageId, String accountId, String folder, JSObject message) {
         if (!hasNotificationPermission(context)) return;
 
@@ -442,10 +538,13 @@ public class MailFlowNativePlugin extends Plugin {
             + "window.mailflowNative=window.mailflowNative||{};"
             + "window.mailflowNative.platform='android';"
             + "window.mailflowNative.updates=window.mailflowNative.updates||{};"
+            + "window.mailflowNative.updates.getState=function(){return call('getUpdateState',{}, {type:'idle'});};"
             + "window.mailflowNative.updates.check=function(verbose){return call('checkForUpdates',{verbose:!!verbose});};"
+            + "window.mailflowNative.updates.download=function(){return call('downloadUpdate',{}, {started:false,reason:'unavailable'});};"
+            + "window.mailflowNative.updates.cancel=function(){return call('cancelUpdateDownload',{}, {cancelled:false});};"
             + "window.mailflowNative.updates.installDownloaded=function(){if(androidNotifications&&typeof androidNotifications.installDownloadedUpdate==='function'){try{return Promise.resolve(JSON.parse(androidNotifications.installDownloadedUpdate()||'{}'));}catch(e){return Promise.resolve({installed:false,reason:'unavailable'});}}return call('installDownloadedUpdate',{}, {installed:false,reason:'unavailable'});};"
             + "window.mailflowNative.updates.installAuto=window.mailflowNative.updates.installDownloaded;"
-            + "window.mailflowNative.updates.openDownload=function(){return call('openDownloadedUpdate',{});};"
+            + "window.mailflowNative.updates.openDownload=function(){return call('openUpdateInBrowser',{});};"
             + "window.mailflowNative.updates.onStatus=function(callback){if(typeof callback!=='function')return function(){};var handler=function(event){callback(event.detail);};window.addEventListener('mailflow:update-status',handler);return function(){window.removeEventListener('mailflow:update-status',handler);};};"
             + "window.mailflowNative.notifications=window.mailflowNative.notifications||{};"
             + "window.mailflowNative.notifications.showNewMail=function(notification){if(androidNotifications&&typeof androidNotifications.showNewMail==='function'){androidNotifications.showNewMail(JSON.stringify(notification||{}));return Promise.resolve(null);}return call('showNewMail',notification||{});};"
@@ -659,114 +758,283 @@ public class MailFlowNativePlugin extends Plugin {
 
     private ReleaseInfo fetchLatestRelease() throws Exception {
         JSONObject release = requestJson(UPDATE_RELEASE_URL);
+        if (release.optBoolean("draft", false) || release.optBoolean("prerelease", false)) {
+            throw new Exception("Latest GitHub Release is not on the stable channel.");
+        }
+
+        String tag = release.optString("tag_name", "");
+        int[] parsedVersion = parseVersion(tag);
+        if (parsedVersion == null) throw new Exception("Latest GitHub Release has an invalid custom tag.");
+
         org.json.JSONArray assets = release.optJSONArray("assets");
-        JSONObject apkAsset = null;
+        JSONObject manifestAsset = null;
 
         if (assets != null) {
             for (int i = 0; i < assets.length(); i++) {
                 JSONObject asset = assets.optJSONObject(i);
                 if (asset == null) continue;
 
-                String name = asset.optString("name", "");
-                String downloadUrl = asset.optString("browser_download_url", "");
-                if (name.toLowerCase().endsWith(".apk") && !downloadUrl.isEmpty()) {
-                    apkAsset = asset;
+                if ("update-manifest.json".equals(asset.optString("name", ""))) {
+                    manifestAsset = asset;
                     break;
                 }
             }
         }
 
+        if (manifestAsset == null) throw new Exception("Stable Release is missing update-manifest.json.");
+        JSONObject manifest = requestJson(manifestAsset.optString("browser_download_url", ""));
+        if (manifest.optInt("schemaVersion", 0) != 1 || !"stable".equals(manifest.optString("channel", ""))) {
+            throw new Exception("Unsupported update manifest schema or channel.");
+        }
+        if (!tag.equals(manifest.optString("tag", ""))) throw new Exception("Release and manifest tags differ.");
+
+        JSONObject android = manifest.optJSONObject("android");
+        if (android == null || !getContext().getPackageName().equals(android.optString("packageName", ""))) {
+            throw new Exception("Update manifest contains an unexpected Android package.");
+        }
+
+        String assetName = android.optString("asset", "");
+        JSONObject apkAsset = null;
+        if (assets != null) {
+            for (int i = 0; i < assets.length(); i++) {
+                JSONObject asset = assets.optJSONObject(i);
+                if (asset != null && assetName.equals(asset.optString("name", ""))) {
+                    apkAsset = asset;
+                    break;
+                }
+            }
+        }
+        if (apkAsset == null || !assetName.endsWith(".apk")) throw new Exception("Manifest APK asset is missing.");
+
         ReleaseInfo info = new ReleaseInfo();
-        info.version = release.optString("tag_name", release.optString("name", ""));
+        info.version = tag;
         info.releaseName = release.optString("name", info.version);
         info.releaseNotes = release.optString("body", "");
         info.releaseDate = release.optString("published_at", "");
+        info.assetName = assetName;
+        info.downloadUrl = apkAsset.optString("browser_download_url", null);
+        info.assetSize = android.optLong("size", -1L);
+        info.sha256 = normalizeFingerprint(android.optString("sha256", ""));
+        info.certificateSha256 = normalizeFingerprint(android.optString("certificateSha256", ""));
+        info.versionCode = android.optLong("versionCode", -1L);
 
-        if (apkAsset != null) {
-            info.assetName = apkAsset.optString("name", "MailFlow.apk");
-            info.downloadUrl = apkAsset.optString("browser_download_url", null);
+        long releaseAssetSize = apkAsset.optLong("size", -1L);
+        String compiledCertificate = normalizeFingerprint(BuildConfig.MAILFLOW_ANDROID_CERTIFICATE_SHA256);
+        if (info.versionCode != toVersionCode(parsedVersion)
+            || info.assetSize <= 0L
+            || info.assetSize > MAX_APK_BYTES
+            || info.assetSize != releaseAssetSize
+            || info.sha256.length() != 64
+            || compiledCertificate.length() != 64
+            || !compiledCertificate.equals(info.certificateSha256)) {
+            throw new Exception("Android update manifest verification failed.");
         }
 
         return info;
     }
 
     private JSONObject requestJson(String url) throws Exception {
-        HttpURLConnection connection = openConnection(url);
+        HttpURLConnection connection = openConnectionFollowingRedirects(url);
         int status = connection.getResponseCode();
-        if (status >= 300 && status < 400) {
-            String location = connection.getHeaderField("Location");
-            connection.disconnect();
-            if (location != null) return requestJson(location);
-        }
-
         if (status < 200 || status >= 300) {
             connection.disconnect();
             throw new Exception("Update request failed with status " + status);
         }
 
+        long contentLength = connection.getContentLengthLong();
+        if (contentLength > MAX_JSON_BYTES) {
+            connection.disconnect();
+            throw new Exception("Update response exceeded the size limit.");
+        }
+
         try (InputStream stream = connection.getInputStream()) {
-            return new JSONObject(readStream(stream));
+            return new JSONObject(readStream(stream, MAX_JSON_BYTES));
         } finally {
             connection.disconnect();
         }
     }
 
-    private void downloadUpdate(ReleaseInfo release) {
-        sendUpdateStatus(updateStatus("downloading"));
+    private void startUpdateDownload(ReleaseInfo release) {
+        cancelUpdateDownload.set(false);
+        sendUpdateStatus(updateStatus("downloading", release.toStatusData()));
 
         new Thread(() -> {
+            File temporary = null;
             try {
                 Log.i(TAG, "Downloading update APK from " + release.downloadUrl);
-                File directory = getContext().getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-                if (directory == null) directory = getContext().getCacheDir();
+                File directory = new File(getContext().getCacheDir(), "updates");
                 if (!directory.exists()) directory.mkdirs();
 
-                File output = uniqueFile(directory, sanitizeApkName(release.assetName));
-                HttpURLConnection connection = openConnection(release.downloadUrl);
+                temporary = new File(directory, UUID.randomUUID() + ".part");
+                File output = new File(directory, sanitizeApkName(release.assetName));
+                HttpURLConnection connection = openConnectionFollowingRedirects(release.downloadUrl);
                 int status = connection.getResponseCode();
-                if (status >= 300 && status < 400 && connection.getHeaderField("Location") != null) {
-                    release.downloadUrl = connection.getHeaderField("Location");
-                    connection.disconnect();
-                    downloadUpdate(release);
-                    return;
-                }
                 if (status < 200 || status >= 300) {
                     connection.disconnect();
                     throw new Exception("APK download failed with status " + status);
                 }
 
+                long contentLength = connection.getContentLengthLong();
+                if (contentLength <= 0L || contentLength > MAX_APK_BYTES || contentLength != release.assetSize) {
+                    connection.disconnect();
+                    throw new Exception("APK Content-Length did not match the verified manifest.");
+                }
+
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                long received = 0L;
+
                 try (
                     InputStream input = new BufferedInputStream(connection.getInputStream());
-                    FileOutputStream outputStream = new FileOutputStream(output)
+                    FileOutputStream outputStream = new FileOutputStream(temporary)
                 ) {
                     byte[] buffer = new byte[8192];
                     int read;
                     while ((read = input.read(buffer)) != -1) {
+                        if (cancelUpdateDownload.get()) throw new UpdateCancelledException();
                         outputStream.write(buffer, 0, read);
+                        digest.update(buffer, 0, read);
+                        received += read;
+                        JSObject progress = release.toStatusData();
+                        progress.put("progress", downloadProgress(received, contentLength));
+                        sendUpdateStatus(updateStatus("downloading", progress));
                     }
+                    outputStream.getFD().sync();
                 } finally {
                     connection.disconnect();
                 }
 
+                if (received != release.assetSize || !toHex(digest.digest()).equals(release.sha256)) {
+                    throw new Exception("Downloaded APK SHA-256 verification failed.");
+                }
+                verifyDownloadedPackage(temporary, release);
+                if (output.exists() && !output.delete()) throw new Exception("Could not replace the previous verified APK.");
+                moveAtomically(temporary, output);
+                temporary = null;
                 downloadedUpdate = output;
                 persistDownloadedUpdateState(release, output);
-                Log.i(TAG, "Downloaded update APK to " + output.getAbsolutePath());
-                sendUpdateStatus(updateStatus("downloaded", release.toStatusData(output.getAbsolutePath())));
+                Log.i(TAG, "Downloaded and verified update APK.");
+                sendUpdateStatus(updateStatus("downloaded", release.toStatusData()));
                 postUpdateReadyNotification(release);
+            } catch (UpdateCancelledException cancelled) {
+                sendUpdateStatus(updateStatus("available", release.toStatusData()));
             } catch (Exception error) {
                 Log.e(TAG, "Update download failed", error);
-                sendUpdateError("The MailFlow update could not be downloaded.");
+                sendUpdateError("downloadError");
+            } finally {
+                if (temporary != null && temporary.exists()) temporary.delete();
+                cancelUpdateDownload.set(false);
+                updateDownloadStarted.set(false);
             }
         }).start();
     }
 
     private HttpURLConnection openConnection(String url) throws Exception {
+        validateUpdateUrl(url);
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setInstanceFollowRedirects(false);
         connection.setConnectTimeout(15000);
         connection.setReadTimeout(30000);
         connection.setRequestProperty("Accept", "application/vnd.github+json");
         connection.setRequestProperty("User-Agent", "MailFlow/" + getInstalledVersion());
         return connection;
+    }
+
+    private HttpURLConnection openConnectionFollowingRedirects(String url) throws Exception {
+        String current = url;
+        for (int redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+            HttpURLConnection connection = openConnection(current);
+            int status = connection.getResponseCode();
+            if (status < 300 || status >= 400) return connection;
+
+            String location = connection.getHeaderField("Location");
+            connection.disconnect();
+            if (location == null || redirects == MAX_REDIRECTS) throw new Exception("Invalid update redirect.");
+            current = UpdateUrlPolicy.resolveRedirect(current, location);
+        }
+        throw new Exception("Too many update redirects.");
+    }
+
+    private static void validateUpdateUrl(String value) throws Exception {
+        UpdateUrlPolicy.validate(value);
+    }
+
+    private void verifyDownloadedPackage(File file, ReleaseInfo release) throws Exception {
+        if (file == null || release == null || !file.exists()) throw new Exception("Downloaded APK is missing.");
+        if (release.sha256 == null || !sha256(file).equals(release.sha256)) {
+            throw new Exception("Downloaded APK SHA-256 mismatch.");
+        }
+
+        PackageManager manager = getContext().getPackageManager();
+        int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            ? PackageManager.GET_SIGNING_CERTIFICATES
+            : PackageManager.GET_SIGNATURES;
+        PackageInfo archive = manager.getPackageArchiveInfo(file.getAbsolutePath(), flags);
+        if (archive == null || !getContext().getPackageName().equals(archive.packageName)) {
+            throw new Exception("Downloaded APK package name mismatch.");
+        }
+
+        long archiveVersionCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            ? archive.getLongVersionCode()
+            : archive.versionCode;
+        if (archiveVersionCode != release.versionCode || archiveVersionCode <= getInstalledVersionCode()) {
+            throw new Exception("Downloaded APK versionCode is not an upgrade.");
+        }
+
+        Signature[] signatures = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && archive.signingInfo != null
+            ? archive.signingInfo.getApkContentsSigners()
+            : archive.signatures;
+        if (signatures == null || signatures.length != 1) throw new Exception("Downloaded APK signer is missing or ambiguous.");
+
+        String signer = toHex(MessageDigest.getInstance("SHA-256").digest(signatures[0].toByteArray()));
+        String compiledCertificate = normalizeFingerprint(BuildConfig.MAILFLOW_ANDROID_CERTIFICATE_SHA256);
+        if (!signer.equals(compiledCertificate) || !signer.equals(release.certificateSha256)) {
+            throw new Exception("Downloaded APK signing certificate mismatch.");
+        }
+    }
+
+    private long getInstalledVersionCode() {
+        try {
+            PackageInfo installed = getContext().getPackageManager().getPackageInfo(getContext().getPackageName(), 0);
+            return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? installed.getLongVersionCode() : installed.versionCode;
+        } catch (Exception ignored) {
+            return -1L;
+        }
+    }
+
+    private static JSObject downloadProgress(long received, long total) {
+        JSObject progress = new JSObject();
+        progress.put("transferred", received);
+        progress.put("total", total);
+        progress.put("percent", total <= 0L ? 0D : Math.min(100D, (received * 100D) / total));
+        return progress;
+    }
+
+    private static void moveAtomically(File source, File target) throws Exception {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            return;
+        }
+        if (!source.renameTo(target)) throw new Exception("Could not move verified APK into place.");
+    }
+
+    private static String sha256(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new BufferedInputStream(new java.io.FileInputStream(file))) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) digest.update(buffer, 0, read);
+        }
+        return toHex(digest.digest());
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder value = new StringBuilder(bytes.length * 2);
+        for (byte item : bytes) value.append(String.format("%02X", item));
+        return value.toString();
+    }
+
+    private static String normalizeFingerprint(String value) {
+        return String.valueOf(value == null ? "" : value).replaceAll("[^A-Fa-f0-9]", "").toUpperCase();
     }
 
     private String getInstalledVersion() {
@@ -788,6 +1056,17 @@ public class MailFlowNativePlugin extends Plugin {
             Log.w(TAG, "Install requested with no downloaded APK");
             result.put("installed", false);
             result.put("reason", "missing-download");
+            return result;
+        }
+
+        try {
+            verifyDownloadedPackage(downloadedUpdate, updateInfo);
+        } catch (Exception error) {
+            Log.e(TAG, "Downloaded APK failed install-time verification", error);
+            clearDownloadedUpdateState();
+            sendUpdateError("verificationError");
+            result.put("installed", false);
+            result.put("reason", "verification-failed");
             return result;
         }
 
@@ -819,10 +1098,9 @@ public class MailFlowNativePlugin extends Plugin {
             return result;
         } catch (Exception error) {
             Log.e(TAG, "Could not start package installer", error);
-            sendUpdateError("The update was downloaded, but MailFlow could not start the installer.");
+            sendUpdateError("genericError");
             result.put("installed", false);
             result.put("reason", "launch-failed");
-            result.put("error", error.getMessage());
             return result;
         }
     }
@@ -830,7 +1108,8 @@ public class MailFlowNativePlugin extends Plugin {
     private void continuePendingUpdateInstall() {
         if (!installPendingPermission || downloadedUpdate == null || !downloadedUpdate.exists()) return;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getContext().getPackageManager().canRequestPackageInstalls()) return;
-        startDownloadedUpdateInstall();
+        installPendingPermission = false;
+        sendUpdateStatus(updateStatus("downloaded", updateInfo == null ? new JSObject() : updateInfo.toStatusData()));
     }
 
     private JSObject showUpdateReadyDialog() {
@@ -859,10 +1138,10 @@ public class MailFlowNativePlugin extends Plugin {
             }
 
             new AlertDialog.Builder(getActivity())
-                .setTitle("Update ready")
-                .setMessage("MailFlow " + version + " has been downloaded and is ready to install.")
-                .setPositiveButton("Install", (dialog, which) -> startDownloadedUpdateInstall())
-                .setNegativeButton("Later", null)
+                .setTitle(getContext().getString(R.string.update_ready_title))
+                .setMessage(getContext().getString(R.string.update_ready_message, version))
+                .setPositiveButton(getContext().getString(R.string.update_install), (dialog, which) -> startDownloadedUpdateInstall())
+                .setNegativeButton(getContext().getString(R.string.update_later), null)
                 .show();
         });
 
@@ -879,6 +1158,8 @@ public class MailFlowNativePlugin extends Plugin {
             .putString(PREF_UPDATE_APK_PATH, file.getAbsolutePath())
             .putString(PREF_UPDATE_VERSION, release.version == null ? "" : release.version)
             .putString(PREF_UPDATE_RELEASE_NAME, release.releaseName == null ? "" : release.releaseName)
+            .putString(PREF_UPDATE_SHA256, release.sha256 == null ? "" : release.sha256)
+            .putLong(PREF_UPDATE_VERSION_CODE, release.versionCode)
             .apply();
     }
 
@@ -901,18 +1182,28 @@ public class MailFlowNativePlugin extends Plugin {
             restored.version = prefs.getString(PREF_UPDATE_VERSION, "");
             restored.releaseName = prefs.getString(PREF_UPDATE_RELEASE_NAME, restored.version);
             restored.assetName = file.getName();
+            restored.assetSize = file.length();
+            restored.sha256 = prefs.getString(PREF_UPDATE_SHA256, "");
+            restored.certificateSha256 = normalizeFingerprint(BuildConfig.MAILFLOW_ANDROID_CERTIFICATE_SHA256);
+            restored.versionCode = prefs.getLong(PREF_UPDATE_VERSION_CODE, -1L);
             updateInfo = restored;
         }
     }
 
     private void clearDownloadedUpdateState() {
+        File previousDownload = downloadedUpdate;
         downloadedUpdate = null;
         installPendingPermission = false;
+        if (previousDownload != null && previousDownload.exists() && !previousDownload.delete()) {
+            Log.w(TAG, "Could not remove stale update APK from the app cache.");
+        }
         getPrefs(getContext())
             .edit()
             .remove(PREF_UPDATE_APK_PATH)
             .remove(PREF_UPDATE_VERSION)
             .remove(PREF_UPDATE_RELEASE_NAME)
+            .remove(PREF_UPDATE_SHA256)
+            .remove(PREF_UPDATE_VERSION_CODE)
             .apply();
     }
 
@@ -924,11 +1215,18 @@ public class MailFlowNativePlugin extends Plugin {
     }
 
     private void sendUpdateError(String message) {
+        sendUpdateError(message, false);
+    }
+
+    private void sendUpdateError(String message, boolean verbose) {
         JSObject status = updateStatus("error");
-        status.put("message", message);
+        status.put("messageKey", message);
+        status.put("retryable", true);
+        status.put("verbose", verbose);
         sendUpdateStatus(status);
     }
 
+    @SuppressLint("MissingPermission")
     private void postUpdateReadyNotification(ReleaseInfo release) {
         Intent openIntent = new Intent(getContext(), MainActivity.class);
         openIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -953,11 +1251,11 @@ public class MailFlowNativePlugin extends Plugin {
 
         NotificationCompat.Builder builder = new NotificationCompat.Builder(getContext(), CHANNEL_UPDATES)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("MailFlow update ready")
-            .setContentText("MailFlow " + release.version + " has been downloaded.")
-            .setStyle(new NotificationCompat.BigTextStyle().bigText("MailFlow " + release.version + " has been downloaded and is ready to install."))
+            .setContentTitle(getContext().getString(R.string.update_ready_title))
+            .setContentText(getContext().getString(R.string.update_downloaded, release.version))
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(getContext().getString(R.string.update_ready_message, release.version)))
             .setContentIntent(openPendingIntent)
-            .addAction(R.mipmap.ic_launcher, "Install", installPendingIntent)
+            .addAction(R.mipmap.ic_launcher, getContext().getString(R.string.update_install), installPendingIntent)
             .setAutoCancel(false)
             .setOngoing(false)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT);
@@ -968,6 +1266,7 @@ public class MailFlowNativePlugin extends Plugin {
     }
 
     private void sendUpdateStatus(JSObject status) {
+        lastUpdateStatus = status;
         notifyListeners("updateStatus", status);
 
         if (getBridge() == null || getBridge().getWebView() == null) return;
@@ -981,6 +1280,7 @@ public class MailFlowNativePlugin extends Plugin {
     private JSObject updateStatus(String type) {
         JSObject status = new JSObject();
         status.put("type", type);
+        status.put("currentVersion", getInstalledVersion());
         return status;
     }
 
@@ -995,7 +1295,7 @@ public class MailFlowNativePlugin extends Plugin {
         int[] installed = parseVersion(current);
         if (next == null || installed == null) return false;
 
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             if (next[i] > installed[i]) return true;
             if (next[i] < installed[i]) return false;
         }
@@ -1004,26 +1304,21 @@ public class MailFlowNativePlugin extends Plugin {
     }
 
     private static int[] parseVersion(String value) {
-        Matcher matcher = VERSION_PATTERN.matcher(value == null ? "" : value);
-        if (!matcher.find()) return null;
-
-        String[] parts = matcher.group().split("\\.");
-        int[] version = new int[] { 0, 0, 0 };
-        for (int i = 0; i < Math.min(parts.length, 3); i++) {
-            try {
-                version[i] = Integer.parseInt(parts[i]);
-            } catch (NumberFormatException ignored) {
-                return null;
-            }
-        }
-        return version;
+        return CustomReleaseVersion.parse(value);
     }
 
-    private static String readStream(InputStream stream) throws Exception {
+    private static long toVersionCode(int[] version) {
+        return CustomReleaseVersion.versionCode(version);
+    }
+
+    private static String readStream(InputStream stream, int maxBytes) throws Exception {
         StringBuilder builder = new StringBuilder();
         byte[] buffer = new byte[8192];
         int read;
+        int total = 0;
         while ((read = stream.read(buffer)) != -1) {
+            total += read;
+            if (total > maxBytes) throw new Exception("Update response exceeded the size limit.");
             builder.append(new String(buffer, 0, read, "UTF-8"));
         }
         return builder.toString();
@@ -1059,22 +1354,28 @@ public class MailFlowNativePlugin extends Plugin {
         String releaseDate;
         String assetName;
         String downloadUrl;
+        String sha256;
+        String certificateSha256;
+        long assetSize;
+        long versionCode;
 
         JSObject toStatusData() {
-            return toStatusData(null);
-        }
-
-        JSObject toStatusData(String filePath) {
             JSObject data = new JSObject();
             data.put("releaseNotes", releaseNotes);
+            data.put("version", version == null ? "" : version.replaceFirst("^v", ""));
+            data.put("tag", version);
             data.put("releaseName", releaseName);
             data.put("releaseDate", releaseDate);
             data.put("updateUrl", downloadUrl);
+            data.put("size", assetSize);
+            data.put("versionCode", versionCode);
+            data.put("releaseUrl", version == null ? "https://github.com/YunQue0912/mailflow/releases" : "https://github.com/YunQue0912/mailflow/releases/tag/" + version);
             data.put("manual", true);
-            if (filePath != null) data.put("filePath", filePath);
             return data;
         }
     }
+
+    private static class UpdateCancelledException extends Exception {}
 
     private static void createNotificationChannel(Context context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
@@ -1091,10 +1392,10 @@ public class MailFlowNativePlugin extends Plugin {
 
             NotificationChannel updatesChannel = new NotificationChannel(
                 CHANNEL_UPDATES,
-                "Updates",
+                context.getString(R.string.update_channel_name),
                 NotificationManager.IMPORTANCE_DEFAULT
             );
-            updatesChannel.setDescription("MailFlow app update notifications.");
+            updatesChannel.setDescription(context.getString(R.string.update_channel_description));
             manager.createNotificationChannel(updatesChannel);
         }
     }

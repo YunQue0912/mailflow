@@ -1329,7 +1329,13 @@
       "sourceCode": "Исходный код",
       "sponsor": "Поддержать разработку",
       "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors"
+      "githubSponsors": "GitHub Sponsors",
+      "updates": {
+        "title": "Обновления приложения", "autoCheck": "Автоматически проверять обновления", "currentVersion": "Текущая версия", "latestVersion": "Последняя версия", "published": "Опубликовано", "size": "Размер загрузки", "notes": "Примечания к выпуску", "check": "Проверить обновления", "download": "Скачать обновление", "later": "Позже", "skip": "Пропустить эту версию", "cancel": "Отмена", "install": "Перезапустить и установить", "installAndroid": "Установить", "retry": "Повторить", "browser": "Скачать в браузере",
+        "notificationAvailableTitle": "Доступно обновление", "notificationAvailableBody": "MailFlow {{version}} готов к загрузке.", "notificationReadyTitle": "Обновление готово", "notificationReadyBody": "MailFlow {{version}} готов к установке.", "notificationErrorTitle": "Не удалось проверить обновления", "notificationInstallErrorTitle": "Не удалось установить", "notificationInstallErrorBody": "Проверенное обновление не удалось установить.",
+        "status": { "idle": "Готово к проверке обновлений.", "checking": "Проверка обновлений...", "up-to-date": "Установлена последняя версия.", "available": "Доступна более новая подписанная версия.", "downloading": "Загрузка и проверка обновления...", "downloaded": "Обновление проверено и готово к установке.", "installing": "Перезапуск для установки...", "error": "Не удалось подготовить обновление.", "skipped": "Эта версия пропущена. Более новая версия появится автоматически.", "deferred": "Обновление будет предложено снова завтра." },
+        "errors": { "genericError": "Сервис обновлений временно недоступен.", "downloadError": "Не удалось загрузить или проверить обновление.", "verificationError": "Пакет не прошёл проверку безопасности.", "invalidRelease": "Последний выпуск имеет неверный номер custom-версии.", "packagedOnly": "Проверка обновлений доступна в установленном приложении." }
+      }
     },
     "search": {
       "placeholder": "Поиск настроек…",

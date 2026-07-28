@@ -1,138 +1,200 @@
-name: Publish Apps
+name: Publish Native Apps
 
-# Manual-only until the native apps are release-ready: signing secrets must be
-# configured and the deferred native security items resolved before this ships.
-# Re-add the `push.tags` trigger to publish native builds automatically on a tag.
 on:
+  push:
+    tags:
+      - "v*-custom.*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: Custom release tag (vX.Y.Z-custom.N)
+        required: true
+        type: string
+      publish:
+        description: Publish an existing immutable tag after verification
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: native-apps-${{ github.ref }}-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  desktop:
-    name: Electron (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - windows-latest
-          - macos-latest
-          - ubuntu-latest
-
+  validate:
+    name: Validate source and version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      version-name: ${{ steps.release.outputs.version-name }}
+      version-code: ${{ steps.release.outputs.version-code }}
+      publish: ${{ steps.release.outputs.publish }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'push' && github.ref || (inputs.publish && inputs.version || github.sha) }}
+
+      - name: Resolve and validate release version
+        id: release
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+          DISPATCH_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            APP_VERSION="${GITHUB_REF_NAME}"
+            PUBLISH=true
+          else
+            APP_VERSION="${DISPATCH_VERSION}"
+            PUBLISH="${DISPATCH_PUBLISH:-false}"
+          fi
+
+          RELEASE_JSON="$(APP_VERSION="$APP_VERSION" node <<'NODE'
+          const { parseCustomVersion } = require('./frontend/packages/shared/custom-release.cjs');
+          const parsed = parseCustomVersion(process.env.APP_VERSION);
+          if (!parsed) {
+            console.error('Version must match vX.Y.Z-custom.N and fit Android versionCode limits.');
+            process.exit(1);
+          }
+          process.stdout.write(JSON.stringify(parsed));
+          NODE
+          )"
+
+          git fetch origin "+refs/heads/custom/release:refs/remotes/origin/custom/release" --tags
+          if [[ "$PUBLISH" == "true" ]]; then
+            git merge-base --is-ancestor HEAD origin/custom/release || {
+              echo "Release commit is not part of origin/custom/release." >&2
+              exit 1
+            }
+            git show-ref --verify --quiet "refs/tags/$APP_VERSION" || {
+              echo "Formal publication requires an existing immutable tag: $APP_VERSION" >&2
+              exit 1
+            }
+            [[ "$(git rev-parse "refs/tags/$APP_VERSION^{commit}")" == "$(git rev-parse HEAD)" ]] || {
+              echo "Checked-out commit does not match $APP_VERSION." >&2
+              exit 1
+            }
+          else
+            git merge-base --is-ancestor origin/custom/release HEAD || {
+              echo "Dry-run source must be based on origin/custom/release." >&2
+              exit 1
+            }
+          fi
+
+          echo "version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "version-name=$(jq -r .versionName <<<"$RELEASE_JSON")" >> "$GITHUB_OUTPUT"
+          echo "version-code=$(jq -r .versionCode <<<"$RELEASE_JSON")" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-          cache: "npm"
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Test and lint backend
+        working-directory: backend
+        run: |
+          npm ci
+          npm test
+          npm run lint
+
+      - name: Test, lint, and build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run lint
+          npm run build
+
+  windows:
+    name: Windows x64 unsigned NSIS
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install dependencies
+      - name: Build unsigned Windows package
         working-directory: frontend
-        run: npm ci
-
-      - name: Resolve app version
-        id: app-version
-        shell: bash
+        shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          DISPATCH_VERSION: ${{ github.event.inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          VERSION="${RELEASE_TAG:-${DISPATCH_VERSION:-$REF_NAME}}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Set app version
-        working-directory: frontend
-        run: npm run app:version -- "${{ steps.app-version.outputs.version }}" "${{ github.run_number }}"
-
-      - name: Validate desktop release signing
-        if: matrix.os == 'windows-latest' || matrix.os == 'macos-latest'
-        shell: bash
-        env:
-          MAILFLOW_WINDOWS_CSC_LINK: ${{ secrets.MAILFLOW_WINDOWS_CSC_LINK }}
-          MAILFLOW_WINDOWS_CSC_KEY_PASSWORD: ${{ secrets.MAILFLOW_WINDOWS_CSC_KEY_PASSWORD }}
-          MAILFLOW_MAC_CSC_LINK: ${{ secrets.MAILFLOW_MAC_CSC_LINK }}
-          MAILFLOW_MAC_CSC_KEY_PASSWORD: ${{ secrets.MAILFLOW_MAC_CSC_KEY_PASSWORD }}
-        run: |
-          missing=()
-
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            [ -n "$MAILFLOW_WINDOWS_CSC_LINK" ] || missing+=("MAILFLOW_WINDOWS_CSC_LINK")
-            [ -n "$MAILFLOW_WINDOWS_CSC_KEY_PASSWORD" ] || missing+=("MAILFLOW_WINDOWS_CSC_KEY_PASSWORD")
-          fi
-
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
-            [ -n "$MAILFLOW_MAC_CSC_LINK" ] || missing+=("MAILFLOW_MAC_CSC_LINK")
-            [ -n "$MAILFLOW_MAC_CSC_KEY_PASSWORD" ] || missing+=("MAILFLOW_MAC_CSC_KEY_PASSWORD")
-          fi
-
-          if [ "${#missing[@]}" -gt 0 ]; then
-            printf 'Desktop release signing secrets are required for %s. Missing: %s\n' "${{ matrix.os }}" "${missing[*]}" >&2
-            exit 1
-          fi
-
-      - name: Build signed Windows Electron package
-        if: matrix.os == 'windows-latest'
-        working-directory: frontend
-        run: npm run electron:dist
-        env:
-          CSC_LINK: ${{ secrets.MAILFLOW_WINDOWS_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAILFLOW_WINDOWS_CSC_KEY_PASSWORD }}
-
-      - name: Build signed macOS Electron package
-        if: matrix.os == 'macos-latest'
-        working-directory: frontend
-        run: npm run electron:dist
-        env:
-          CSC_LINK: ${{ secrets.MAILFLOW_MAC_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAILFLOW_MAC_CSC_KEY_PASSWORD }}
-
-      - name: Build Linux x64 Electron packages
-        if: matrix.os == 'ubuntu-latest'
-        working-directory: frontend
-        run: npm run electron:dist -- --linux deb rpm --x64
-        env:
+          APP_VERSION: ${{ needs.validate.outputs.version }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npm ci
+          npm run app:version -- $env:APP_VERSION
+          npm run electron:dist -- --win nsis --x64
 
-      - name: Build Linux arm64 Electron packages
-        if: matrix.os == 'ubuntu-latest'
+      - name: Verify Windows package
         working-directory: frontend
-        run: npm run electron:dist -- --linux deb rpm --arm64
+        shell: pwsh
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          VERSION_NAME: ${{ needs.validate.outputs.version-name }}
+        run: |
+          $release = Resolve-Path 'packages/release'
+          $exe = Get-Item -LiteralPath (Join-Path $release "MailFlow-$env:VERSION_NAME-Setup.exe")
+          Get-Item -LiteralPath "$($exe.FullName).blockmap" | Out-Null
+          Get-Item -LiteralPath (Join-Path $release 'latest.yml') | Out-Null
+          $updateConfig = Get-Content -Raw -LiteralPath (Join-Path $release 'win-unpacked/resources/app-update.yml')
+          if ($updateConfig -match '(?m)^publisherName:') {
+            throw 'Unsigned Windows update configuration must not contain publisherName.'
+          }
 
-      - name: Rename Linux artifacts
-        if: matrix.os == 'ubuntu-latest'
-        working-directory: frontend
-        run: node packages/scripts/rename-linux-artifacts.cjs
+          if ($exe.VersionInfo.ProductVersion -ne $env:VERSION_NAME) {
+            throw "Unexpected ProductVersion: $($exe.VersionInfo.ProductVersion)"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          if ($signature.Status -ne 'NotSigned' -or $signature.SignerCertificate) {
+            throw "Windows package must remain unsigned: $($signature.Status)"
+          }
 
-      - name: Upload Electron artifacts
-        uses: actions/upload-artifact@v4
+          [ordered]@{
+            productVersion = $exe.VersionInfo.ProductVersion
+            size = $exe.Length
+            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName).Hash.ToLowerInvariant()
+            signaturePolicy = 'unsigned'
+            authenticodeStatus = $signature.Status.ToString()
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $release 'windows-verification.json') -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: mailflow-electron-${{ matrix.os }}
+          name: mailflow-windows-${{ needs.validate.outputs.version-name }}
           if-no-files-found: error
           path: |
-            frontend/packages/release/*.deb
-            frontend/packages/release/*.dmg
-            frontend/packages/release/*.exe
-            frontend/packages/release/*.rpm
+            frontend/packages/release/MailFlow-${{ needs.validate.outputs.version-name }}-Setup.exe
+            frontend/packages/release/MailFlow-${{ needs.validate.outputs.version-name }}-Setup.exe.blockmap
+            frontend/packages/release/latest.yml
+            frontend/packages/release/windows-verification.json
 
   android:
-    name: Android
+    name: Android signed APK and AAB
+    needs: validate
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
 
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-          cache: "npm"
+          cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - uses: actions/setup-java@v5
@@ -142,105 +204,166 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: Install dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Resolve app version
-        id: app-version
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          DISPATCH_VERSION: ${{ github.event.inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          VERSION="${RELEASE_TAG:-${DISPATCH_VERSION:-$REF_NAME}}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Set app version
-        working-directory: frontend
-        run: npm run app:version -- "${{ steps.app-version.outputs.version }}" "${{ github.run_number }}"
-
       - name: Prepare Android release signing
         shell: bash
         env:
-          MAILFLOW_ANDROID_KEYSTORE_BASE64: ${{ secrets.MAILFLOW_ANDROID_KEYSTORE_BASE64 }}
-          MAILFLOW_ANDROID_STORE_PASSWORD: ${{ secrets.MAILFLOW_ANDROID_STORE_PASSWORD }}
-          MAILFLOW_ANDROID_KEY_ALIAS: ${{ secrets.MAILFLOW_ANDROID_KEY_ALIAS }}
-          MAILFLOW_ANDROID_KEY_PASSWORD: ${{ secrets.MAILFLOW_ANDROID_KEY_PASSWORD }}
+          KEYSTORE_BASE64: ${{ secrets.MAILFLOW_ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.MAILFLOW_ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MAILFLOW_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.MAILFLOW_ANDROID_KEY_PASSWORD }}
+          EXPECTED_CERTIFICATE: ${{ vars.MAILFLOW_ANDROID_CERTIFICATE_SHA256 }}
         run: |
           missing=()
-          [ -n "$MAILFLOW_ANDROID_KEYSTORE_BASE64" ] || missing+=("MAILFLOW_ANDROID_KEYSTORE_BASE64")
-          [ -n "$MAILFLOW_ANDROID_STORE_PASSWORD" ] || missing+=("MAILFLOW_ANDROID_STORE_PASSWORD")
-          [ -n "$MAILFLOW_ANDROID_KEY_ALIAS" ] || missing+=("MAILFLOW_ANDROID_KEY_ALIAS")
-          [ -n "$MAILFLOW_ANDROID_KEY_PASSWORD" ] || missing+=("MAILFLOW_ANDROID_KEY_PASSWORD")
-
-          if [ "${#missing[@]}" -gt 0 ]; then
-            printf 'Android release signing secrets are required. Missing: %s\n' "${missing[*]}" >&2
+          [[ -n "$KEYSTORE_BASE64" ]] || missing+=(MAILFLOW_ANDROID_KEYSTORE_BASE64)
+          [[ -n "$STORE_PASSWORD" ]] || missing+=(MAILFLOW_ANDROID_STORE_PASSWORD)
+          [[ -n "$KEY_ALIAS" ]] || missing+=(MAILFLOW_ANDROID_KEY_ALIAS)
+          [[ -n "$KEY_PASSWORD" ]] || missing+=(MAILFLOW_ANDROID_KEY_PASSWORD)
+          [[ -n "$EXPECTED_CERTIFICATE" ]] || missing+=("MAILFLOW_ANDROID_CERTIFICATE_SHA256 (variable)")
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing Android signing configuration: %s\n' "${missing[*]}" >&2
             exit 1
           fi
+          install -d -m 700 "$RUNNER_TEMP/mailflow-signing"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/mailflow-signing/release.keystore"
+          chmod 600 "$RUNNER_TEMP/mailflow-signing/release.keystore"
+          echo "MAILFLOW_ANDROID_STORE_FILE=$RUNNER_TEMP/mailflow-signing/release.keystore" >> "$GITHUB_ENV"
 
-          if [ -n "$MAILFLOW_ANDROID_KEYSTORE_BASE64" ]; then
-            mkdir -p "$RUNNER_TEMP/mailflow-signing"
-            echo "$MAILFLOW_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/mailflow-signing/release.keystore"
-            echo "MAILFLOW_ANDROID_STORE_FILE=$RUNNER_TEMP/mailflow-signing/release.keystore" >> "$GITHUB_ENV"
-          fi
-
-      - name: Build Android package
+      - name: Build signed Android packages
         working-directory: frontend
-        run: npm run android:dist
         env:
+          APP_VERSION: ${{ needs.validate.outputs.version }}
           MAILFLOW_ANDROID_STORE_PASSWORD: ${{ secrets.MAILFLOW_ANDROID_STORE_PASSWORD }}
           MAILFLOW_ANDROID_KEY_ALIAS: ${{ secrets.MAILFLOW_ANDROID_KEY_ALIAS }}
           MAILFLOW_ANDROID_KEY_PASSWORD: ${{ secrets.MAILFLOW_ANDROID_KEY_PASSWORD }}
+          MAILFLOW_ANDROID_CERTIFICATE_SHA256: ${{ vars.MAILFLOW_ANDROID_CERTIFICATE_SHA256 }}
+        run: |
+          npm ci
+          npm run app:version -- "$APP_VERSION"
+          npm run android:sync
+          pushd packages/android
+          ./gradlew test lint assembleRelease bundleRelease
+          popd
+          node packages/scripts/collect-android-artifacts.cjs
 
-      - name: List Android release artifacts
-        if: always()
+      - name: Verify Android packages
         working-directory: frontend
-        run: find packages/android/app/build -maxdepth 6 -type f | sort || true
-
-      - name: Upload Android artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mailflow-android
-          if-no-files-found: error
-          path: |
-            frontend/packages/release/*.aab
-            frontend/packages/release/*.apk
-
-  release:
-    name: Attach to GitHub Release
-    needs:
-      - desktop
-      - android
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Resolve app version
-        id: app-version
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          DISPATCH_VERSION: ${{ github.event.inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
+          VERSION_NAME: ${{ needs.validate.outputs.version-name }}
+          VERSION_CODE: ${{ needs.validate.outputs.version-code }}
+          EXPECTED_CERTIFICATE: ${{ vars.MAILFLOW_ANDROID_CERTIFICATE_SHA256 }}
         run: |
-          VERSION="${RELEASE_TAG:-${DISPATCH_VERSION:-$REF_NAME}}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          APK="packages/release/MailFlow-$VERSION_NAME.apk"
+          AAB="packages/release/MailFlow-$VERSION_NAME.aab"
+          test -s "$APK"
+          test -s "$AAB"
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          BADGING="$($AAPT dump badging "$APK" | head -n 1)"
+          [[ "$BADGING" == *"name='sh.mailflow.app'"* ]]
+          [[ "$BADGING" == *"versionCode='$VERSION_CODE'"* ]]
+          [[ "$BADGING" == *"versionName='$VERSION_NAME'"* ]]
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+          CERT_OUTPUT="$($APKSIGNER verify --verbose --print-certs "$APK")"
+          ACTUAL_CERTIFICATE="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' <<<"$CERT_OUTPUT" | head -n 1 | tr -cd '[:xdigit:]' | tr '[:lower:]' '[:upper:]')"
+          EXPECTED_NORMALIZED="$(tr -cd '[:xdigit:]' <<<"$EXPECTED_CERTIFICATE" | tr '[:lower:]' '[:upper:]')"
+          [[ ${#EXPECTED_NORMALIZED} -eq 64 && "$ACTUAL_CERTIFICATE" == "$EXPECTED_NORMALIZED" ]] || {
+            echo 'Android signing certificate SHA-256 mismatch.' >&2
+            exit 1
+          }
+
+          jq -n \
+            --arg packageName sh.mailflow.app \
+            --arg versionName "$VERSION_NAME" \
+            --argjson versionCode "$VERSION_CODE" \
+            --arg certificateSha256 "$ACTUAL_CERTIFICATE" \
+            --arg sha256 "$(sha256sum "$APK" | cut -d' ' -f1)" \
+            --argjson size "$(stat -c %s "$APK")" \
+            '{packageName:$packageName,versionName:$versionName,versionCode:$versionCode,certificateSha256:$certificateSha256,sha256:$sha256,size:$size}' \
+            > packages/release/android-verification.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mailflow-android-${{ needs.validate.outputs.version-name }}
+          if-no-files-found: error
+          path: |
+            frontend/packages/release/MailFlow-${{ needs.validate.outputs.version-name }}.apk
+            frontend/packages/release/MailFlow-${{ needs.validate.outputs.version-name }}.aab
+            frontend/packages/release/android-verification.json
+
+  aggregate:
+    name: Generate manifest and checksums
+    needs: [validate, windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          path: source
+
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Publish release files
-        uses: softprops/action-gh-release@v2
+      - name: Generate release metadata from verified artifacts
+        env:
+          APP_VERSION: ${{ needs.validate.outputs.version }}
+          ANDROID_CERTIFICATE_SHA256: ${{ vars.MAILFLOW_ANDROID_CERTIFICATE_SHA256 }}
+        run: |
+          node source/frontend/packages/scripts/generate-update-metadata.cjs \
+            --artifacts artifacts \
+            --output release-assets \
+            --tag "$APP_VERSION" \
+            --android-certificate-sha256 "$ANDROID_CERTIFICATE_SHA256"
+
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.app-version.outputs.version }}
-          files: |
-            artifacts/**/*.aab
-            artifacts/**/*.apk
-            artifacts/**/*.deb
-            artifacts/**/*.dmg
-            artifacts/**/*.exe
-            artifacts/**/*.rpm
+          name: mailflow-native-release-${{ needs.validate.outputs.version-name }}
+          if-no-files-found: error
+          path: release-assets/
+
+  release:
+    name: Publish verified GitHub Release
+    needs: [validate, aggregate]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mailflow-native-release-${{ needs.validate.outputs.version-name }}
+          path: release-assets
+
+      - name: Create or verify Draft Release
+        shell: bash
+        run: |
+          if gh release view "$APP_VERSION" --json isDraft > existing-release.json 2>/dev/null; then
+            [[ "$(jq -r .isDraft existing-release.json)" == "true" ]] || {
+              echo 'Refusing to replace an already published Release.' >&2
+              exit 1
+            }
+          else
+            gh release create "$APP_VERSION" \
+              --verify-tag \
+              --draft \
+              --title "MailFlow ${APP_VERSION#v}" \
+              --notes "Unsigned Windows x64 package and signed Android packages for $APP_VERSION."
+          fi
+
+      - name: Upload and verify all Release assets
+        shell: bash
+        run: |
+          gh release upload "$APP_VERSION" release-assets/* --clobber
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$APP_VERSION" > release.json
+          node frontend/packages/scripts/verify-release-assets.cjs release-assets release.json
+
+      - name: Publish stable Release
+        run: gh release edit "$APP_VERSION" --draft=false --prerelease=false --latest

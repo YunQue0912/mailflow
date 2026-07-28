@@ -1329,7 +1329,13 @@
       "sourceCode": "Codice sorgente",
       "sponsor": "Supporta lo sviluppo",
       "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors"
+      "githubSponsors": "GitHub Sponsors",
+      "updates": {
+        "title": "Aggiornamenti dell’app", "autoCheck": "Controlla automaticamente gli aggiornamenti", "currentVersion": "Versione attuale", "latestVersion": "Ultima versione", "published": "Pubblicata", "size": "Dimensione download", "notes": "Note di rilascio", "check": "Controlla aggiornamenti", "download": "Scarica aggiornamento", "later": "Più tardi", "skip": "Salta questa versione", "cancel": "Annulla", "install": "Riavvia e installa", "installAndroid": "Installa", "retry": "Riprova", "browser": "Scarica nel browser",
+        "notificationAvailableTitle": "Aggiornamento disponibile", "notificationAvailableBody": "MailFlow {{version}} è pronto per il download.", "notificationReadyTitle": "Aggiornamento pronto", "notificationReadyBody": "MailFlow {{version}} è pronto per l’installazione.", "notificationErrorTitle": "Controllo aggiornamenti non riuscito", "notificationInstallErrorTitle": "Installazione non riuscita", "notificationInstallErrorBody": "Impossibile installare l’aggiornamento verificato.",
+        "status": { "idle": "Pronto per il controllo degli aggiornamenti.", "checking": "Controllo aggiornamenti...", "up-to-date": "L’app è aggiornata.", "available": "È disponibile una versione firmata più recente.", "downloading": "Download e verifica dell’aggiornamento...", "downloaded": "L’aggiornamento è verificato e pronto.", "installing": "Riavvio per l’installazione...", "error": "Impossibile preparare l’aggiornamento.", "skipped": "Questa versione è stata saltata. Una versione più recente verrà mostrata automaticamente.", "deferred": "Questo aggiornamento verrà proposto di nuovo domani." },
+        "errors": { "genericError": "Il servizio di aggiornamento non è temporaneamente disponibile.", "downloadError": "Impossibile scaricare o verificare l’aggiornamento.", "verificationError": "Il pacchetto non ha superato la verifica di sicurezza.", "invalidRelease": "L’ultima versione non usa un numero personalizzato valido.", "packagedOnly": "Il controllo aggiornamenti è disponibile nell’app installata." }
+      }
     },
     "search": {
       "placeholder": "Cerca impostazioni…",

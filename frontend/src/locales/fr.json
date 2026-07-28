@@ -1329,7 +1329,13 @@
       "sourceCode": "Code source",
       "sponsor": "Soutenir le développement",
       "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors"
+      "githubSponsors": "GitHub Sponsors",
+      "updates": {
+        "title": "Mises à jour de l’application", "autoCheck": "Rechercher automatiquement les mises à jour", "currentVersion": "Version actuelle", "latestVersion": "Dernière version", "published": "Publication", "size": "Taille du téléchargement", "notes": "Notes de version", "check": "Rechercher des mises à jour", "download": "Télécharger la mise à jour", "later": "Plus tard", "skip": "Ignorer cette version", "cancel": "Annuler", "install": "Redémarrer et installer", "installAndroid": "Installer", "retry": "Réessayer", "browser": "Télécharger dans le navigateur",
+        "notificationAvailableTitle": "Mise à jour disponible", "notificationAvailableBody": "MailFlow {{version}} est prêt à être téléchargé.", "notificationReadyTitle": "Mise à jour prête", "notificationReadyBody": "MailFlow {{version}} est prêt à être installé.", "notificationErrorTitle": "Échec de la recherche", "notificationInstallErrorTitle": "Échec de l’installation", "notificationInstallErrorBody": "La mise à jour vérifiée n’a pas pu être installée.",
+        "status": { "idle": "Prêt à rechercher des mises à jour.", "checking": "Recherche de mises à jour...", "up-to-date": "L’application est à jour.", "available": "Une version signée plus récente est disponible.", "downloading": "Téléchargement et vérification...", "downloaded": "La mise à jour est vérifiée et prête à installer.", "installing": "Redémarrage pour l’installation...", "error": "La mise à jour n’a pas pu être préparée.", "skipped": "Cette version est ignorée. Une version plus récente sera affichée automatiquement.", "deferred": "Cette mise à jour sera proposée à nouveau demain." },
+        "errors": { "genericError": "Le service de mise à jour est temporairement indisponible.", "downloadError": "La mise à jour n’a pas pu être téléchargée ou vérifiée.", "verificationError": "Le paquet a échoué à la vérification de sécurité.", "invalidRelease": "La dernière version n’utilise pas un numéro personnalisé valide.", "packagedOnly": "La recherche de mises à jour est disponible dans l’application installée." }
+      }
     },
     "search": {
       "placeholder": "Rechercher dans les paramètres…",

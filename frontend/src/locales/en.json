@@ -1329,7 +1329,51 @@
       "sourceCode": "Source code",
       "sponsor": "Support development",
       "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors"
+      "githubSponsors": "GitHub Sponsors",
+      "updates": {
+        "title": "App updates",
+        "autoCheck": "Automatically check for app updates",
+        "currentVersion": "Current version",
+        "latestVersion": "Latest version",
+        "published": "Published",
+        "size": "Download size",
+        "notes": "Release notes",
+        "check": "Check for updates",
+        "download": "Download update",
+        "later": "Later",
+        "skip": "Skip this version",
+        "cancel": "Cancel",
+        "install": "Restart and install",
+        "installAndroid": "Install",
+        "retry": "Retry",
+        "browser": "Download in browser",
+        "notificationAvailableTitle": "App update available",
+        "notificationAvailableBody": "MailFlow {{version}} is ready to download.",
+        "notificationReadyTitle": "Update ready",
+        "notificationReadyBody": "MailFlow {{version}} is ready to install.",
+        "notificationErrorTitle": "Update check failed",
+        "notificationInstallErrorTitle": "Install failed",
+        "notificationInstallErrorBody": "The verified update could not be installed.",
+        "status": {
+          "idle": "Ready to check for updates.",
+          "checking": "Checking for updates...",
+          "up-to-date": "This app is up to date.",
+          "available": "A newer signed version is available.",
+          "downloading": "Downloading and verifying the update...",
+          "downloaded": "The update is verified and ready to install.",
+          "installing": "Restarting to install the update...",
+          "error": "The update could not be prepared.",
+          "skipped": "This version is skipped. A newer version will be shown automatically.",
+          "deferred": "This update will be offered again tomorrow."
+        },
+        "errors": {
+          "genericError": "The update service is temporarily unavailable.",
+          "downloadError": "The update could not be downloaded or verified.",
+          "verificationError": "The downloaded package failed security verification.",
+          "invalidRelease": "The latest release does not use a valid custom version.",
+          "packagedOnly": "Update checks are available in the installed app."
+        }
+      }
     },
     "search": {
       "placeholder": "Search settings…",

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="shortcut_compose_short_label">Новое письмо</string>
+    <string name="shortcut_compose_long_label">Написать</string>
+    <string name="shortcut_sync_short_label">Синхронизировать</string>
+    <string name="shortcut_sync_long_label">Синхронизировать</string>
+    <string name="update_channel_name">Обновления</string>
+    <string name="update_channel_description">Уведомления об обновлениях MailFlow</string>
+    <string name="update_ready_title">Обновление готово</string>
+    <string name="update_ready_message">MailFlow %1$s загружен и готов к установке.</string>
+    <string name="update_downloaded">MailFlow %1$s загружен.</string>
+    <string name="update_install">Установить</string>
+    <string name="update_later">Позже</string>
+</resources>

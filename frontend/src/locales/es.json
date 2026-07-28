@@ -1329,7 +1329,13 @@
       "sourceCode": "Código fuente",
       "sponsor": "Apoyar el desarrollo",
       "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors"
+      "githubSponsors": "GitHub Sponsors",
+      "updates": {
+        "title": "Actualizaciones de la aplicación", "autoCheck": "Buscar actualizaciones automáticamente", "currentVersion": "Versión actual", "latestVersion": "Última versión", "published": "Publicada", "size": "Tamaño de descarga", "notes": "Notas de la versión", "check": "Buscar actualizaciones", "download": "Descargar actualización", "later": "Más tarde", "skip": "Omitir esta versión", "cancel": "Cancelar", "install": "Reiniciar e instalar", "installAndroid": "Instalar", "retry": "Reintentar", "browser": "Descargar en el navegador",
+        "notificationAvailableTitle": "Actualización disponible", "notificationAvailableBody": "MailFlow {{version}} está listo para descargar.", "notificationReadyTitle": "Actualización lista", "notificationReadyBody": "MailFlow {{version}} está listo para instalar.", "notificationErrorTitle": "Error al buscar actualizaciones", "notificationInstallErrorTitle": "Error de instalación", "notificationInstallErrorBody": "No se pudo instalar la actualización verificada.",
+        "status": { "idle": "Listo para buscar actualizaciones.", "checking": "Buscando actualizaciones...", "up-to-date": "La aplicación está actualizada.", "available": "Hay una versión firmada más reciente.", "downloading": "Descargando y verificando la actualización...", "downloaded": "La actualización está verificada y lista para instalar.", "installing": "Reiniciando para instalar...", "error": "No se pudo preparar la actualización.", "skipped": "Esta versión se omitirá. Una versión más reciente aparecerá automáticamente.", "deferred": "Esta actualización se volverá a ofrecer mañana." },
+        "errors": { "genericError": "El servicio de actualizaciones no está disponible temporalmente.", "downloadError": "No se pudo descargar o verificar la actualización.", "verificationError": "El paquete no superó la verificación de seguridad.", "invalidRelease": "La última versión no usa una versión personalizada válida.", "packagedOnly": "La búsqueda de actualizaciones está disponible en la aplicación instalada." }
+      }
     },
     "search": {
       "placeholder": "Buscar ajustes…",

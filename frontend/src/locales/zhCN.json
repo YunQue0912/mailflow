@@ -1329,7 +1329,13 @@
       "sourceCode": "源代码",
       "sponsor": "支持开发",
       "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors"
+      "githubSponsors": "GitHub Sponsors",
+      "updates": {
+        "title": "应用更新", "autoCheck": "自动检查应用更新", "currentVersion": "当前版本", "latestVersion": "最新版本", "published": "发布日期", "size": "下载大小", "notes": "发布说明", "check": "检查更新", "download": "下载更新", "later": "稍后", "skip": "跳过此版本", "cancel": "取消", "install": "重启并安装", "installAndroid": "安装", "retry": "重试", "browser": "在浏览器中下载",
+        "notificationAvailableTitle": "有可用更新", "notificationAvailableBody": "MailFlow {{version}} 可以下载。", "notificationReadyTitle": "更新已就绪", "notificationReadyBody": "MailFlow {{version}} 可以安装。", "notificationErrorTitle": "检查更新失败", "notificationInstallErrorTitle": "安装失败", "notificationInstallErrorBody": "无法安装已验证的更新。",
+        "status": { "idle": "可以检查更新。", "checking": "正在检查更新…", "up-to-date": "当前已是最新版本。", "available": "有新的已签名版本可用。", "downloading": "正在下载并验证更新…", "downloaded": "更新已验证，可以安装。", "installing": "正在重启并安装更新…", "error": "无法准备更新。", "skipped": "已跳过此版本；出现更高版本时会自动恢复提示。", "deferred": "明天会再次提示此更新。" },
+        "errors": { "genericError": "更新服务暂时不可用。", "downloadError": "无法下载更新或更新验证失败。", "verificationError": "下载的安装包未通过安全验证。", "invalidRelease": "最新 Release 不是合法的定制版本。", "packagedOnly": "安装后的原生应用才能检查应用更新。" }
+      }
     },
     "search": {
       "placeholder": "搜索设置…",

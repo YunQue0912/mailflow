@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="shortcut_compose_short_label">Nuova email</string>
+    <string name="shortcut_compose_long_label">Scrivi</string>
+    <string name="shortcut_sync_short_label">Sincronizza</string>
+    <string name="shortcut_sync_long_label">Sincronizza</string>
+    <string name="update_channel_name">Aggiornamenti</string>
+    <string name="update_channel_description">Notifiche degli aggiornamenti di MailFlow</string>
+    <string name="update_ready_title">Aggiornamento pronto</string>
+    <string name="update_ready_message">MailFlow %1$s è stato scaricato ed è pronto per l’installazione.</string>
+    <string name="update_downloaded">MailFlow %1$s è stato scaricato.</string>
+    <string name="update_install">Installa</string>
+    <string name="update_later">Più tardi</string>
+</resources>

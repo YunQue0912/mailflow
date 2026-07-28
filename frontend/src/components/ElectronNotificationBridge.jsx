@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
 import { installCapacitorNativeBridge } from '../utils/capacitorNativeBridge.js';
+import {
+  NATIVE_UPDATE_KEYS,
+  shouldRecordNativeUpdateCheck,
+  shouldRunAutomaticNativeUpdateCheck,
+} from '../utils/nativeUpdatePolicy.js';
 
 export default function ElectronNotificationBridge() {
+  const { t } = useTranslation();
   const addNotification = useStore(state => state.addNotification);
   const openCompose = useStore(state => state.openCompose);
   const setSelectedAccount = useStore(state => state.setSelectedAccount);
@@ -56,22 +63,49 @@ export default function ElectronNotificationBridge() {
   useEffect(() => {
     if (!nativeBridgeReady) return undefined;
     const unsubscribe = window.mailflowNative?.updates?.onStatus?.((status) => {
+      if (status?.type === 'available') {
+        if (localStorage.getItem(NATIVE_UPDATE_KEYS.skippedVersion) === status.version) return;
+        const deferredVersion = localStorage.getItem(NATIVE_UPDATE_KEYS.deferredVersion);
+        if (deferredVersion === status.version
+          && Date.now() < Number(localStorage.getItem(NATIVE_UPDATE_KEYS.deferredUntil) || 0)) return;
+        addNotification({
+          type: 'info',
+          title: t('admin.about.updates.notificationAvailableTitle'),
+          body: t('admin.about.updates.notificationAvailableBody', { version: status.version }),
+          allowWrap: true,
+          actionLabel: t('admin.about.updates.download'),
+          onAction: () => window.mailflowNative?.updates?.download?.(),
+        });
+        return;
+      }
+
+      if (status?.type === 'error' && status.verbose) {
+        addNotification({
+          type: 'error',
+          title: t('admin.about.updates.notificationErrorTitle'),
+          body: t(`admin.about.updates.errors.${status.messageKey || 'genericError'}`),
+        });
+        return;
+      }
+
       if (status?.type !== 'downloaded') return;
 
       addNotification({
         type: 'success',
-        title: 'Update ready',
-        body: 'MailFlow downloaded the update.',
+        title: t('admin.about.updates.notificationReadyTitle'),
+        body: t('admin.about.updates.notificationReadyBody', { version: status.version }),
         allowWrap: true,
         persistent: true,
-        actionLabel: 'Install',
+        actionLabel: window.mailflowNative?.platform === 'android'
+          ? t('admin.about.updates.installAndroid')
+          : t('admin.about.updates.install'),
         onAction: async () => {
           const result = await window.mailflowNative?.updates?.installDownloaded?.();
           if (result && result.installed === false) {
             addNotification({
               type: 'error',
-              title: 'Install failed',
-              body: 'The update was downloaded, but the installer could not be started.',
+              title: t('admin.about.updates.notificationInstallErrorTitle'),
+              body: t('admin.about.updates.notificationInstallErrorBody'),
             });
           }
         },
@@ -81,12 +115,20 @@ export default function ElectronNotificationBridge() {
     return () => {
       if (typeof unsubscribe === 'function') unsubscribe();
     };
-  }, [addNotification, nativeBridgeReady]);
+  }, [addNotification, nativeBridgeReady, t]);
 
   useEffect(() => {
     if (!nativeBridgeReady) return;
-    if (window.mailflowNative?.platform !== 'android') return;
-    window.mailflowNative?.updates?.check?.(false)?.catch?.(() => {});
+    const autoCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.autoCheck) !== 'false';
+    const lastCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.lastCheck);
+    if (!shouldRunAutomaticNativeUpdateCheck({ autoCheck, lastCheck })) return;
+    window.mailflowNative?.updates?.check?.(false)
+      ?.then?.((result) => {
+        if (shouldRecordNativeUpdateCheck(result)) {
+          localStorage.setItem(NATIVE_UPDATE_KEYS.lastCheck, String(Date.now()));
+        }
+      })
+      ?.catch?.(() => {});
   }, [nativeBridgeReady]);
 
   useEffect(() => {

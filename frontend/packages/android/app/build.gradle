@@ -12,6 +12,7 @@ def releaseStoreFile = System.getenv("MAILFLOW_ANDROID_STORE_FILE")
 def releaseStorePassword = System.getenv("MAILFLOW_ANDROID_STORE_PASSWORD")
 def releaseKeyAlias = System.getenv("MAILFLOW_ANDROID_KEY_ALIAS")
 def releaseKeyPassword = System.getenv("MAILFLOW_ANDROID_KEY_PASSWORD")
+def androidCertificateSha256 = System.getenv("MAILFLOW_ANDROID_CERTIFICATE_SHA256") ?: ""
 
 android {
     namespace = "sh.mailflow.app"
@@ -21,14 +22,18 @@ android {
         applicationId "sh.mailflow.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0.0"
+        versionCode 207010005
+        versionName "2.7.1-custom.5"
+        buildConfigField "String", "MAILFLOW_ANDROID_CERTIFICATE_SHA256", "\"${androidCertificateSha256}\""
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
+    }
+    buildFeatures {
+        buildConfig true
     }
     signingConfigs {
         if (hasReleaseSigning) {

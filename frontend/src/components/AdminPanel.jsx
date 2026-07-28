@@ -13,6 +13,7 @@ import SignatureEditor from './SignatureEditor.jsx';
 import GtdZeroPet from './GtdZeroPet.jsx';
 import { getEffectiveShortcuts, getGroupedActions, ACTION_DEFS, SPECIAL_KEY_LABELS, parseModKey, modLabel } from '../utils/defaultShortcuts.js';
 import { DEFAULT_GTD_FOLDERS, GTD_STATES, resolveAccountGtdFolders, diffGtdFolders, findGtdFolderCollisions } from '../utils/gtd.js';
+import NativeUpdatePanel from './NativeUpdatePanel.jsx';
 
 // ─── Shared field component ───────────────────────────────────────────────────
 function Field({ label, required, children }) {
@@ -5505,6 +5506,7 @@ function AboutTab() {
           </div>
         ))}
       </div>
+      <NativeUpdatePanel />
     </div>
   );
 }

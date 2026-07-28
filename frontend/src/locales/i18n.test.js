@@ -354,6 +354,22 @@ const DYNAMIC_KEYS = new Set([
   // appear as literals; the other three do via the tab pills).
   'gtd.state.watch',
   'gtd.state.delegated',
+  // Native update state and error keys are selected from validated bridge enums.
+  'admin.about.updates.status.idle',
+  'admin.about.updates.status.checking',
+  'admin.about.updates.status.up-to-date',
+  'admin.about.updates.status.available',
+  'admin.about.updates.status.downloading',
+  'admin.about.updates.status.downloaded',
+  'admin.about.updates.status.installing',
+  'admin.about.updates.status.error',
+  'admin.about.updates.status.skipped',
+  'admin.about.updates.status.deferred',
+  'admin.about.updates.errors.genericError',
+  'admin.about.updates.errors.downloadError',
+  'admin.about.updates.errors.verificationError',
+  'admin.about.updates.errors.invalidRelease',
+  'admin.about.updates.errors.packagedOnly',
 ]);
 
 // JSX attribute names whose values must never be plain strings — always t().

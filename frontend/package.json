@@ -1,7 +1,7 @@
 {
   "name": "mailflow-frontend",
   "productName": "MailFlow",
-  "version": "2.7.1",
+  "version": "2.7.1-custom.5",
   "description": "A self-hosted, unified webmail client.",
   "homepage": "https://mailflow.sh",
   "author": {
@@ -64,6 +64,8 @@
     "win": {
       "artifactName": "${productName}-${version}-Setup.${ext}",
       "icon": "icon.ico",
+      "forceCodeSigning": false,
+      "verifyUpdateCodeSignature": false,
       "target": [
         "nsis"
       ]
@@ -132,7 +134,15 @@
         "--replaces=mailflow-frontend",
         "packages/electron/package-type/rpm=/opt/MailFlow/resources/package-type"
       ]
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "YunQue0912",
+        "repo": "mailflow",
+        "channel": "latest"
+      }
+    ]
   },
   "dependencies": {
     "@capacitor/android": "^8.3.4",
@@ -152,6 +162,7 @@
     "@tiptap/starter-kit": "^3.23.1",
     "date-fns": "^3.3.1",
     "dompurify": "^3.4.11",
+    "electron-updater": "^6.8.9",
     "i18next": "^26.0.8",
     "marked": "^18.0.6",
     "postcss": "^8.4.35",

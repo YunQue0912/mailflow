@@ -35,7 +35,10 @@ contextBridge.exposeInMainWorld('mailflowNative', {
     setUnreadCount: (count) => ipcRenderer.invoke('mailflow:badge:set-unread-count', count),
   },
   updates: {
+    getState: () => ipcRenderer.invoke('mailflow:updates:get-state'),
     check: (verbose) => ipcRenderer.invoke('mailflow:updates:check', { verbose }),
+    download: () => ipcRenderer.invoke('mailflow:updates:download'),
+    cancel: () => ipcRenderer.invoke('mailflow:updates:cancel'),
     installDownloaded: () => ipcRenderer.invoke('mailflow:updates:install-downloaded'),
     installAuto: () => ipcRenderer.invoke('mailflow:updates:install-auto'),
     openDownload: () => ipcRenderer.invoke('mailflow:updates:open-download'),

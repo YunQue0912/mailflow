@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="shortcut_compose_short_label">新邮件</string>
+    <string name="shortcut_compose_long_label">写邮件</string>
+    <string name="shortcut_sync_short_label">同步</string>
+    <string name="shortcut_sync_long_label">同步</string>
+    <string name="update_channel_name">应用更新</string>
+    <string name="update_channel_description">MailFlow 应用更新通知</string>
+    <string name="update_ready_title">更新已就绪</string>
+    <string name="update_ready_message">MailFlow %1$s 已下载，可以安装。</string>
+    <string name="update_downloaded">MailFlow %1$s 已下载。</string>
+    <string name="update_install">安装</string>
+    <string name="update_later">稍后</string>
+</resources>
