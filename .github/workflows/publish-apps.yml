@@ -151,6 +151,12 @@ jobs:
           $exe = Get-Item -LiteralPath (Join-Path $release "MailFlow-$env:VERSION_NAME-Setup.exe")
           Get-Item -LiteralPath "$($exe.FullName).blockmap" | Out-Null
           Get-Item -LiteralPath (Join-Path $release 'latest.yml') | Out-Null
+          $asar = Join-Path $release 'win-unpacked/resources/app.asar'
+          Get-Item -LiteralPath $asar | Out-Null
+          node -e "const path = require('path'); require('@electron/asar').extractFile(process.argv[1], path.win32.join('packages', 'shared', 'custom-release.cjs'))" $asar
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Packaged Electron app is missing packages/shared/custom-release.cjs.'
+          }
           $updateConfig = Get-Content -Raw -LiteralPath (Join-Path $release 'win-unpacked/resources/app-update.yml')
           if ($updateConfig -match '(?m)^publisherName:') {
             throw 'Unsigned Windows update configuration must not contain publisherName.'

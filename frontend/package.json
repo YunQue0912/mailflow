@@ -59,6 +59,7 @@
     "files": [
       "packages/electron/**/*",
       "packages/native-shell/**/*",
+      "packages/shared/custom-release.cjs",
       "package.json"
     ],
     "win": {

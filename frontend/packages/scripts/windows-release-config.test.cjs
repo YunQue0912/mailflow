@@ -20,3 +20,7 @@ test('does not inject a Windows publisher into app-update.yml', () => {
   assert.ok(githubPublisher);
   assert.equal(githubPublisher.publisherName, undefined);
 });
+
+test('packages the shared release parser required by the Electron updater', () => {
+  assert.ok(packageJson.build?.files?.includes('packages/shared/custom-release.cjs'));
+});
