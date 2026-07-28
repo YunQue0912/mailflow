@@ -11,14 +11,14 @@ const {
 } = require('./custom-release.cjs');
 
 test('parses a custom release tag and calculates Android versionCode', () => {
-  assert.deepEqual(parseCustomVersion('v2.7.1-custom.5'), {
+  assert.deepEqual(parseCustomVersion('v2.8.0-custom.1'), {
     major: 2,
-    minor: 7,
-    patch: 1,
-    custom: 5,
-    tag: 'v2.7.1-custom.5',
-    versionName: '2.7.1-custom.5',
-    versionCode: 207010005,
+    minor: 8,
+    patch: 0,
+    custom: 1,
+    tag: 'v2.8.0-custom.1',
+    versionName: '2.8.0-custom.1',
+    versionCode: 208000001,
   });
 });
 

@@ -9,9 +9,9 @@ import org.junit.Test;
 public class CustomReleaseVersionTest {
     @Test
     public void parsesVersionAndCalculatesVersionCode() {
-        int[] parsed = CustomReleaseVersion.parse("v2.7.1-custom.5");
-        assertArrayEquals(new int[] { 2, 7, 1, 5 }, parsed);
-        assertEquals(207010005L, CustomReleaseVersion.versionCode(parsed));
+        int[] parsed = CustomReleaseVersion.parse("v2.8.0-custom.1");
+        assertArrayEquals(new int[] { 2, 8, 0, 1 }, parsed);
+        assertEquals(208000001L, CustomReleaseVersion.versionCode(parsed));
     }
 
     @Test
