@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
+import { isNativeAppEnvironment } from '../utils/nativeUpdatePolicy.js';
 import { activateOnKey, collapsedTooltip } from '../utils/sidebar.js';
 import { useMobile } from '../hooks/useMobile.js';
 import LogoMark from './LogoMark.jsx';
@@ -478,6 +479,7 @@ export default function Sidebar() {
   // never contacts GitHub. Silent on any failure.
   const [updateInfo, setUpdateInfo] = useState(null);
   useEffect(() => {
+    if (isNativeAppEnvironment(window)) return undefined;
     let cancelled = false;
     fetch('/api/update')
       .then(r => (r.ok ? r.json() : null))

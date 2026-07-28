@@ -1,11 +1,20 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  isNativeAppEnvironment,
   NATIVE_UPDATE_CHECK_INTERVAL_MS,
   resolveNativeUpdateDisplayType,
   shouldRecordNativeUpdateCheck,
   shouldRunAutomaticNativeUpdateCheck,
 } from './nativeUpdatePolicy.js';
+
+test('server update notices are suppressed in Electron and Capacitor native apps', () => {
+  assert.equal(isNativeAppEnvironment({ mailflowNative: { updates: {} } }), true);
+  assert.equal(isNativeAppEnvironment({ Capacitor: { isNativePlatform: () => true } }), true);
+  assert.equal(isNativeAppEnvironment({ Capacitor: { getPlatform: () => 'android' } }), true);
+  assert.equal(isNativeAppEnvironment({ Capacitor: { getPlatform: () => 'web' } }), false);
+  assert.equal(isNativeAppEnvironment({}), false);
+});
 
 test('automatic update checks are enabled by default and throttled for 24 hours', () => {
   const now = 1_000_000_000;

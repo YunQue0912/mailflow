@@ -8,6 +8,14 @@ export const NATIVE_UPDATE_KEYS = Object.freeze({
 
 export const NATIVE_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+export function isNativeAppEnvironment(target = globalThis.window) {
+  if (target?.mailflowNative?.updates) return true;
+  const capacitor = target?.Capacitor;
+  if (typeof capacitor?.isNativePlatform === 'function') return capacitor.isNativePlatform();
+  if (typeof capacitor?.getPlatform === 'function') return capacitor.getPlatform() !== 'web';
+  return false;
+}
+
 export function shouldRunAutomaticNativeUpdateCheck({ autoCheck, lastCheck, now = Date.now() }) {
   if (autoCheck === false) return false;
   const previousCheck = Number(lastCheck || 0);
