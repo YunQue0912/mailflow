@@ -21,6 +21,22 @@ const mainActivity = fs.readFileSync(
   ),
   'utf8',
 );
+const nativePlugin = fs.readFileSync(
+  path.join(
+    __dirname,
+    '..',
+    'android',
+    'app',
+    'src',
+    'main',
+    'java',
+    'sh',
+    'mailflow',
+    'app',
+    'MailFlowNativePlugin.java',
+  ),
+  'utf8',
+);
 
 test('resolves the Android update plugin lazily after Capacitor creates its bridge', () => {
   const registerIndex = mainActivity.indexOf('registerPlugin(MailFlowNativePlugin.class);');
@@ -48,4 +64,19 @@ test('resolves the Android update plugin lazily after Capacitor creates its brid
     /private final MailFlowNativePlugin nativePlugin = new MailFlowNativePlugin\(\);/,
   );
   assert.doesNotMatch(mainActivity, /bridgeBuilder\.addPluginInstance/);
+});
+
+test('does not access the Capacitor context while constructing the native plugin', () => {
+  assert.match(
+    nativePlugin,
+    /private volatile JSObject lastUpdateStatus = null;/,
+  );
+  assert.doesNotMatch(
+    nativePlugin,
+    /lastUpdateStatus\s*=\s*updateStatus\("idle"\)/,
+  );
+  assert.match(
+    nativePlugin,
+    /public void load\(\)[\s\S]*lastUpdateStatus = downloadedUpdate/,
+  );
 });

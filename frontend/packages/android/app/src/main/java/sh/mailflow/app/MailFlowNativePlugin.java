@@ -91,7 +91,11 @@ public class MailFlowNativePlugin extends Plugin {
     private final AtomicBoolean updateDownloadStarted = new AtomicBoolean(false);
     private boolean installPendingPermission = false;
     private final AtomicBoolean cancelUpdateDownload = new AtomicBoolean(false);
-    private JSObject lastUpdateStatus = updateStatus("idle");
+    // Capacitor constructs the plugin before attaching its Bridge. Any field
+    // initializer that calls getContext() makes reflection-based registration
+    // fail and leaves every native update action unavailable. load() initializes
+    // this state after the Bridge has been attached.
+    private volatile JSObject lastUpdateStatus = null;
 
     @Override
     public void load() {
