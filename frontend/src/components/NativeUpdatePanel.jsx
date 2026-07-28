@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { NATIVE_UPDATE_KEYS, resolveNativeUpdateDisplayType } from '../utils/nativeUpdatePolicy.js';
+import {
+  formatNativeUpdateReleaseDate,
+  NATIVE_UPDATE_KEYS,
+  resolveNativeUpdateDisplayType,
+} from '../utils/nativeUpdatePolicy.js';
 
 function readAutoCheck() {
   return localStorage.getItem(NATIVE_UPDATE_KEYS.autoCheck) !== 'false';
@@ -65,9 +69,7 @@ export default function NativeUpdatePanel() {
 
   const displayedType = resolveNativeUpdateDisplayType(status, { skippedVersion, deferredVersion, deferredUntil });
   const size = formatBytes(status.size || status.progress?.total);
-  const published = status.releaseDate
-    ? new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium' }).format(new Date(status.releaseDate))
-    : null;
+  const published = formatNativeUpdateReleaseDate(status.releaseDate, i18n.language);
   const progress = Math.max(0, Math.min(100, Number(status.progress?.percent || 0)));
   const actionStyle = {
     border: '1px solid var(--border)', borderRadius: 6, padding: '7px 11px', fontSize: 12,

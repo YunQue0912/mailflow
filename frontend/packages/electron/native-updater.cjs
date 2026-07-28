@@ -1,15 +1,28 @@
 'use strict';
 
-const { autoUpdater, CancellationToken } = require('electron-updater');
 const { parseCustomVersion } = require('../shared/custom-release.cjs');
 
 const RELEASE_BASE_URL = 'https://github.com/YunQue0912/mailflow/releases';
 
-function createNativeUpdater({ app, shell, getWindow }) {
+function createNativeUpdater({
+  app,
+  shell,
+  getWindow,
+  updater: providedUpdater,
+  createCancellationToken: providedCancellationTokenFactory,
+  prepareToInstall = () => {},
+}) {
+  const updaterModule = providedUpdater && providedCancellationTokenFactory
+    ? null
+    : require('electron-updater');
+  const updater = providedUpdater || updaterModule.autoUpdater;
+  const createCancellationToken = providedCancellationTokenFactory
+    || (() => new updaterModule.CancellationToken());
   let initialized = false;
   let verboseCheck = false;
   let cancellationToken = null;
   let updateDownloaded = false;
+  let installStarted = false;
   let state = {
     type: 'idle',
     currentVersion: app.getVersion(),
@@ -50,25 +63,28 @@ function createNativeUpdater({ app, shell, getWindow }) {
     if (initialized) return;
     initialized = true;
 
-    autoUpdater.autoDownload = false;
-    autoUpdater.autoInstallOnAppQuit = false;
-    autoUpdater.allowPrerelease = true;
+    updater.autoDownload = false;
+    updater.autoInstallOnAppQuit = false;
+    updater.allowPrerelease = true;
+    updater.logger = console;
 
-    autoUpdater.on('checking-for-update', () => send('checking', { verbose: verboseCheck }));
-    autoUpdater.on('update-not-available', () => {
+    updater.on('checking-for-update', () => send('checking', { verbose: verboseCheck }));
+    updater.on('update-not-available', () => {
       updateDownloaded = false;
+      installStarted = false;
       send('up-to-date', { verbose: verboseCheck, latestVersion: app.getVersion(), progress: null });
     });
-    autoUpdater.on('update-available', (info) => {
+    updater.on('update-available', (info) => {
       const data = releaseData(info);
       if (!parseCustomVersion(data.version)) {
         send('error', { messageKey: 'invalidRelease', retryable: false });
         return;
       }
       updateDownloaded = false;
+      installStarted = false;
       send('available', { ...data, progress: null, retryable: true });
     });
-    autoUpdater.on('download-progress', (progress) => {
+    updater.on('download-progress', (progress) => {
       send('downloading', {
         progress: {
           percent: Math.max(0, Math.min(100, Number(progress.percent || 0))),
@@ -78,13 +94,16 @@ function createNativeUpdater({ app, shell, getWindow }) {
         },
       });
     });
-    autoUpdater.on('update-downloaded', (info) => {
+    updater.on('update-downloaded', (info) => {
       cancellationToken = null;
       updateDownloaded = true;
+      installStarted = false;
       send('downloaded', { ...releaseData(info), progress: null, retryable: true });
     });
-    autoUpdater.on('error', (error) => {
+    updater.on('error', (error) => {
       cancellationToken = null;
+      installStarted = false;
+      console.error('Native update error:', error);
       send('error', {
         messageKey: error?.code === 'ERR_UPDATER_INVALID_RELEASE_FEED' ? 'invalidRelease' : 'genericError',
         retryable: true,
@@ -99,12 +118,14 @@ function createNativeUpdater({ app, shell, getWindow }) {
       return send('error', { messageKey: 'packagedOnly', retryable: false, verbose: verboseCheck });
     }
     try {
-      const result = await autoUpdater.checkForUpdates();
+      const result = await updater.checkForUpdates();
       return {
-        updateAvailable: state.type === 'available' && Boolean(result?.updateInfo && parseCustomVersion(result.updateInfo.version)),
+        updateAvailable: ['available', 'downloaded'].includes(state.type)
+          && Boolean(result?.updateInfo && parseCustomVersion(result.updateInfo.version)),
         state,
       };
-    } catch {
+    } catch (error) {
+      console.error('Could not check for native updates:', error);
       return { updateAvailable: false, state };
     }
   }
@@ -114,10 +135,10 @@ function createNativeUpdater({ app, shell, getWindow }) {
     if (state.type !== 'available' && state.type !== 'error') {
       return { started: false, reason: 'not-available', state };
     }
-    cancellationToken = new CancellationToken();
+    cancellationToken = createCancellationToken();
     send('downloading', { progress: { percent: 0, transferred: 0, total: state.size || 0, bytesPerSecond: 0 } });
     try {
-      await autoUpdater.downloadUpdate(cancellationToken);
+      await updater.downloadUpdate(cancellationToken);
       return { started: true, state };
     } catch (error) {
       if (cancellationToken?.cancelled) {
@@ -137,8 +158,19 @@ function createNativeUpdater({ app, shell, getWindow }) {
 
   function install() {
     if (!updateDownloaded) return { installed: false, reason: 'missing-download' };
+    if (installStarted) return { installed: false, reason: 'already-installing' };
+    installStarted = true;
     send('installing');
-    setImmediate(() => autoUpdater.quitAndInstall(false, true));
+    setImmediate(() => {
+      try {
+        prepareToInstall();
+        updater.quitAndInstall(false, true);
+      } catch (error) {
+        installStarted = false;
+        console.error('Could not start native update installer:', error);
+        send('error', { messageKey: 'genericError', retryable: true });
+      }
+    });
     return { installed: true };
   }
 

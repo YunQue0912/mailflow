@@ -29,7 +29,24 @@ let mainWindow;
 let tray = null;
 let isQuitting = false;
 let nextNativeActionId = 1;
-const nativeUpdater = createNativeUpdater({ app, shell, getWindow: () => mainWindow });
+const nativeUpdater = createNativeUpdater({
+  app,
+  shell,
+  getWindow: () => mainWindow,
+  prepareToInstall: prepareToInstallUpdate,
+});
+
+function destroyTray() {
+  if (!tray) return;
+  tray.destroy();
+  tray = null;
+}
+
+function prepareToInstallUpdate() {
+  isQuitting = true;
+  if (mainWindow && !mainWindow.isDestroyed()) saveWindowBounds();
+  destroyTray();
+}
 
 function isAllowedExternalUrl(url) {
   try {
@@ -1340,6 +1357,7 @@ if (!gotSingleInstanceLock) {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  destroyTray();
 });
 
 app.on('open-url', (event, url) => {
