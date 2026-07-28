@@ -78,7 +78,10 @@ public class MailFlowNativePlugin extends Plugin {
     private static final String PREF_UPDATE_VERSION_CODE = "update_version_code";
     private static final String PREF_LAST_UPDATE_CHECK = "last_update_check";
     private static final String SETUP_URL = "file:///android_asset/public/index.html";
-    private static final String UPDATE_RELEASE_URL = "https://api.github.com/repos/YunQue0912/mailflow/releases/latest";
+    private static final String UPDATE_MANIFEST_URL =
+        "https://github.com/YunQue0912/mailflow/releases/latest/download/update-manifest.json";
+    private static final String UPDATE_DOWNLOAD_BASE =
+        "https://github.com/YunQue0912/mailflow/releases/download/";
     private static final long UPDATE_CHECK_INTERVAL_MS = 24L * 60L * 60L * 1000L;
     private static final int MAX_JSON_BYTES = 1024 * 1024;
     private static final long MAX_APK_BYTES = 250L * 1024L * 1024L;
@@ -236,7 +239,7 @@ public class MailFlowNativePlugin extends Plugin {
 
         new Thread(() -> {
             try {
-                Log.i(TAG, "Checking for updates from " + UPDATE_RELEASE_URL);
+                Log.i(TAG, "Checking for updates from " + UPDATE_MANIFEST_URL);
                 ReleaseInfo release = fetchLatestRelease();
                 Log.i(TAG, "Latest release " + release.version + ", installed " + getInstalledVersion() + ", APK " + release.downloadUrl);
                 getPrefs(getContext()).edit().putLong(PREF_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
@@ -299,7 +302,7 @@ public class MailFlowNativePlugin extends Plugin {
                 }
             } catch (Exception error) {
                 Log.e(TAG, "Update check failed", error);
-                sendUpdateError("genericError", verbose);
+                sendUpdateError("genericError", verbose, error);
                 if (call != null) {
                     JSObject result = new JSObject();
                     result.put("updateAvailable", false);
@@ -802,36 +805,17 @@ public class MailFlowNativePlugin extends Plugin {
     }
 
     private ReleaseInfo fetchLatestRelease() throws Exception {
-        JSONObject release = requestJson(UPDATE_RELEASE_URL);
-        if (release.optBoolean("draft", false) || release.optBoolean("prerelease", false)) {
-            throw new Exception("Latest GitHub Release is not on the stable channel.");
-        }
-
-        String tag = release.optString("tag_name", "");
-        int[] parsedVersion = parseVersion(tag);
-        if (parsedVersion == null) throw new Exception("Latest GitHub Release has an invalid custom tag.");
-
-        org.json.JSONArray assets = release.optJSONArray("assets");
-        JSONObject manifestAsset = null;
-
-        if (assets != null) {
-            for (int i = 0; i < assets.length(); i++) {
-                JSONObject asset = assets.optJSONObject(i);
-                if (asset == null) continue;
-
-                if ("update-manifest.json".equals(asset.optString("name", ""))) {
-                    manifestAsset = asset;
-                    break;
-                }
-            }
-        }
-
-        if (manifestAsset == null) throw new Exception("Stable Release is missing update-manifest.json.");
-        JSONObject manifest = requestJson(manifestAsset.optString("browser_download_url", ""));
+        // Use the stable Release download endpoint directly. GitHub's REST API
+        // is rate-limited per public IP and can fail on carrier-grade mobile
+        // networks even when the same URL opens in an authenticated browser.
+        JSONObject manifest = requestJson(UPDATE_MANIFEST_URL);
         if (manifest.optInt("schemaVersion", 0) != 1 || !"stable".equals(manifest.optString("channel", ""))) {
             throw new Exception("Unsupported update manifest schema or channel.");
         }
-        if (!tag.equals(manifest.optString("tag", ""))) throw new Exception("Release and manifest tags differ.");
+
+        String tag = manifest.optString("tag", "");
+        int[] parsedVersion = parseVersion(tag);
+        if (parsedVersion == null) throw new Exception("Stable update manifest has an invalid custom tag.");
 
         JSONObject android = manifest.optJSONObject("android");
         if (android == null || !getContext().getPackageName().equals(android.optString("packageName", ""))) {
@@ -839,36 +823,27 @@ public class MailFlowNativePlugin extends Plugin {
         }
 
         String assetName = android.optString("asset", "");
-        JSONObject apkAsset = null;
-        if (assets != null) {
-            for (int i = 0; i < assets.length(); i++) {
-                JSONObject asset = assets.optJSONObject(i);
-                if (asset != null && assetName.equals(asset.optString("name", ""))) {
-                    apkAsset = asset;
-                    break;
-                }
-            }
+        if (!assetName.matches("[A-Za-z0-9._-]+\\.apk")) {
+            throw new Exception("Manifest APK asset name is invalid.");
         }
-        if (apkAsset == null || !assetName.endsWith(".apk")) throw new Exception("Manifest APK asset is missing.");
 
         ReleaseInfo info = new ReleaseInfo();
         info.version = tag;
-        info.releaseName = release.optString("name", info.version);
-        info.releaseNotes = release.optString("body", "");
-        info.releaseDate = release.optString("published_at", "");
+        info.releaseName = manifest.optString("versionName", info.version);
+        info.releaseNotes = "";
+        info.releaseDate = manifest.optString("publishedAt", "");
         info.assetName = assetName;
-        info.downloadUrl = apkAsset.optString("browser_download_url", null);
+        info.downloadUrl = UPDATE_DOWNLOAD_BASE + tag + "/" + assetName;
+        info.releaseUrl = "https://github.com/YunQue0912/mailflow/releases/tag/" + tag;
         info.assetSize = android.optLong("size", -1L);
         info.sha256 = normalizeFingerprint(android.optString("sha256", ""));
         info.certificateSha256 = normalizeFingerprint(android.optString("certificateSha256", ""));
         info.versionCode = android.optLong("versionCode", -1L);
 
-        long releaseAssetSize = apkAsset.optLong("size", -1L);
         String compiledCertificate = normalizeFingerprint(BuildConfig.MAILFLOW_ANDROID_CERTIFICATE_SHA256);
         if (info.versionCode != toVersionCode(parsedVersion)
             || info.assetSize <= 0L
             || info.assetSize > MAX_APK_BYTES
-            || info.assetSize != releaseAssetSize
             || info.sha256.length() != 64
             || compiledCertificate.length() != 64
             || !compiledCertificate.equals(info.certificateSha256)) {
@@ -1268,10 +1243,17 @@ public class MailFlowNativePlugin extends Plugin {
     }
 
     private void sendUpdateError(String message, boolean verbose) {
+        sendUpdateError(message, verbose, null);
+    }
+
+    private void sendUpdateError(String message, boolean verbose, Exception error) {
         JSObject status = updateStatus("error");
         status.put("messageKey", message);
         status.put("retryable", true);
         status.put("verbose", verbose);
+        if (error != null) {
+            status.put("diagnostic", error.getClass().getSimpleName() + ": " + String.valueOf(error.getMessage()));
+        }
         sendUpdateStatus(status);
     }
 
@@ -1403,6 +1385,7 @@ public class MailFlowNativePlugin extends Plugin {
         String releaseDate;
         String assetName;
         String downloadUrl;
+        String releaseUrl;
         String sha256;
         String certificateSha256;
         long assetSize;
@@ -1418,7 +1401,9 @@ public class MailFlowNativePlugin extends Plugin {
             data.put("updateUrl", downloadUrl);
             data.put("size", assetSize);
             data.put("versionCode", versionCode);
-            data.put("releaseUrl", version == null ? "https://github.com/YunQue0912/mailflow/releases" : "https://github.com/YunQue0912/mailflow/releases/tag/" + version);
+            data.put("releaseUrl", releaseUrl == null
+                ? "https://github.com/YunQue0912/mailflow/releases"
+                : releaseUrl);
             data.put("manual", true);
             return data;
         }
