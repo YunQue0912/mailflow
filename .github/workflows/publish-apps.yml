@@ -241,7 +241,7 @@ jobs:
           npm run app:version -- "$APP_VERSION"
           npm run android:sync
           pushd packages/android
-          ./gradlew test lint assembleRelease bundleRelease
+          bash ./gradlew test lint assembleRelease bundleRelease
           popd
           node packages/scripts/collect-android-artifacts.cjs
 
