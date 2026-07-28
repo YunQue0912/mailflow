@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   callAndroidJavascriptInterface,
+  installCapacitorNativeBridge,
   pollAndroidUpdateState,
+  subscribeNativePluginEvent,
 } from './capacitorNativeBridge.js';
 
 test('reads structured update state from the Android JavaScript interface', () => {
@@ -87,4 +89,45 @@ test('returns null when the direct Android bridge never leaves idle', async () =
   });
 
   assert.equal(result, null);
+});
+
+test('native action subscription is a safe no-op without a Capacitor plugin proxy', () => {
+  assert.doesNotThrow(() => {
+    const unsubscribe = subscribeNativePluginEvent(null, 'nativeAction', () => {});
+    assert.equal(typeof unsubscribe, 'function');
+    unsubscribe();
+  });
+});
+
+test('native action subscription contains synchronous plugin lookup failures', () => {
+  assert.doesNotThrow(() => {
+    const unsubscribe = subscribeNativePluginEvent(
+      () => {
+        throw new TypeError('registerNativePlugin is not a function');
+      },
+      'nativeAction',
+      () => {},
+    );
+    assert.equal(typeof unsubscribe, 'function');
+    unsubscribe();
+  });
+});
+
+test('Android JavaScript interface can mount post-login action listeners without Capacitor', async () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = Object.assign(new EventTarget(), {
+    MailFlowAndroid: {},
+    Capacitor: {},
+  });
+
+  try {
+    assert.equal(await installCapacitorNativeBridge(), true);
+    assert.doesNotThrow(() => {
+      const unsubscribe = globalThis.window.mailflowNative.actions.onAction(() => {});
+      assert.equal(typeof unsubscribe, 'function');
+      unsubscribe();
+    });
+  } finally {
+    globalThis.window = originalWindow;
+  }
 });

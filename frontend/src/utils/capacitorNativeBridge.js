@@ -55,6 +55,10 @@ function dispatchAndroidUpdateStatus(target, status) {
 
 function getPlugin() {
   if (plugin) return plugin;
+  if (typeof registerNativePlugin !== 'function') {
+    pluginUnavailable = true;
+    return null;
+  }
   plugin = registerNativePlugin('MailFlowNative');
   return plugin;
 }
@@ -64,6 +68,7 @@ async function callNative(method, args, fallback = null) {
 
   try {
     const MailFlowNative = getPlugin();
+    if (!MailFlowNative || typeof MailFlowNative[method] !== 'function') return fallback;
     return await MailFlowNative[method](args);
   } catch (error) {
     if (String(error?.message || error).includes('not implemented')) {
@@ -77,6 +82,22 @@ async function callNativeUpdate(androidMethod, androidArgs, pluginMethod, plugin
   const direct = callAndroidJavascriptInterface(window, androidMethod, androidArgs, fallback);
   if (direct.available && direct.value?.reason !== 'unavailable') return direct.value;
   return callNative(pluginMethod, pluginArgs, fallback);
+}
+
+export function subscribeNativePluginEvent(pluginFactory, eventName, callback) {
+  let handlePromise = Promise.resolve(null);
+
+  try {
+    const nativePlugin = typeof pluginFactory === 'function' ? pluginFactory() : null;
+    if (!nativePlugin || typeof nativePlugin.addListener !== 'function') return () => {};
+    handlePromise = Promise.resolve(nativePlugin.addListener(eventName, callback)).catch(() => null);
+  } catch {
+    return () => {};
+  }
+
+  return () => {
+    handlePromise.then((handle) => handle?.remove?.()).catch(() => {});
+  };
 }
 
 export async function installCapacitorNativeBridge() {
@@ -184,12 +205,16 @@ export async function installCapacitorNativeBridge() {
         onStatus: (callback) => {
           const onDomStatus = (event) => callback(normalizeUpdateStatus(event.detail));
           window.addEventListener('mailflow:update-status', onDomStatus);
-          const handlePromise = !hasAndroidInterface && registerNativePlugin && !pluginUnavailable
-            ? getPlugin().addListener('updateStatus', (status) => callback(normalizeUpdateStatus(status))).catch(() => null)
-            : Promise.resolve(null);
+          const unsubscribePlugin = !hasAndroidInterface && !pluginUnavailable
+            ? subscribeNativePluginEvent(
+              getPlugin,
+              'updateStatus',
+              (status) => callback(normalizeUpdateStatus(status)),
+            )
+            : () => {};
           return () => {
             window.removeEventListener('mailflow:update-status', onDomStatus);
-            handlePromise.then((handle) => handle?.remove?.()).catch(() => {});
+            unsubscribePlugin();
           };
         },
       },
@@ -213,14 +238,9 @@ export async function installCapacitorNativeBridge() {
           return result?.actions || [];
         },
         ack: async (id) => callNative('ackAction', { id }),
-        onAction: (callback) => {
-          if (pluginUnavailable) return () => {};
-          const MailFlowNative = getPlugin();
-          const handlePromise = MailFlowNative.addListener('nativeAction', callback).catch(() => null);
-          return () => {
-            handlePromise.then((handle) => handle?.remove?.()).catch(() => {});
-          };
-        },
+        onAction: (callback) => (pluginUnavailable
+          ? () => {}
+          : subscribeNativePluginEvent(getPlugin, 'nativeAction', callback)),
       },
     };
 
