@@ -265,10 +265,21 @@ jobs:
           [[ "$BADGING" == *"versionName='$VERSION_NAME'"* ]]
 
           CERT_OUTPUT="$($APKSIGNER verify --verbose --print-certs "$APK")"
-          ACTUAL_CERTIFICATE="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' <<<"$CERT_OUTPUT" | head -n 1 | tr -cd '[:xdigit:]' | tr '[:lower:]' '[:upper:]')"
+          CERTIFICATE_LINE="$(grep -im1 'certificate SHA-256 digest:' <<<"$CERT_OUTPUT" || true)"
+          ACTUAL_CERTIFICATE="$(cut -d: -f2- <<<"$CERTIFICATE_LINE" | tr -cd '[:xdigit:]' | tr '[:lower:]' '[:upper:]')"
           EXPECTED_NORMALIZED="$(tr -cd '[:xdigit:]' <<<"$EXPECTED_CERTIFICATE" | tr '[:lower:]' '[:upper:]')"
-          [[ ${#EXPECTED_NORMALIZED} -eq 64 && "$ACTUAL_CERTIFICATE" == "$EXPECTED_NORMALIZED" ]] || {
-            echo 'Android signing certificate SHA-256 mismatch.' >&2
+
+          [[ ${#EXPECTED_NORMALIZED} -eq 64 ]] || {
+            echo 'Configured Android certificate SHA-256 is not a 64-character hexadecimal digest.' >&2
+            exit 1
+          }
+          [[ ${#ACTUAL_CERTIFICATE} -eq 64 ]] || {
+            echo 'Unable to parse the Android signing certificate SHA-256 from apksigner output.' >&2
+            printf '%s\n' "$CERT_OUTPUT" >&2
+            exit 1
+          }
+          [[ "$ACTUAL_CERTIFICATE" == "$EXPECTED_NORMALIZED" ]] || {
+            printf 'Android signing certificate SHA-256 mismatch. Expected %s, got %s.\n' "$EXPECTED_NORMALIZED" "$ACTUAL_CERTIFICATE" >&2
             exit 1
           }
 
