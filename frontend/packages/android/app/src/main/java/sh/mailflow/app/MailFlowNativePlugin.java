@@ -1383,7 +1383,7 @@ public class MailFlowNativePlugin extends Plugin {
 
     private static boolean isConfiguredHost(Context context, String url) {
         String host = getSavedHost(context);
-        return host != null && url != null && url.startsWith(host);
+        return WebNavigationPolicy.isConfiguredOrigin(host, url);
     }
 
     private static class ReleaseInfo {
@@ -1479,10 +1479,20 @@ public class MailFlowNativePlugin extends Plugin {
 
     public static class NotificationBridge {
         private final Context context;
+        private final MailFlowNativePlugin nativePlugin;
 
         NotificationBridge(Context context) {
+            this(context, null);
+        }
+
+        NotificationBridge(Context context, MailFlowNativePlugin nativePlugin) {
             this.context = context.getApplicationContext();
+            this.nativePlugin = nativePlugin;
             createNotificationChannel(this.context);
+        }
+
+        private MailFlowNativePlugin getNativePlugin() {
+            return nativePlugin != null ? nativePlugin : instance;
         }
 
         @JavascriptInterface
@@ -1506,40 +1516,45 @@ public class MailFlowNativePlugin extends Plugin {
 
         @JavascriptInterface
         public String installDownloadedUpdate() {
-            if (instance == null) {
+            MailFlowNativePlugin plugin = getNativePlugin();
+            if (plugin == null) {
                 JSObject result = new JSObject();
                 result.put("installed", false);
                 result.put("reason", "unavailable");
                 return result.toString();
             }
 
-            return instance.showUpdateReadyDialog().toString();
+            return plugin.showUpdateReadyDialog().toString();
         }
 
         @JavascriptInterface
         public String getUpdateState() {
-            return instance == null
+            MailFlowNativePlugin plugin = getNativePlugin();
+            return plugin == null
                 ? unavailableUpdateState().toString()
-                : instance.currentUpdateState().toString();
+                : plugin.currentUpdateState().toString();
         }
 
         @JavascriptInterface
         public String checkForUpdates(boolean verbose) {
-            return instance == null
+            MailFlowNativePlugin plugin = getNativePlugin();
+            return plugin == null
                 ? unavailableResult("started").toString()
-                : instance.beginUpdateCheck(verbose).toString();
+                : plugin.beginUpdateCheck(verbose).toString();
         }
 
         @JavascriptInterface
         public String downloadUpdate() {
-            return instance == null
+            MailFlowNativePlugin plugin = getNativePlugin();
+            return plugin == null
                 ? unavailableResult("started").toString()
-                : instance.beginUpdateDownload().toString();
+                : plugin.beginUpdateDownload().toString();
         }
 
         @JavascriptInterface
         public String cancelUpdateDownload() {
-            if (instance != null) return instance.cancelUpdateDownloadResult().toString();
+            MailFlowNativePlugin plugin = getNativePlugin();
+            if (plugin != null) return plugin.cancelUpdateDownloadResult().toString();
             JSObject result = new JSObject();
             result.put("cancelled", false);
             return result.toString();
@@ -1547,9 +1562,10 @@ public class MailFlowNativePlugin extends Plugin {
 
         @JavascriptInterface
         public String openUpdateInBrowser() {
-            return instance == null
+            MailFlowNativePlugin plugin = getNativePlugin();
+            return plugin == null
                 ? unavailableResult("opened").toString()
-                : instance.openUpdateReleasePage().toString();
+                : plugin.openUpdateReleasePage().toString();
         }
 
         private JSObject unavailableUpdateState() {

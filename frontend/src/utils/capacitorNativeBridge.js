@@ -3,6 +3,8 @@ let plugin = null;
 let registerNativePlugin = null;
 let installPromise = null;
 let pluginUnavailable = false;
+let directUpdatePollGeneration = 0;
+const DIRECT_UPDATE_TERMINAL_STATES = new Set(['available', 'up-to-date', 'downloaded', 'error']);
 
 function normalizeUpdateStatus(status) {
   if (!status?.data || typeof status.data !== 'object') return status;
@@ -22,6 +24,33 @@ export function callAndroidJavascriptInterface(target, method, args = [], fallba
   } catch {
     return { available: true, value: fallback };
   }
+}
+
+export async function pollAndroidUpdateState(target, {
+  onStatus = () => {},
+  wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  intervalMs = 250,
+  maxAttempts = 120,
+} = {}) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const direct = callAndroidJavascriptInterface(target, 'getUpdateState', [], null);
+    if (!direct.available) return null;
+
+    const status = normalizeUpdateStatus(direct.value);
+    if (status?.type) {
+      onStatus(status);
+      if (DIRECT_UPDATE_TERMINAL_STATES.has(status.type)) return status;
+    }
+
+    await wait(intervalMs);
+  }
+
+  return null;
+}
+
+function dispatchAndroidUpdateStatus(target, status) {
+  if (!status || typeof target?.dispatchEvent !== 'function') return;
+  target.dispatchEvent(new CustomEvent('mailflow:update-status', { detail: status }));
 }
 
 function getPlugin() {
@@ -46,7 +75,7 @@ async function callNative(method, args, fallback = null) {
 
 async function callNativeUpdate(androidMethod, androidArgs, pluginMethod, pluginArgs, fallback = null) {
   const direct = callAndroidJavascriptInterface(window, androidMethod, androidArgs, fallback);
-  if (direct.available) return direct.value;
+  if (direct.available && direct.value?.reason !== 'unavailable') return direct.value;
   return callNative(pluginMethod, pluginArgs, fallback);
 }
 
@@ -87,9 +116,56 @@ export async function installCapacitorNativeBridge() {
         getState: async () => normalizeUpdateStatus(await callNativeUpdate(
           'getUpdateState', [], 'getUpdateState', undefined, { type: 'idle' },
         )),
-        check: async (verbose) => callNativeUpdate(
-          'checkForUpdates', [Boolean(verbose)], 'checkForUpdates', { verbose }, { started: false },
-        ),
+        check: async (verbose) => {
+          const current = normalizeUpdateStatus(callAndroidJavascriptInterface(
+            window, 'getUpdateState', [], { type: 'idle' },
+          ).value);
+          if (hasAndroidInterface) {
+            dispatchAndroidUpdateStatus(window, {
+              ...current,
+              type: 'checking',
+              verbose: Boolean(verbose),
+            });
+          }
+
+          const result = await callNativeUpdate(
+            'checkForUpdates', [Boolean(verbose)], 'checkForUpdates', { verbose }, { started: false },
+          );
+
+          if (!hasAndroidInterface) return result;
+
+          const pollGeneration = ++directUpdatePollGeneration;
+          if (!result?.started) {
+            dispatchAndroidUpdateStatus(window, {
+              ...current,
+              type: 'error',
+              messageKey: 'genericError',
+              retryable: true,
+              verbose: Boolean(verbose),
+            });
+            return result;
+          }
+
+          pollAndroidUpdateState(window, {
+            onStatus: (status) => {
+              if (pollGeneration === directUpdatePollGeneration) {
+                dispatchAndroidUpdateStatus(window, status);
+              }
+            },
+          }).then((status) => {
+            if (!status && pollGeneration === directUpdatePollGeneration) {
+              dispatchAndroidUpdateStatus(window, {
+                ...current,
+                type: 'error',
+                messageKey: 'genericError',
+                retryable: true,
+                verbose: Boolean(verbose),
+              });
+            }
+          }).catch(() => {});
+
+          return result;
+        },
         download: async () => callNativeUpdate(
           'downloadUpdate', [], 'downloadUpdate', undefined, { started: false, reason: 'unavailable' },
         ),

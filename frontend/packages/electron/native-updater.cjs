@@ -11,6 +11,8 @@ function createNativeUpdater({
   updater: providedUpdater,
   createCancellationToken: providedCancellationTokenFactory,
   prepareToInstall = () => {},
+  forceExit = () => {},
+  scheduleForceExit = (callback) => setTimeout(callback, 500),
 }) {
   const updaterModule = providedUpdater && providedCancellationTokenFactory
     ? null
@@ -165,6 +167,10 @@ function createNativeUpdater({
       try {
         prepareToInstall();
         updater.quitAndInstall(false, true);
+        scheduleForceExit(() => {
+          console.warn('Forcing MailFlow to exit after handing control to the update installer.');
+          forceExit();
+        });
       } catch (error) {
         installStarted = false;
         console.error('Could not start native update installer:', error);

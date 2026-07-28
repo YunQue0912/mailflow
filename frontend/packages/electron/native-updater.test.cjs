@@ -10,6 +10,8 @@ function createHarness() {
   const sent = [];
   let prepared = 0;
   let installed = 0;
+  let forcedExit = 0;
+  let scheduledExit = null;
   updater.checkForUpdates = async () => ({ updateInfo: { version: '2.8.0-custom.3' } });
   updater.downloadUpdate = async () => [];
   updater.quitAndInstall = () => { installed += 1; };
@@ -24,12 +26,16 @@ function createHarness() {
     updater,
     createCancellationToken: () => ({ cancel() {}, cancelled: false }),
     prepareToInstall: () => { prepared += 1; },
+    forceExit: () => { forcedExit += 1; },
+    scheduleForceExit: (callback) => { scheduledExit = callback; },
   });
 
   return {
     get installed() { return installed; },
+    get forcedExit() { return forcedExit; },
     nativeUpdater,
     get prepared() { return prepared; },
+    runScheduledExit() { scheduledExit?.(); },
     sent,
     updater,
   };
@@ -61,7 +67,11 @@ test('installation prepares the application before starting NSIS', async () => {
 
   assert.equal(harness.prepared, 1);
   assert.equal(harness.installed, 1);
+  assert.equal(harness.forcedExit, 0);
   assert.equal(harness.nativeUpdater.getState().type, 'installing');
+
+  harness.runScheduledExit();
+  assert.equal(harness.forcedExit, 1);
 });
 
 test('duplicate install requests are rejected', async () => {

@@ -8,6 +8,7 @@ import android.webkit.CookieManager;
 import android.webkit.WebView;
 import androidx.activity.OnBackPressedCallback;
 import com.getcapacitor.BridgeActivity;
+import com.getcapacitor.PluginHandle;
 
 public class MainActivity extends BridgeActivity {
     private String lastHandledIntentKey = null;
@@ -25,7 +26,15 @@ public class MainActivity extends BridgeActivity {
 
         if (bridge != null) {
             configureCookies();
-            bridge.getWebView().addJavascriptInterface(new MailFlowNativePlugin.NotificationBridge(this), "MailFlowAndroid");
+            PluginHandle nativePluginHandle = bridge.getPlugin("MailFlowNative");
+            MailFlowNativePlugin nativePlugin = nativePluginHandle != null
+                && nativePluginHandle.getInstance() instanceof MailFlowNativePlugin
+                ? (MailFlowNativePlugin) nativePluginHandle.getInstance()
+                : null;
+            bridge.getWebView().addJavascriptInterface(
+                new MailFlowNativePlugin.NotificationBridge(this, nativePlugin),
+                "MailFlowAndroid"
+            );
             bridge.setWebViewClient(new MailFlowWebViewClient(bridge, this));
             String savedHost = MailFlowNativePlugin.getSavedHost(this);
             if (savedHost != null) {

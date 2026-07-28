@@ -34,6 +34,7 @@ const nativeUpdater = createNativeUpdater({
   shell,
   getWindow: () => mainWindow,
   prepareToInstall: prepareToInstallUpdate,
+  forceExit: () => app.exit(0),
 });
 
 function destroyTray() {
@@ -46,6 +47,9 @@ function prepareToInstallUpdate() {
   isQuitting = true;
   if (mainWindow && !mainWindow.isDestroyed()) saveWindowBounds();
   destroyTray();
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.destroy();
+  }
 }
 
 function isAllowedExternalUrl(url) {
