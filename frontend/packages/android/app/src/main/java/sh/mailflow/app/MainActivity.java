@@ -4,21 +4,24 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.webkit.CookieManager;
 import android.webkit.WebView;
 import androidx.activity.OnBackPressedCallback;
 import com.getcapacitor.BridgeActivity;
+import com.getcapacitor.PluginHandle;
+import com.getcapacitor.PluginLoadException;
 
 public class MainActivity extends BridgeActivity {
-    private final MailFlowNativePlugin nativePlugin = new MailFlowNativePlugin();
+    private static final String TAG = "MailFlowMain";
     private String lastHandledIntentKey = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        // Register the exact instance used by the direct JavaScript interface.
-        // Looking it up by plugin id here is timing-sensitive on remote pages
-        // and can leave update actions unavailable while version reads work.
-        bridgeBuilder.addPluginInstance(nativePlugin);
+        // Let Capacitor create the plugin only after its Bridge is ready.
+        // Creating a Plugin as an Activity field can access its Context before
+        // attachment and crash the application during startup.
+        registerPlugin(MailFlowNativePlugin.class);
         super.onCreate(savedInstanceState);
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -30,7 +33,15 @@ public class MainActivity extends BridgeActivity {
         if (bridge != null) {
             configureCookies();
             bridge.getWebView().addJavascriptInterface(
-                new MailFlowNativePlugin.NotificationBridge(this, nativePlugin),
+                new MailFlowNativePlugin.NotificationBridge(
+                    this,
+                    new MailFlowNativePlugin.NativePluginProvider() {
+                        @Override
+                        public MailFlowNativePlugin get() {
+                            return resolveNativePlugin();
+                        }
+                    }
+                ),
                 "MailFlowAndroid"
             );
             bridge.setWebViewClient(new MailFlowWebViewClient(bridge, this));
@@ -42,6 +53,27 @@ public class MainActivity extends BridgeActivity {
         }
 
         handleNativeIntent(getIntent());
+    }
+
+    private MailFlowNativePlugin resolveNativePlugin() {
+        if (bridge == null) return null;
+
+        PluginHandle handle = bridge.getPlugin("MailFlowNative");
+        if (handle == null) {
+            Log.e(TAG, "MailFlowNative plugin is not registered");
+            return null;
+        }
+
+        try {
+            Object plugin = handle.getInstance();
+            if (plugin == null) plugin = handle.load();
+            return plugin instanceof MailFlowNativePlugin
+                ? (MailFlowNativePlugin) plugin
+                : null;
+        } catch (PluginLoadException error) {
+            Log.e(TAG, "Unable to load MailFlowNative plugin", error);
+            return null;
+        }
     }
 
     @Override

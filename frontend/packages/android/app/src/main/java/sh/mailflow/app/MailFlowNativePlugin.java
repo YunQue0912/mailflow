@@ -1487,22 +1487,29 @@ public class MailFlowNativePlugin extends Plugin {
         return result;
     }
 
+    public interface NativePluginProvider {
+        MailFlowNativePlugin get();
+    }
+
     public static class NotificationBridge {
         private final Context context;
-        private final MailFlowNativePlugin nativePlugin;
+        private final NativePluginProvider nativePluginProvider;
 
         NotificationBridge(Context context) {
             this(context, null);
         }
 
-        NotificationBridge(Context context, MailFlowNativePlugin nativePlugin) {
+        NotificationBridge(Context context, NativePluginProvider nativePluginProvider) {
             this.context = context.getApplicationContext();
-            this.nativePlugin = nativePlugin;
+            this.nativePluginProvider = nativePluginProvider;
             createNotificationChannel(this.context);
         }
 
         private MailFlowNativePlugin getNativePlugin() {
-            return nativePlugin != null ? nativePlugin : instance;
+            MailFlowNativePlugin plugin = nativePluginProvider == null
+                ? null
+                : nativePluginProvider.get();
+            return plugin != null ? plugin : instance;
         }
 
         @JavascriptInterface

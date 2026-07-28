@@ -22,19 +22,30 @@ const mainActivity = fs.readFileSync(
   'utf8',
 );
 
-test('binds the direct Android bridge to the same eagerly registered plugin instance', () => {
-  const registerIndex = mainActivity.indexOf('bridgeBuilder.addPluginInstance(nativePlugin);');
+test('resolves the Android update plugin lazily after Capacitor creates its bridge', () => {
+  const registerIndex = mainActivity.indexOf('registerPlugin(MailFlowNativePlugin.class);');
   const createIndex = mainActivity.indexOf('super.onCreate(savedInstanceState);');
 
-  assert.match(
-    mainActivity,
-    /private final MailFlowNativePlugin nativePlugin = new MailFlowNativePlugin\(\);/,
-  );
   assert.ok(registerIndex >= 0 && registerIndex < createIndex);
   assert.match(
     mainActivity,
-    /new MailFlowNativePlugin\.NotificationBridge\(this, nativePlugin\)/,
+    /new MailFlowNativePlugin\.NativePluginProvider\(\)/,
   );
-  assert.doesNotMatch(mainActivity, /registerPlugin\(MailFlowNativePlugin\.class\)/);
-  assert.doesNotMatch(mainActivity, /bridge\.getPlugin\("MailFlowNative"\)/);
+  assert.match(
+    mainActivity,
+    /return resolveNativePlugin\(\);/,
+  );
+  assert.match(
+    mainActivity,
+    /PluginHandle handle = bridge\.getPlugin\("MailFlowNative"\);/,
+  );
+  assert.match(
+    mainActivity,
+    /if \(plugin == null\) plugin = handle\.load\(\);/,
+  );
+  assert.doesNotMatch(
+    mainActivity,
+    /private final MailFlowNativePlugin nativePlugin = new MailFlowNativePlugin\(\);/,
+  );
+  assert.doesNotMatch(mainActivity, /bridgeBuilder\.addPluginInstance/);
 });
