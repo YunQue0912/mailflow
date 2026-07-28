@@ -152,39 +152,59 @@ public class MailFlowNativePlugin extends Plugin {
 
     @PluginMethod
     public void getUpdateState(PluginCall call) {
-        call.resolve(lastUpdateStatus);
+        call.resolve(currentUpdateState());
     }
 
     @PluginMethod
     public void downloadUpdate(PluginCall call) {
+        call.resolve(beginUpdateDownload());
+    }
+
+    private JSObject beginUpdateDownload() {
         if (updateInfo == null || updateInfo.downloadUrl == null) {
             JSObject result = new JSObject();
             result.put("started", false);
             result.put("reason", "not-available");
-            call.resolve(result);
-            return;
+            return result;
         }
         if (!updateDownloadStarted.compareAndSet(false, true)) {
             JSObject result = new JSObject();
             result.put("started", false);
             result.put("reason", "already-downloading");
-            call.resolve(result);
-            return;
+            return result;
         }
 
         startUpdateDownload(updateInfo);
         JSObject result = new JSObject();
         result.put("started", true);
-        call.resolve(result);
+        return result;
     }
 
     @PluginMethod
     public void cancelUpdateDownload(PluginCall call) {
+        call.resolve(cancelUpdateDownloadResult());
+    }
+
+    private JSObject cancelUpdateDownloadResult() {
         boolean downloading = updateDownloadStarted.get();
         if (downloading) cancelUpdateDownload.set(true);
         JSObject result = new JSObject();
         result.put("cancelled", downloading);
-        call.resolve(result);
+        return result;
+    }
+
+    private JSObject currentUpdateState() {
+        JSObject status = lastUpdateStatus;
+        if (status != null && status.has("currentVersion")) return status;
+        return updateStatus("idle");
+    }
+
+    private JSObject beginUpdateCheck(boolean verbose) {
+        checkForUpdatesInBackground(verbose, null);
+        JSObject result = new JSObject();
+        result.put("started", true);
+        result.put("state", currentUpdateState());
+        return result;
     }
 
     private void checkForUpdatesInBackground(boolean verbose, PluginCall call) {
@@ -307,6 +327,16 @@ public class MailFlowNativePlugin extends Plugin {
 
     @PluginMethod
     public void openUpdateInBrowser(PluginCall call) {
+        JSObject result = openUpdateReleasePage();
+        if (result.optBoolean("opened", false)) {
+            call.resolve(result);
+        } else {
+            call.reject("Could not open the verified Release page.");
+        }
+    }
+
+    private JSObject openUpdateReleasePage() {
+        JSObject result = new JSObject();
         String tag = updateInfo == null ? "" : updateInfo.version;
         if (parseVersion(tag) == null) tag = "";
         String url = tag.isEmpty()
@@ -314,10 +344,13 @@ public class MailFlowNativePlugin extends Plugin {
             : "https://github.com/YunQue0912/mailflow/releases/tag/" + tag;
         try {
             getContext().startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-            call.resolve();
+            result.put("opened", true);
+            result.put("url", url);
         } catch (Exception error) {
-            call.reject("Could not open the verified Release page.");
+            result.put("opened", false);
+            result.put("reason", "unavailable");
         }
+        return result;
     }
 
     @PluginMethod
@@ -535,16 +568,18 @@ public class MailFlowNativePlugin extends Plugin {
             + "var androidNotifications=window.MailFlowAndroid;"
             + "var plugin=function(){return window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.MailFlowNative;};"
             + "var call=function(method,args,fallback){var p=plugin();if(!p||typeof p[method]!=='function')return Promise.resolve(fallback||null);return p[method](args||{}).catch(function(){return fallback||null;});};"
+            + "var direct=function(method,args,fallback){if(!androidNotifications||typeof androidNotifications[method]!=='function')return null;try{var value=androidNotifications[method].apply(androidNotifications,args||[]);return Promise.resolve(typeof value==='string'?JSON.parse(value||'{}'):value);}catch(e){return Promise.resolve(fallback||null);}};"
+            + "var updateCall=function(directMethod,directArgs,pluginMethod,pluginArgs,fallback){return direct(directMethod,directArgs,fallback)||call(pluginMethod,pluginArgs,fallback);};"
             + "window.mailflowNative=window.mailflowNative||{};"
             + "window.mailflowNative.platform='android';"
             + "window.mailflowNative.updates=window.mailflowNative.updates||{};"
-            + "window.mailflowNative.updates.getState=function(){return call('getUpdateState',{}, {type:'idle'});};"
-            + "window.mailflowNative.updates.check=function(verbose){return call('checkForUpdates',{verbose:!!verbose});};"
-            + "window.mailflowNative.updates.download=function(){return call('downloadUpdate',{}, {started:false,reason:'unavailable'});};"
-            + "window.mailflowNative.updates.cancel=function(){return call('cancelUpdateDownload',{}, {cancelled:false});};"
-            + "window.mailflowNative.updates.installDownloaded=function(){if(androidNotifications&&typeof androidNotifications.installDownloadedUpdate==='function'){try{return Promise.resolve(JSON.parse(androidNotifications.installDownloadedUpdate()||'{}'));}catch(e){return Promise.resolve({installed:false,reason:'unavailable'});}}return call('installDownloadedUpdate',{}, {installed:false,reason:'unavailable'});};"
+            + "window.mailflowNative.updates.getState=function(){return updateCall('getUpdateState',[],'getUpdateState',{}, {type:'idle'});};"
+            + "window.mailflowNative.updates.check=function(verbose){return updateCall('checkForUpdates',[!!verbose],'checkForUpdates',{verbose:!!verbose},{started:false});};"
+            + "window.mailflowNative.updates.download=function(){return updateCall('downloadUpdate',[],'downloadUpdate',{}, {started:false,reason:'unavailable'});};"
+            + "window.mailflowNative.updates.cancel=function(){return updateCall('cancelUpdateDownload',[],'cancelUpdateDownload',{}, {cancelled:false});};"
+            + "window.mailflowNative.updates.installDownloaded=function(){return updateCall('installDownloadedUpdate',[],'installDownloadedUpdate',{}, {installed:false,reason:'unavailable'});};"
             + "window.mailflowNative.updates.installAuto=window.mailflowNative.updates.installDownloaded;"
-            + "window.mailflowNative.updates.openDownload=function(){return call('openUpdateInBrowser',{});};"
+            + "window.mailflowNative.updates.openDownload=function(){return updateCall('openUpdateInBrowser',[],'openUpdateInBrowser',{}, {opened:false});};"
             + "window.mailflowNative.updates.onStatus=function(callback){if(typeof callback!=='function')return function(){};var handler=function(event){callback(event.detail);};window.addEventListener('mailflow:update-status',handler);return function(){window.removeEventListener('mailflow:update-status',handler);};};"
             + "window.mailflowNative.notifications=window.mailflowNative.notifications||{};"
             + "window.mailflowNative.notifications.showNewMail=function(notification){if(androidNotifications&&typeof androidNotifications.showNewMail==='function'){androidNotifications.showNewMail(JSON.stringify(notification||{}));return Promise.resolve(null);}return call('showNewMail',notification||{});};"
@@ -1037,15 +1072,19 @@ public class MailFlowNativePlugin extends Plugin {
         return String.valueOf(value == null ? "" : value).replaceAll("[^A-Fa-f0-9]", "").toUpperCase();
     }
 
-    private String getInstalledVersion() {
+    private static String getInstalledVersion(Context context) {
         try {
-            return getContext()
+            return context
                 .getPackageManager()
-                .getPackageInfo(getContext().getPackageName(), 0)
+                .getPackageInfo(context.getPackageName(), 0)
                 .versionName;
         } catch (Exception ignored) {
             return "0.0.0";
         }
+    }
+
+    private String getInstalledVersion() {
+        return getInstalledVersion(getContext());
     }
 
     private JSObject startDownloadedUpdateInstall() {
@@ -1475,6 +1514,56 @@ public class MailFlowNativePlugin extends Plugin {
             }
 
             return instance.showUpdateReadyDialog().toString();
+        }
+
+        @JavascriptInterface
+        public String getUpdateState() {
+            return instance == null
+                ? unavailableUpdateState().toString()
+                : instance.currentUpdateState().toString();
+        }
+
+        @JavascriptInterface
+        public String checkForUpdates(boolean verbose) {
+            return instance == null
+                ? unavailableResult("started").toString()
+                : instance.beginUpdateCheck(verbose).toString();
+        }
+
+        @JavascriptInterface
+        public String downloadUpdate() {
+            return instance == null
+                ? unavailableResult("started").toString()
+                : instance.beginUpdateDownload().toString();
+        }
+
+        @JavascriptInterface
+        public String cancelUpdateDownload() {
+            if (instance != null) return instance.cancelUpdateDownloadResult().toString();
+            JSObject result = new JSObject();
+            result.put("cancelled", false);
+            return result.toString();
+        }
+
+        @JavascriptInterface
+        public String openUpdateInBrowser() {
+            return instance == null
+                ? unavailableResult("opened").toString()
+                : instance.openUpdateReleasePage().toString();
+        }
+
+        private JSObject unavailableUpdateState() {
+            JSObject result = new JSObject();
+            result.put("type", "idle");
+            result.put("currentVersion", getInstalledVersion(context));
+            return result;
+        }
+
+        private static JSObject unavailableResult(String field) {
+            JSObject result = new JSObject();
+            result.put(field, false);
+            result.put("reason", "unavailable");
+            return result;
         }
     }
 

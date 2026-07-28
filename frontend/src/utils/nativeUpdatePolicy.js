@@ -8,6 +8,29 @@ export const NATIVE_UPDATE_KEYS = Object.freeze({
 
 export const NATIVE_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+export function normalizeIntlLocale(locale) {
+  const value = String(locale || '').trim();
+  if (!value) return 'en';
+  if (/^[a-z]{2}[A-Z]{2}$/.test(value)) {
+    return `${value.slice(0, 2)}-${value.slice(2)}`;
+  }
+
+  try {
+    Intl.getCanonicalLocales(value);
+    return value;
+  } catch {
+    return 'en';
+  }
+}
+
+export function formatNativeUpdateReleaseDate(value, locale) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+
+  return new Intl.DateTimeFormat(normalizeIntlLocale(locale), { dateStyle: 'medium' }).format(date);
+}
+
 export function isNativeAppEnvironment(target = globalThis.window) {
   if (target?.mailflowNative?.updates) return true;
   const capacitor = target?.Capacitor;

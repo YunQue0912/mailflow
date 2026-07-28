@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  formatNativeUpdateReleaseDate,
   isNativeAppEnvironment,
   NATIVE_UPDATE_CHECK_INTERVAL_MS,
+  normalizeIntlLocale,
   resolveNativeUpdateDisplayType,
   shouldRecordNativeUpdateCheck,
   shouldRunAutomaticNativeUpdateCheck,
 } from './nativeUpdatePolicy.js';
+
+test('native release dates accept the app language codes without crashing the page', () => {
+  assert.equal(normalizeIntlLocale('zhCN'), 'zh-CN');
+  assert.equal(normalizeIntlLocale('not_a_locale'), 'en');
+  assert.match(formatNativeUpdateReleaseDate('2026-07-29T00:00:00.000Z', 'zhCN'), /2026/);
+  assert.equal(formatNativeUpdateReleaseDate('not-a-date', 'zhCN'), null);
+});
 
 test('server update notices are suppressed in Electron and Capacitor native apps', () => {
   assert.equal(isNativeAppEnvironment({ mailflowNative: { updates: {} } }), true);
