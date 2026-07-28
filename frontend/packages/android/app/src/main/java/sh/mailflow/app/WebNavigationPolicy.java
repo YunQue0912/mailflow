@@ -1,6 +1,7 @@
 package sh.mailflow.app;
 
 import java.net.URI;
+import java.util.Objects;
 
 final class WebNavigationPolicy {
     private WebNavigationPolicy() {}
@@ -16,7 +17,7 @@ final class WebNavigationPolicy {
         String candidateUrl
     ) {
         if (!isHttpUrl(candidateUrl) || currentUrl == null) return false;
-        if (setupFileUrl != null && setupFileUrl.equalsIgnoreCase(stripQueryAndFragment(currentUrl))) {
+        if (isSameDocument(setupFileUrl, currentUrl)) {
             return true;
         }
 
@@ -57,13 +58,20 @@ final class WebNavigationPolicy {
         }
     }
 
-    private static String stripQueryAndFragment(String value) {
+    private static boolean isSameDocument(String firstUrl, String secondUrl) {
         try {
-            URI uri = new URI(value);
-            return new URI(uri.getScheme(), uri.getAuthority(), uri.getPath(), null, null).toString();
+            URI first = new URI(firstUrl);
+            URI second = new URI(secondUrl);
+            return equalsIgnoreCase(first.getScheme(), second.getScheme())
+                && Objects.equals(first.getAuthority(), second.getAuthority())
+                && Objects.equals(first.getPath(), second.getPath());
         } catch (Exception ignored) {
-            return value;
+            return false;
         }
+    }
+
+    private static boolean equalsIgnoreCase(String first, String second) {
+        return first == null ? second == null : second != null && first.equalsIgnoreCase(second);
     }
 
     private static boolean isHttp(URI uri) {
