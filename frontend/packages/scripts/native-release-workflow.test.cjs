@@ -17,6 +17,7 @@ test('runs the Android Gradle wrapper without relying on executable file mode', 
 
 test('parses and validates the Android signing certificate across apksigner versions', () => {
   assert.match(workflow, /grep -im1 'certificate SHA-256 digest:'/);
+  assert.ok(workflow.includes("sed 's/^.*: //'"));
   assert.match(workflow, /\$\{#ACTUAL_CERTIFICATE\} -eq 64/);
   assert.match(workflow, /"\$ACTUAL_CERTIFICATE" == "\$EXPECTED_NORMALIZED"/);
 });
