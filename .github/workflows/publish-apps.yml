@@ -362,25 +362,71 @@ jobs:
       - name: Create or verify Draft Release
         shell: bash
         run: |
-          if gh release view "$APP_VERSION" --json isDraft > existing-release.json 2>/dev/null; then
-            [[ "$(jq -r .isDraft existing-release.json)" == "true" ]] || {
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > releases.json
+          jq --arg tag "$APP_VERSION" '[.[] | select(.tag_name == $tag)]' releases.json > matching-releases.json
+
+          [[ "$(jq 'length' matching-releases.json)" -le 1 ]] || {
+            echo "Multiple Releases found for $APP_VERSION." >&2
+            exit 1
+          }
+
+          if [[ "$(jq 'length' matching-releases.json)" -eq 1 ]]; then
+            jq '.[0]' matching-releases.json > release.json
+            [[ "$(jq -r .draft release.json)" == "true" ]] || {
               echo 'Refusing to replace an already published Release.' >&2
               exit 1
             }
-          else
-            gh release create "$APP_VERSION" \
-              --verify-tag \
-              --draft \
-              --title "MailFlow ${APP_VERSION#v}" \
-              --notes "Unsigned Windows x64 package and signed Android packages for $APP_VERSION."
+            exit 0
           fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$APP_VERSION" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+            -f tag_name="$APP_VERSION" \
+            -f name="MailFlow ${APP_VERSION#v}" \
+            -f body="Unsigned Windows x64 package and signed Android packages for $APP_VERSION." \
+            -F draft=true \
+            -F prerelease=false \
+            > release.json
 
       - name: Upload and verify all Release assets
         shell: bash
         run: |
-          gh release upload "$APP_VERSION" release-assets/* --clobber
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$APP_VERSION" > release.json
+          release_id="$(jq -r .id release.json)"
+          [[ "$release_id" =~ ^[0-9]+$ ]] || {
+            echo 'Draft Release ID is missing or invalid.' >&2
+            exit 1
+          }
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" > existing-assets.json
+          for asset in release-assets/*; do
+            asset_name="$(basename "$asset")"
+            existing_asset_id="$(
+              jq -r --arg name "$asset_name" '.[] | select(.name == $name) | .id' existing-assets.json |
+                head -n 1
+            )"
+            if [[ -n "$existing_asset_id" ]]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$existing_asset_id"
+            fi
+
+            encoded_name="$(jq -rn --arg value "$asset_name" '$value | @uri')"
+            gh api --method POST \
+              -H 'Content-Type: application/octet-stream' \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?name=$encoded_name" \
+              --input "$asset" \
+              > /dev/null
+          done
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id" > release.json
           node frontend/packages/scripts/verify-release-assets.cjs release-assets release.json
 
       - name: Publish stable Release
-        run: gh release edit "$APP_VERSION" --draft=false --prerelease=false --latest
+        shell: bash
+        run: |
+          release_id="$(jq -r .id release.json)"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/$release_id" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true \
+            > published-release.json
+          [[ "$(jq -r .draft published-release.json)" == "false" ]]
+          [[ "$(jq -r .prerelease published-release.json)" == "false" ]]

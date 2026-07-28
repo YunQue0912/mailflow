@@ -21,3 +21,10 @@ test('parses and validates the Android signing certificate across apksigner vers
   assert.match(workflow, /\$\{#ACTUAL_CERTIFICATE\} -eq 64/);
   assert.match(workflow, /"\$ACTUAL_CERTIFICATE" == "\$EXPECTED_NORMALIZED"/);
 });
+
+test('uploads and publishes draft Release assets by immutable Release ID', () => {
+  assert.doesNotMatch(workflow, /gh release upload/);
+  assert.match(workflow, /releases\/\$release_id\/assets\?per_page=100/);
+  assert.match(workflow, /uploads\.github\.com\/repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{release_id\}\/assets/);
+  assert.match(workflow, /--method PATCH "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$release_id"/);
+});
