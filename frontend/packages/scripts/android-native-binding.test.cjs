@@ -80,3 +80,14 @@ test('does not access the Capacitor context while constructing the native plugin
     /public void load\(\)[\s\S]*lastUpdateStatus = downloadedUpdate/,
   );
 });
+
+test('discards a persisted Android update after that version has been installed', () => {
+  assert.match(
+    nativePlugin,
+    /restoreDownloadedUpdateState\(\)[\s\S]*!isPersistedUpdateNewer\([\s\S]*updateInfo\.version,[\s\S]*updateInfo\.versionCode,[\s\S]*getInstalledVersion\(\),[\s\S]*getInstalledVersionCode\(\)[\s\S]*clearDownloadedUpdateState\(\);/,
+  );
+  assert.match(
+    nativePlugin,
+    /private void clearDownloadedUpdateState\(\)[\s\S]*downloadedUpdate = null;[\s\S]*updateInfo = null;/,
+  );
+});

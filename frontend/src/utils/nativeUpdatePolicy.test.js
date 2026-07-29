@@ -19,6 +19,7 @@ test('native release dates accept the app language codes without crashing the pa
 
 test('server update notices are suppressed in Electron and Capacitor native apps', () => {
   assert.equal(isNativeAppEnvironment({ mailflowNative: { updates: {} } }), true);
+  assert.equal(isNativeAppEnvironment({ MailFlowAndroid: {} }), true);
   assert.equal(isNativeAppEnvironment({ Capacitor: { isNativePlatform: () => true } }), true);
   assert.equal(isNativeAppEnvironment({ Capacitor: { getPlatform: () => 'android' } }), true);
   assert.equal(isNativeAppEnvironment({ Capacitor: { getPlatform: () => 'web' } }), false);
@@ -41,8 +42,11 @@ test('failed native checks are not recorded as successful throttle points', () =
   assert.equal(shouldRecordNativeUpdateCheck(undefined), false);
   assert.equal(shouldRecordNativeUpdateCheck({ error: 'update-check-failed' }), false);
   assert.equal(shouldRecordNativeUpdateCheck({ state: { type: 'error' } }), false);
+  assert.equal(shouldRecordNativeUpdateCheck({ state: { type: 'idle' } }), false);
+  assert.equal(shouldRecordNativeUpdateCheck({ state: { type: 'checking' } }), false);
   assert.equal(shouldRecordNativeUpdateCheck({ updateAvailable: false, state: { type: 'up-to-date' } }), true);
-  assert.equal(shouldRecordNativeUpdateCheck({ updateAvailable: true }), true);
+  assert.equal(shouldRecordNativeUpdateCheck({ updateAvailable: true, state: { type: 'available' } }), true);
+  assert.equal(shouldRecordNativeUpdateCheck({ updateAvailable: true, state: { type: 'downloaded' } }), true);
 });
 
 test('skip and defer suppression only apply to the matching release', () => {

@@ -153,39 +153,47 @@ export async function installCapacitorNativeBridge() {
             'checkForUpdates', [Boolean(verbose)], 'checkForUpdates', { verbose }, { started: false },
           );
 
-          if (!hasAndroidInterface) return result;
+          if (!hasAndroidInterface) {
+            const state = normalizeUpdateStatus(await callNativeUpdate(
+              'getUpdateState', [], 'getUpdateState', undefined, { type: 'idle' },
+            ));
+            return { ...result, state };
+          }
 
           const pollGeneration = ++directUpdatePollGeneration;
           if (!result?.started) {
-            dispatchAndroidUpdateStatus(window, {
+            const state = {
               ...current,
               type: 'error',
               messageKey: 'genericError',
               retryable: true,
               verbose: Boolean(verbose),
-            });
-            return result;
+            };
+            dispatchAndroidUpdateStatus(window, state);
+            return { ...result, error: 'update-check-failed', state };
           }
 
-          pollAndroidUpdateState(window, {
+          const state = await pollAndroidUpdateState(window, {
             onStatus: (status) => {
               if (pollGeneration === directUpdatePollGeneration) {
                 dispatchAndroidUpdateStatus(window, status);
               }
             },
-          }).then((status) => {
-            if (!status && pollGeneration === directUpdatePollGeneration) {
-              dispatchAndroidUpdateStatus(window, {
-                ...current,
-                type: 'error',
-                messageKey: 'genericError',
-                retryable: true,
-                verbose: Boolean(verbose),
-              });
-            }
-          }).catch(() => {});
+          }).catch(() => null);
 
-          return result;
+          if (state) return { ...result, state };
+
+          const errorState = {
+            ...current,
+            type: 'error',
+            messageKey: 'genericError',
+            retryable: true,
+            verbose: Boolean(verbose),
+          };
+          if (pollGeneration === directUpdatePollGeneration) {
+            dispatchAndroidUpdateStatus(window, errorState);
+          }
+          return { ...result, error: 'update-check-failed', state: errorState };
         },
         download: async () => callNativeUpdate(
           'downloadUpdate', [], 'downloadUpdate', undefined, { started: false, reason: 'unavailable' },

@@ -4,7 +4,9 @@ import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
 import { installCapacitorNativeBridge } from '../utils/capacitorNativeBridge.js';
 import {
+  NATIVE_UPDATE_CHECK_INTERVAL_MS,
   NATIVE_UPDATE_KEYS,
+  NATIVE_UPDATE_RETRY_INTERVAL_MS,
   shouldRecordNativeUpdateCheck,
   shouldRunAutomaticNativeUpdateCheck,
 } from '../utils/nativeUpdatePolicy.js';
@@ -18,6 +20,7 @@ export default function ElectronNotificationBridge() {
   const setSearchQuery = useStore(state => state.setSearchQuery);
   const totalUnread = useStore(state => state.unreadCounts.total);
   const lastActionRef = useRef({ action: null, time: 0 });
+  const lastUpdateNoticeRef = useRef('');
   const processedActionIdsRef = useRef(new Set());
   const [nativeBridgeReady, setNativeBridgeReady] = useState(() => Boolean(window.mailflowNative));
 
@@ -62,12 +65,16 @@ export default function ElectronNotificationBridge() {
 
   useEffect(() => {
     if (!nativeBridgeReady) return undefined;
-    const unsubscribe = window.mailflowNative?.updates?.onStatus?.((status) => {
+    let active = true;
+    const handleStatus = (status) => {
       if (status?.type === 'available') {
         if (localStorage.getItem(NATIVE_UPDATE_KEYS.skippedVersion) === status.version) return;
         const deferredVersion = localStorage.getItem(NATIVE_UPDATE_KEYS.deferredVersion);
         if (deferredVersion === status.version
           && Date.now() < Number(localStorage.getItem(NATIVE_UPDATE_KEYS.deferredUntil) || 0)) return;
+        const noticeKey = `available:${status.version || ''}`;
+        if (lastUpdateNoticeRef.current === noticeKey) return;
+        lastUpdateNoticeRef.current = noticeKey;
         addNotification({
           type: 'info',
           title: t('admin.about.updates.notificationAvailableTitle'),
@@ -89,6 +96,9 @@ export default function ElectronNotificationBridge() {
       }
 
       if (status?.type !== 'downloaded') return;
+      const noticeKey = `downloaded:${status.version || ''}`;
+      if (lastUpdateNoticeRef.current === noticeKey) return;
+      lastUpdateNoticeRef.current = noticeKey;
 
       addNotification({
         type: 'success',
@@ -110,25 +120,83 @@ export default function ElectronNotificationBridge() {
           }
         },
       });
-    });
+    };
+    const unsubscribe = window.mailflowNative?.updates?.onStatus?.(handleStatus);
+    window.mailflowNative?.updates?.getState?.()
+      ?.then?.((status) => {
+        if (active && status) handleStatus(status);
+      })
+      ?.catch?.(() => {});
 
     return () => {
+      active = false;
       if (typeof unsubscribe === 'function') unsubscribe();
     };
   }, [addNotification, nativeBridgeReady, t]);
 
   useEffect(() => {
-    if (!nativeBridgeReady) return;
-    const autoCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.autoCheck) !== 'false';
-    const lastCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.lastCheck);
-    if (!shouldRunAutomaticNativeUpdateCheck({ autoCheck, lastCheck })) return;
-    window.mailflowNative?.updates?.check?.(false)
-      ?.then?.((result) => {
+    if (!nativeBridgeReady) return undefined;
+    let active = true;
+    let checkInFlight = false;
+    let timer = null;
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const scheduleNextCheck = (delayOverride) => {
+      clearTimer();
+      if (!active || localStorage.getItem(NATIVE_UPDATE_KEYS.autoCheck) === 'false') return;
+      const lastCheck = Number(localStorage.getItem(NATIVE_UPDATE_KEYS.lastCheck) || 0);
+      const elapsed = Number.isFinite(lastCheck) ? Math.max(0, Date.now() - lastCheck) : NATIVE_UPDATE_CHECK_INTERVAL_MS;
+      const delay = delayOverride ?? Math.max(1000, NATIVE_UPDATE_CHECK_INTERVAL_MS - elapsed);
+      timer = window.setTimeout(runAutomaticCheck, delay);
+    };
+
+    const runAutomaticCheck = async () => {
+      if (!active || checkInFlight) return;
+      const autoCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.autoCheck) !== 'false';
+      const lastCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.lastCheck);
+      if (!shouldRunAutomaticNativeUpdateCheck({ autoCheck, lastCheck })) {
+        scheduleNextCheck();
+        return;
+      }
+
+      checkInFlight = true;
+      let completed = false;
+      try {
+        const result = await window.mailflowNative?.updates?.check?.(false);
         if (shouldRecordNativeUpdateCheck(result)) {
           localStorage.setItem(NATIVE_UPDATE_KEYS.lastCheck, String(Date.now()));
+          completed = true;
         }
-      })
-      ?.catch?.(() => {});
+      } catch {
+        // A failed background check is intentionally not a 24-hour throttle point.
+      } finally {
+        checkInFlight = false;
+        scheduleNextCheck(completed ? undefined : NATIVE_UPDATE_RETRY_INTERVAL_MS);
+      }
+    };
+
+    const checkWhenVisible = () => {
+      if (document.visibilityState === 'visible') runAutomaticCheck();
+    };
+
+    runAutomaticCheck();
+    document.addEventListener('visibilitychange', checkWhenVisible);
+    window.addEventListener('online', runAutomaticCheck);
+    window.addEventListener('mailflow:native-auto-update-changed', runAutomaticCheck);
+
+    return () => {
+      active = false;
+      clearTimer();
+      document.removeEventListener('visibilitychange', checkWhenVisible);
+      window.removeEventListener('online', runAutomaticCheck);
+      window.removeEventListener('mailflow:native-auto-update-changed', runAutomaticCheck);
+    };
   }, [nativeBridgeReady]);
 
   useEffect(() => {

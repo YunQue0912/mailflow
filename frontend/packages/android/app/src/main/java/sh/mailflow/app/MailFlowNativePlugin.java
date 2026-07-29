@@ -76,10 +76,8 @@ public class MailFlowNativePlugin extends Plugin {
     private static final String PREF_UPDATE_RELEASE_NAME = "update_release_name";
     private static final String PREF_UPDATE_SHA256 = "update_sha256";
     private static final String PREF_UPDATE_VERSION_CODE = "update_version_code";
-    private static final String PREF_LAST_UPDATE_CHECK = "last_update_check";
     private static final String SETUP_URL = "file:///android_asset/public/index.html";
     private static final String UPDATE_RELEASE_URL = "https://api.github.com/repos/YunQue0912/mailflow/releases/latest";
-    private static final long UPDATE_CHECK_INTERVAL_MS = 24L * 60L * 60L * 1000L;
     private static final int MAX_JSON_BYTES = 1024 * 1024;
     private static final long MAX_APK_BYTES = 250L * 1024L * 1024L;
     private static final int MAX_REDIRECTS = 5;
@@ -211,17 +209,6 @@ public class MailFlowNativePlugin extends Plugin {
     }
 
     private void checkForUpdatesInBackground(boolean verbose, PluginCall call) {
-        long lastCheck = getPrefs(getContext()).getLong(PREF_LAST_UPDATE_CHECK, 0L);
-        if (!verbose && System.currentTimeMillis() - lastCheck < UPDATE_CHECK_INTERVAL_MS) {
-            if (call != null) {
-                JSObject result = new JSObject();
-                result.put("updateAvailable", false);
-                result.put("skipped", true);
-                call.resolve(result);
-            }
-            return;
-        }
-
         if (!updateCheckStarted.compareAndSet(false, true)) {
             if (call != null) {
                 JSObject result = new JSObject();
@@ -232,23 +219,20 @@ public class MailFlowNativePlugin extends Plugin {
             return;
         }
 
-        if (verbose) {
-            JSObject checking = updateStatus("checking");
-            checking.put("verbose", true);
-            sendUpdateStatus(checking);
-        }
+        JSObject checking = updateStatus("checking");
+        checking.put("verbose", verbose);
+        sendUpdateStatus(checking);
 
         new Thread(() -> {
             try {
                 Log.i(TAG, "Checking for updates from " + UPDATE_RELEASE_URL);
                 ReleaseInfo release = fetchLatestRelease();
                 Log.i(TAG, "Latest release " + release.version + ", installed " + getInstalledVersion() + ", APK " + release.downloadUrl);
-                getPrefs(getContext()).edit().putLong(PREF_LAST_UPDATE_CHECK, System.currentTimeMillis()).apply();
                 if (!isNewerVersion(release.version, getInstalledVersion())) {
                     clearDownloadedUpdateState();
-                    if (verbose) {
-                        sendUpdateStatus(updateStatus("up-to-date"));
-                    }
+                    JSObject upToDate = updateStatus("up-to-date");
+                    upToDate.put("verbose", verbose);
+                    sendUpdateStatus(upToDate);
 
                     if (call != null) {
                         JSObject result = new JSObject();
@@ -1241,11 +1225,22 @@ public class MailFlowNativePlugin extends Plugin {
             restored.versionCode = prefs.getLong(PREF_UPDATE_VERSION_CODE, -1L);
             updateInfo = restored;
         }
+
+        if (!isPersistedUpdateNewer(
+            updateInfo.version,
+            updateInfo.versionCode,
+            getInstalledVersion(),
+            getInstalledVersionCode()
+        )) {
+            Log.i(TAG, "Discarding a downloaded APK that is no longer newer than the installed app.");
+            clearDownloadedUpdateState();
+        }
     }
 
     private void clearDownloadedUpdateState() {
         File previousDownload = downloadedUpdate;
         downloadedUpdate = null;
+        updateInfo = null;
         installPendingPermission = false;
         if (previousDownload != null && previousDownload.exists() && !previousDownload.delete()) {
             Log.w(TAG, "Could not remove stale update APK from the app cache.");
@@ -1354,6 +1349,16 @@ public class MailFlowNativePlugin extends Plugin {
         }
 
         return false;
+    }
+
+    static boolean isPersistedUpdateNewer(
+        String candidateVersion,
+        long candidateVersionCode,
+        String installedVersion,
+        long installedVersionCode
+    ) {
+        return candidateVersionCode > installedVersionCode
+            && isNewerVersion(candidateVersion, installedVersion);
     }
 
     private static int[] parseVersion(String value) {

@@ -4,6 +4,7 @@ import {
   formatNativeUpdateReleaseDate,
   NATIVE_UPDATE_KEYS,
   resolveNativeUpdateDisplayType,
+  shouldRecordNativeUpdateCheck,
 } from '../utils/nativeUpdatePolicy.js';
 
 function readAutoCheck() {
@@ -87,6 +88,14 @@ export default function NativeUpdatePanel() {
     setSkippedVersion(status.version);
   };
 
+  const checkForUpdates = async (verbose) => {
+    const result = await bridge?.check?.(verbose);
+    if (shouldRecordNativeUpdateCheck(result)) {
+      localStorage.setItem(NATIVE_UPDATE_KEYS.lastCheck, String(Date.now()));
+    }
+    return result;
+  };
+
   if (!bridge) return null;
 
   return (
@@ -102,7 +111,10 @@ export default function NativeUpdatePanel() {
             const checked = event.target.checked;
             setAutoCheck(checked);
             localStorage.setItem(NATIVE_UPDATE_KEYS.autoCheck, String(checked));
-            if (checked) bridge.check?.(false)?.catch?.(() => {});
+            if (checked) {
+              localStorage.removeItem(NATIVE_UPDATE_KEYS.lastCheck);
+              window.dispatchEvent(new CustomEvent('mailflow:native-auto-update-changed'));
+            }
           }}
         />
         {t('admin.about.updates.autoCheck')}
@@ -150,7 +162,7 @@ export default function NativeUpdatePanel() {
       )}
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-        <button type="button" style={actionStyle} disabled={status.type === 'checking' || status.type === 'downloading'} onClick={() => bridge.check?.(true)}>
+        <button type="button" style={actionStyle} disabled={status.type === 'checking' || status.type === 'downloading'} onClick={() => checkForUpdates(true)}>
           {t('admin.about.updates.check')}
         </button>
         {status.type === 'available' && displayedType === 'available' && <>
@@ -173,7 +185,7 @@ export default function NativeUpdatePanel() {
           </button>
         )}
         {status.type === 'error' && status.retryable && (
-          <button type="button" style={primaryStyle} onClick={() => bridge.check?.(true)}>{t('admin.about.updates.retry')}</button>
+          <button type="button" style={primaryStyle} onClick={() => checkForUpdates(true)}>{t('admin.about.updates.retry')}</button>
         )}
         {(status.releaseUrl || status.type === 'error') && (
           <button type="button" style={actionStyle} onClick={() => bridge.openDownload?.()}>{t('admin.about.updates.browser')}</button>

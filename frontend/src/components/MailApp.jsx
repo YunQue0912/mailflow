@@ -111,7 +111,6 @@ export default function MailApp() {
   }, [gtdActive, selectedAccountId, gtdEnabledKey, fetchGtdSections]);
 
   const scale = fontSize / 100;
-  const hasNativeBridge = Boolean(window.mailflowNative || window.Capacitor?.isNativePlatform?.());
   const [vpSize, setVpSize] = useState({ w: window.innerWidth, h: window.innerHeight });
   useEffect(() => {
     const update = () => setVpSize({ w: window.innerWidth, h: window.innerHeight });
@@ -871,7 +870,7 @@ export default function MailApp() {
 
       <Suspense fallback={lazyFallback}>{composing && <ComposeModal />}</Suspense>
       <Suspense fallback={lazyFallback}>{showAdmin && <AdminPanel />}</Suspense>
-      <Suspense fallback={null}>{hasNativeBridge && <ElectronNotificationBridge />}</Suspense>
+      <Suspense fallback={null}><ElectronNotificationBridge /></Suspense>
       <NotificationToasts />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
 
