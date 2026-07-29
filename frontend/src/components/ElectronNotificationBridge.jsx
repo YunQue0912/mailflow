@@ -156,16 +156,19 @@ export default function ElectronNotificationBridge() {
       timer = window.setTimeout(runAutomaticCheck, delay);
     };
 
-    const runAutomaticCheck = async () => {
+    const runAutomaticCheck = async ({ force = false, markSession = false } = {}) => {
       if (!active || checkInFlight) return;
       const autoCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.autoCheck) !== 'false';
       const lastCheck = localStorage.getItem(NATIVE_UPDATE_KEYS.lastCheck);
-      if (!shouldRunAutomaticNativeUpdateCheck({ autoCheck, lastCheck })) {
+      if (!shouldRunAutomaticNativeUpdateCheck({ autoCheck, force, lastCheck })) {
         scheduleNextCheck();
         return;
       }
 
       checkInFlight = true;
+      if (markSession) {
+        sessionStorage.setItem(NATIVE_UPDATE_KEYS.sessionCheck, 'true');
+      }
       let completed = false;
       try {
         const result = await window.mailflowNative?.updates?.check?.(false);
@@ -185,17 +188,25 @@ export default function ElectronNotificationBridge() {
       if (document.visibilityState === 'visible') runAutomaticCheck();
     };
 
-    runAutomaticCheck();
+    const checkAfterAutoUpdateEnabled = () => {
+      runAutomaticCheck({ force: true, markSession: true });
+    };
+
+    if (sessionStorage.getItem(NATIVE_UPDATE_KEYS.sessionCheck) === 'true') {
+      scheduleNextCheck();
+    } else {
+      runAutomaticCheck({ force: true, markSession: true });
+    }
     document.addEventListener('visibilitychange', checkWhenVisible);
     window.addEventListener('online', runAutomaticCheck);
-    window.addEventListener('mailflow:native-auto-update-changed', runAutomaticCheck);
+    window.addEventListener('mailflow:native-auto-update-changed', checkAfterAutoUpdateEnabled);
 
     return () => {
       active = false;
       clearTimer();
       document.removeEventListener('visibilitychange', checkWhenVisible);
       window.removeEventListener('online', runAutomaticCheck);
-      window.removeEventListener('mailflow:native-auto-update-changed', runAutomaticCheck);
+      window.removeEventListener('mailflow:native-auto-update-changed', checkAfterAutoUpdateEnabled);
     };
   }, [nativeBridgeReady]);
 

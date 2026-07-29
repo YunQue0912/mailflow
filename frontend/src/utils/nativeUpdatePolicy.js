@@ -3,6 +3,7 @@ export const NATIVE_UPDATE_KEYS = Object.freeze({
   deferredUntil: 'mailflow-native-update-deferred-until',
   deferredVersion: 'mailflow-native-update-deferred-version',
   lastCheck: 'mailflow-native-last-update-check',
+  sessionCheck: 'mailflow-native-session-update-check',
   skippedVersion: 'mailflow-native-skipped-version',
 });
 
@@ -40,8 +41,14 @@ export function isNativeAppEnvironment(target = globalThis.window) {
   return false;
 }
 
-export function shouldRunAutomaticNativeUpdateCheck({ autoCheck, lastCheck, now = Date.now() }) {
+export function shouldRunAutomaticNativeUpdateCheck({
+  autoCheck,
+  force = false,
+  lastCheck,
+  now = Date.now(),
+}) {
   if (autoCheck === false) return false;
+  if (force) return true;
   const previousCheck = Number(lastCheck || 0);
   return !Number.isFinite(previousCheck) || now - previousCheck >= NATIVE_UPDATE_CHECK_INTERVAL_MS;
 }

@@ -26,11 +26,23 @@ test('server update notices are suppressed in Electron and Capacitor native apps
   assert.equal(isNativeAppEnvironment({}), false);
 });
 
-test('automatic update checks are enabled by default and throttled for 24 hours', () => {
+test('automatic update checks run once per forced app session and otherwise throttle for 24 hours', () => {
   const now = 1_000_000_000;
   assert.equal(shouldRunAutomaticNativeUpdateCheck({ autoCheck: true, lastCheck: 0, now }), true);
   assert.equal(shouldRunAutomaticNativeUpdateCheck({ autoCheck: false, lastCheck: 0, now }), false);
   assert.equal(shouldRunAutomaticNativeUpdateCheck({ autoCheck: true, lastCheck: now - 1000, now }), false);
+  assert.equal(shouldRunAutomaticNativeUpdateCheck({
+    autoCheck: true,
+    force: true,
+    lastCheck: now - 1000,
+    now,
+  }), true);
+  assert.equal(shouldRunAutomaticNativeUpdateCheck({
+    autoCheck: false,
+    force: true,
+    lastCheck: now - 1000,
+    now,
+  }), false);
   assert.equal(shouldRunAutomaticNativeUpdateCheck({
     autoCheck: true,
     lastCheck: now - NATIVE_UPDATE_CHECK_INTERVAL_MS,
