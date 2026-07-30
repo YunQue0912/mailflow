@@ -192,6 +192,10 @@
     "allowDomain": "Always allow from @{{domain}}",
     "downloading": "Downloading…",
     "downloadAll": "Download all",
+    "downloadFailed": {
+      "title": "Download failed",
+      "body": "Could not download this attachment. Please try again."
+    },
     "reply": "Reply",
     "replyAll": "Reply All",
     "replyOptions": "Reply options",

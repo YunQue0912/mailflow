@@ -192,6 +192,10 @@
     "allowDomain": "Toujours autoriser depuis @{{domain}}",
     "downloading": "Téléchargement…",
     "downloadAll": "Tout télécharger",
+    "downloadFailed": {
+      "title": "Échec du téléchargement",
+      "body": "Impossible de télécharger cette pièce jointe. Veuillez réessayer."
+    },
     "reply": "Répondre",
     "replyAll": "Répondre à tous",
     "replyOptions": "Options de réponse",

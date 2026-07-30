@@ -192,6 +192,10 @@
     "allowDomain": "Permitir siempre desde @{{domain}}",
     "downloading": "Descargando…",
     "downloadAll": "Descargar todo",
+    "downloadFailed": {
+      "title": "Error de descarga",
+      "body": "No se pudo descargar este archivo adjunto. Inténtalo de nuevo."
+    },
     "reply": "Responder",
     "replyAll": "Responder a todos",
     "replyOptions": "Opciones de respuesta",

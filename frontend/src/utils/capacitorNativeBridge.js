@@ -132,6 +132,14 @@ export async function installCapacitorNativeBridge() {
         ...existingBridge.badges,
         setUnreadCount: async (count) => callNative('setUnreadCount', { count }),
       },
+      attachments: {
+        ...existingBridge.attachments,
+        download: async ({ url, filename, mimeType }) => callNative(
+          'downloadAttachment',
+          { url, filename, mimeType },
+          { started: false, reason: 'unavailable' },
+        ),
+      },
       updates: {
         ...existingBridge.updates,
         getState: async () => normalizeUpdateStatus(await callNativeUpdate(

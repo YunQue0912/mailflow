@@ -4,6 +4,7 @@ import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { fetchMessageBodyWithRetry } from '../utils/messageBody.js';
+import { downloadAttachmentFile } from '../utils/attachmentDownload.js';
 
 const USE_DIV_RENDER = import.meta.env.VITE_EMAIL_DIV_RENDER === 'true';
 
@@ -84,6 +85,7 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
   const [loadingBody, setLoadingBody] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
   const [downloadingPart, setDownloadingPart] = useState(null);
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const [savingAllow, setSavingAllow] = useState(false);
   const iframeRef = useRef(null);
   const resizeObserverRef = useRef(null);
@@ -376,20 +378,40 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
   const downloadAttachment = async attachment => {
     setDownloadingPart(attachment.part);
     try {
-      const response = await fetch(`/api/mail/messages/${messageId}/attachments/${encodeURIComponent(attachment.part)}`, { credentials: 'include' });
-      if (!response.ok) throw new Error('Download failed');
-      const url = URL.createObjectURL(await response.blob());
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = attachment.filename;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
+      await downloadAttachmentFile({
+        path: `/api/mail/messages/${messageId}/attachments/${encodeURIComponent(attachment.part)}`,
+        filename: attachment.filename,
+        mimeType: attachment.type,
+      });
     } catch (error) {
       console.error('Download error:', error);
+      addNotification({
+        type: 'error',
+        title: t('message.downloadFailed.title'),
+        body: t('message.downloadFailed.body'),
+      });
     } finally {
       setDownloadingPart(null);
+    }
+  };
+
+  const downloadAllAttachments = async () => {
+    setDownloadingAll(true);
+    try {
+      await downloadAttachmentFile({
+        path: `/api/mail/messages/${messageId}/attachments.zip`,
+        filename: `${message?.subject || 'attachments'}-attachments.zip`,
+        mimeType: 'application/zip',
+      });
+    } catch (error) {
+      console.error('Download all attachments error:', error);
+      addNotification({
+        type: 'error',
+        title: t('message.downloadFailed.title'),
+        body: t('message.downloadFailed.body'),
+      });
+    } finally {
+      setDownloadingAll(false);
     }
   };
 
@@ -413,7 +435,7 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
         <div style={{ marginBottom: 20 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <div style={{ fontSize: 12, color: 'var(--text-tertiary)', fontWeight: 500 }}>{t('message.attachment', { count: attachments.length })}</div>
-            {attachments.length > 1 && <a href={`/api/mail/messages/${messageId}/attachments.zip`} download style={{ fontSize: 12, color: 'var(--accent)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 4 }}><span aria-hidden="true">↓</span>{t('message.downloadAll')}</a>}
+            {attachments.length > 1 && <button type="button" onClick={downloadAllAttachments} disabled={downloadingAll} style={{ padding: 0, border: 'none', background: 'transparent', fontSize: 12, color: 'var(--accent)', cursor: downloadingAll ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}><span aria-hidden="true">↓</span>{downloadingAll ? t('message.downloading') : t('message.downloadAll')}</button>}
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
             {attachments.map((attachment, index) => (

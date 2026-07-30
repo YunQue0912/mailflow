@@ -192,6 +192,10 @@
     "allowDomain": "Immer erlauben von @{{domain}}",
     "downloading": "Wird heruntergeladen…",
     "downloadAll": "Alle herunterladen",
+    "downloadFailed": {
+      "title": "Download fehlgeschlagen",
+      "body": "Dieser Anhang konnte nicht heruntergeladen werden. Bitte versuchen Sie es erneut."
+    },
     "reply": "Antworten",
     "replyAll": "Allen antworten",
     "replyOptions": "Antwortoptionen",

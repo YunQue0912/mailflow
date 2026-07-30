@@ -192,6 +192,10 @@
     "allowDomain": "Consenti sempre da @{{domain}}",
     "downloading": "Download in corso…",
     "downloadAll": "Scarica tutto",
+    "downloadFailed": {
+      "title": "Download non riuscito",
+      "body": "Impossibile scaricare questo allegato. Riprova."
+    },
     "reply": "Rispondi",
     "replyAll": "Rispondi a tutti",
     "replyOptions": "Opzioni di risposta",

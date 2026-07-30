@@ -3,6 +3,7 @@ package sh.mailflow.app;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
+import android.app.DownloadManager;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -15,9 +16,12 @@ import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.provider.Settings;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
+import android.webkit.CookieManager;
+import android.webkit.WebSettings;
 import android.webkit.WebView;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
@@ -55,7 +59,8 @@ import org.json.JSONObject;
 @CapacitorPlugin(
     name = "MailFlowNative",
     permissions = {
-        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS })
+        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS }),
+        @Permission(alias = "storage", strings = { Manifest.permission.WRITE_EXTERNAL_STORAGE })
     }
 )
 public class MailFlowNativePlugin extends Plugin {
@@ -144,6 +149,57 @@ public class MailFlowNativePlugin extends Plugin {
             MailFlowBackgroundSync.schedule(getContext());
         }
         call.resolve();
+    }
+
+    @PluginMethod
+    public void downloadAttachment(PluginCall call) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+            && getPermissionState("storage") != PermissionState.GRANTED) {
+            requestPermissionForAlias("storage", call, "attachmentStoragePermissionCallback");
+            return;
+        }
+        enqueueAttachmentDownload(call);
+    }
+
+    private void enqueueAttachmentDownload(PluginCall call) {
+        String url = call.getString("url", "");
+        String configuredHost = getSavedHost(getContext());
+        if (!AttachmentDownloadPolicy.isAllowed(configuredHost, url)) {
+            call.reject("Attachment URL is not allowed");
+            return;
+        }
+
+        String filename = AttachmentDownloadPolicy.safeFilename(call.getString("filename", "attachment"));
+        String mimeType = call.getString("mimeType", "application/octet-stream");
+        try {
+            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+            request.setTitle(filename);
+            request.setDescription("MailFlow attachment");
+            request.setMimeType(mimeType);
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename);
+            request.addRequestHeader("User-Agent", WebSettings.getDefaultUserAgent(getContext()));
+
+            String cookies = CookieManager.getInstance().getCookie(url);
+            if (cookies != null && !cookies.trim().isEmpty()) {
+                request.addRequestHeader("Cookie", cookies);
+            }
+
+            DownloadManager manager = (DownloadManager) getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+            if (manager == null) {
+                call.reject("System download manager is unavailable");
+                return;
+            }
+
+            long downloadId = manager.enqueue(request);
+            JSObject result = new JSObject();
+            result.put("started", true);
+            result.put("id", downloadId);
+            call.resolve(result);
+        } catch (RuntimeException error) {
+            Log.e(TAG, "Unable to queue attachment download", error);
+            call.reject("Unable to start attachment download", error);
+        }
     }
 
     @PluginMethod
@@ -570,6 +626,8 @@ public class MailFlowNativePlugin extends Plugin {
             + "var updateCall=function(directMethod,directArgs,pluginMethod,pluginArgs,fallback){return direct(directMethod,directArgs,fallback)||call(pluginMethod,pluginArgs,fallback);};"
             + "window.mailflowNative=window.mailflowNative||{};"
             + "window.mailflowNative.platform='android';"
+            + "window.mailflowNative.attachments=window.mailflowNative.attachments||{};"
+            + "window.mailflowNative.attachments.download=function(options){return call('downloadAttachment',options||{}, {started:false,reason:'unavailable'});};"
             + "window.mailflowNative.updates=window.mailflowNative.updates||{};"
             + "window.mailflowNative.updates.getState=function(){return updateCall('getUpdateState',[],'getUpdateState',{}, {type:'idle'});};"
             + "window.mailflowNative.updates.check=function(verbose){return updateCall('checkForUpdates',[!!verbose],'checkForUpdates',{verbose:!!verbose},{started:false});};"
@@ -1456,6 +1514,18 @@ public class MailFlowNativePlugin extends Plugin {
             updatesChannel.setDescription(context.getString(R.string.update_channel_description));
             manager.createNotificationChannel(updatesChannel);
         }
+    }
+
+    @PermissionCallback
+    private void attachmentStoragePermissionCallback(PluginCall call) {
+        if (getPermissionState("storage") != PermissionState.GRANTED) {
+            JSObject result = new JSObject();
+            result.put("started", false);
+            result.put("reason", "permission-denied");
+            call.resolve(result);
+            return;
+        }
+        enqueueAttachmentDownload(call);
     }
 
     @PermissionCallback
