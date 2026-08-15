@@ -128,7 +128,9 @@ export function resolveRowDisplay(thread, sectionKey) {
 // that account's flag only.
 export function gtdActiveForContext(accounts, selectedAccountId) {
   if (!Array.isArray(accounts) || accounts.length === 0) return false;
-  if (selectedAccountId == null) return accounts.some(a => a?.gtd_enabled);
+  if (selectedAccountId == null) {
+    return accounts.some(a => a?.gtd_enabled && a?.include_in_unified_inbox !== false);
+  }
   const acct = accounts.find(a => a?.id === selectedAccountId);
   return !!acct?.gtd_enabled;
 }
@@ -274,6 +276,64 @@ export function removeGtdThreadFromSections(sections, identity, states) {
       ...sections.waiting,
       total: Math.max(0, (Number(sections.waiting.total) || 0) - 1),
       unread: Math.max(0, (Number(sections.waiting.unread) || 0) - (waitingUnread ? 1 : 0)),
+    };
+  }
+  return changed ? next : sections;
+}
+
+export function snapshotGtdThreadRemoval(sections, identity, states) {
+  if (!sections || identity == null) return null;
+  const removedByState = {};
+  for (const key of [...new Set(states || [])]) {
+    const sec = sections[key];
+    if (!sec || !Array.isArray(sec.threads)) continue;
+    const rows = [];
+    sec.threads.forEach((thread, index) => {
+      if ((thread.message_id || thread.id) === identity) rows.push({ index, thread });
+    });
+    if (rows.length) removedByState[key] = rows;
+  }
+  return Object.keys(removedByState).length ? { identity, removedByState } : null;
+}
+
+export function restoreGtdThreadRemoval(sections, snapshot) {
+  if (!sections || !snapshot) return sections;
+  const next = { ...sections };
+  let changed = false;
+  let restoredWaiting = false;
+  let restoredWaitingUnread = false;
+
+  for (const [key, rows] of Object.entries(snapshot.removedByState)) {
+    const sec = sections[key];
+    if (!sec || !Array.isArray(sec.threads)) continue;
+    const threads = [...sec.threads];
+    let restored = 0;
+    let restoredUnread = 0;
+    for (const row of rows) {
+      if (threads.some(thread => (thread.message_id || thread.id) === snapshot.identity)) continue;
+      threads.splice(Math.min(row.index, threads.length), 0, row.thread);
+      restored += 1;
+      if (!row.thread.is_read) restoredUnread += 1;
+    }
+    if (!restored) continue;
+    changed = true;
+    if (key === 'watch' || key === 'delegated') {
+      restoredWaiting = true;
+      if (restoredUnread) restoredWaitingUnread = true;
+    }
+    next[key] = {
+      ...sec,
+      total: (Number(sec.total) || 0) + restored,
+      unread: (Number(sec.unread) || 0) + restoredUnread,
+      threads,
+    };
+  }
+
+  if (restoredWaiting && sections.waiting && typeof sections.waiting === 'object') {
+    next.waiting = {
+      ...sections.waiting,
+      total: (Number(sections.waiting.total) || 0) + 1,
+      unread: (Number(sections.waiting.unread) || 0) + (restoredWaitingUnread ? 1 : 0),
     };
   }
   return changed ? next : sections;

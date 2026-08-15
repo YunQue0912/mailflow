@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
@@ -76,7 +76,7 @@ function FileIcon({ type }) {
   return <svg {...props}><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>;
 }
 
-export default function MessageBodyView({ message, eager = true, onBodyLoaded, beforeContent = null, banner = null, inset = true, framed = true }) {
+const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = true, onBodyLoaded, onContextMenu, beforeContent = null, banner = null, inset = true, framed = true }, ref) {
   const { t } = useTranslation();
   const isMobile = useMobile();
   const { imageWhitelist, addToImageWhitelist, blockRemoteImages, addNotification } = useStore();
@@ -94,6 +94,28 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
   const scaleRef = useRef(null);
   const innerRef = useRef(null);
   const previousBlockingPolicyRef = useRef(null);
+
+  useImperativeHandle(ref, () => ({
+    getSelectionText() {
+      const iframeSelection = iframeRef.current?.contentDocument?.getSelection?.().toString() || '';
+      return iframeSelection.trim() ? iframeSelection : (window.getSelection?.().toString() || '');
+    },
+    selectAll() {
+      const doc = iframeRef.current?.contentDocument || document;
+      const root = iframeRef.current?.contentDocument?.body || innerRef.current || outerRef.current;
+      if (!root) return false;
+      const selection = doc.getSelection?.();
+      const range = doc.createRange();
+      range.selectNodeContents(root);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      return true;
+    },
+    find(query, matchCase = false, backwards = false) {
+      const targetWindow = iframeRef.current?.contentWindow || window;
+      return targetWindow.find?.(query, matchCase, backwards, true, false, false, false) || false;
+    },
+  }), []);
 
   const messageId = message?.id;
   const prepared = useMemo(() => {
@@ -180,6 +202,8 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
     if (!iframe || !body?.html) return;
     let animationFrame;
     let lastHeight = 0;
+    let contextMenuDocument = null;
+    let contextMenuHandler = null;
 
     const setHeight = () => {
       const doc = iframe.contentDocument;
@@ -257,6 +281,20 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
         if (href.startsWith('//')) href = `https:${href}`;
         if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) window.open(href, '_blank', 'noopener,noreferrer');
       });
+      if (onContextMenu) {
+        contextMenuHandler = event => {
+          event.preventDefault();
+          const rect = iframe.getBoundingClientRect();
+          onContextMenu({
+            x: rect.left + event.clientX,
+            y: rect.top + event.clientY,
+            selectedText: doc.getSelection?.().toString() || '',
+            source: 'iframe',
+          });
+        };
+        contextMenuDocument = doc;
+        doc.addEventListener('contextmenu', contextMenuHandler);
+      }
       doc.querySelectorAll('img').forEach(image => {
         if (image.complete) return;
         image.addEventListener('load', () => { expandScrollContainers(); requestAnimationFrame(setHeight); }, { once: true });
@@ -275,10 +313,13 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
       cancelAnimationFrame(animationFrame);
       resizeObserverRef.current?.disconnect();
       resizeObserverRef.current = null;
+      if (contextMenuDocument && contextMenuHandler) {
+        contextMenuDocument.removeEventListener('contextmenu', contextMenuHandler);
+      }
       iframe.removeEventListener('load', onLoaded);
       emailScaleRef.current = 1;
     };
-  }, [body?.html, messageId]);
+  }, [body?.html, messageId, onContextMenu]);
 
   useLayoutEffect(() => {
     if (!prepared) return;
@@ -424,6 +465,18 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
     if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) window.open(href, '_blank', 'noopener,noreferrer');
   };
 
+  const handleBodyContextMenu = event => {
+    if (!onContextMenu) return;
+    event.preventDefault();
+    event.stopPropagation();
+    onContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      selectedText: window.getSelection?.().toString() || '',
+      source: 'body',
+    });
+  };
+
   const attachments = body?.attachments || [];
   const senderEmail = message?.from_email?.toLowerCase() || '';
   const senderDomain = senderEmail.includes('@') ? senderEmail.split('@')[1] : '';
@@ -466,12 +519,14 @@ export default function MessageBodyView({ message, eager = true, onBodyLoaded, b
             senderDomain && { label: t('message.allowDomain', { domain: senderDomain }), handler: () => allowRemoteImages('domain', senderDomain) },
           ].filter(Boolean).map(action => <button key={action.label} onClick={action.handler} disabled={savingAllow} style={{ background: 'none', border: '1px solid var(--border)', borderRadius: 5, padding: '3px 9px', cursor: savingAllow ? 'default' : 'pointer', color: 'var(--accent)', fontSize: 11, fontWeight: 500, opacity: savingAllow ? 0.5 : 1 }}>{action.label}</button>)}</div></div>}
           <div style={{ position: 'relative', padding: '14px 16px 12px', background: 'white', borderRadius: isMobile || !framed ? 0 : 8, border: isMobile || !framed ? 'none' : '1px solid var(--border-subtle)', overflow: 'hidden', contain: 'layout' }}>
-            {USE_DIV_RENDER ? <div ref={outerRef} style={{ position: 'relative', width: '100%' }} onClick={handleEmailClick}><div ref={scaleRef}><div ref={innerRef} data-mailflow-email={prepared?.prefix} className={prepared?.prefix ?? ''} dangerouslySetInnerHTML={prepared ? { __html: prepared.html } : undefined}/></div></div> : <iframe ref={iframeRef} srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="only light"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; style-src 'unsafe-inline';"><base target="_blank"></head><body><div id="mf-scale-wrapper">${body.html.replace(/<a(\s)/gi, '<a rel="noopener noreferrer"$1')}</div><style>html,body{height:auto!important;min-height:0!important;overflow:hidden!important}body{margin:0!important;padding:0!important;background-color:#fff!important;color-scheme:light;font-family:-apple-system,Arial,sans-serif;font-size:14px;line-height:1.6;color:#1a1a1a;word-wrap:break-word;overflow-wrap:break-word}img{max-width:100%!important;height:auto!important}body>table,body>center>table,body>div>table,body>center>div>table,#mf-scale-wrapper>table,#mf-scale-wrapper>center>table,#mf-scale-wrapper>div>table,#mf-scale-wrapper>center>div>table{width:100%!important}td,th{min-width:0!important}td{word-break:break-word}th{overflow-wrap:normal;word-break:normal}a{color:#6366f1}pre,code{overflow-x:auto;white-space:pre-wrap;word-break:break-all}blockquote{border-left:3px solid #ddd;margin:0;padding-left:12px;color:#555}</style></body></html>`} scrolling="no" style={{ width: '1px', minWidth: '100%', border: 'none', display: 'block', height: '300px' }} sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" title={t('message.emailFrameTitle')}/>}
+            {USE_DIV_RENDER ? <div ref={outerRef} style={{ position: 'relative', width: '100%' }} onClick={handleEmailClick} onContextMenu={handleBodyContextMenu}><div ref={scaleRef}><div ref={innerRef} data-mailflow-email={prepared?.prefix} className={prepared?.prefix ?? ''} dangerouslySetInnerHTML={prepared ? { __html: prepared.html } : undefined}/></div></div> : <iframe ref={iframeRef} srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="only light"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; style-src 'unsafe-inline';"><base target="_blank"></head><body><div id="mf-scale-wrapper">${body.html.replace(/<a(\s)/gi, '<a rel="noopener noreferrer"$1')}</div><style>html,body{height:auto!important;min-height:0!important;overflow:hidden!important}body{margin:0!important;padding:0!important;background-color:#fff!important;color-scheme:light;font-family:-apple-system,Arial,sans-serif;font-size:14px;line-height:1.6;color:#1a1a1a;word-wrap:break-word;overflow-wrap:break-word}img{max-width:100%!important;height:auto!important}body>table,body>center>table,body>div>table,body>center>div>table,#mf-scale-wrapper>table,#mf-scale-wrapper>center>table,#mf-scale-wrapper>div>table,#mf-scale-wrapper>center>div>table{width:100%!important}td,th{min-width:0!important}td{word-break:break-word}th{overflow-wrap:normal;word-break:normal}a{color:#6366f1}pre,code{overflow-x:auto;white-space:pre-wrap;word-break:break-all}blockquote{border-left:3px solid #ddd;margin:0;padding-left:12px;color:#555}</style></body></html>`} scrolling="no" style={{ width: '1px', minWidth: '100%', border: 'none', display: 'block', height: '300px' }} sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" title={t('message.emailFrameTitle')}/>}
           </div>
         </div>
       )}
 
-      {!loadingBody && !bodyError && body?.text && !body.html && <div style={{ padding: horizontalPadding }}>{banner}<div style={{ margin: 0, padding: '14px 16px 12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 14, color: '#1a1a1a', lineHeight: 1.7, fontFamily: 'DM Sans, sans-serif', background: 'white', borderRadius: isMobile || !framed ? 0 : 8, border: isMobile || !framed ? 'none' : '1px solid var(--border-subtle)', overflow: 'hidden' }} dangerouslySetInnerHTML={{ __html: linkifyText(body.text) }}/></div>}
+      {!loadingBody && !bodyError && body?.text && !body.html && <div style={{ padding: horizontalPadding }}>{banner}<div onContextMenu={handleBodyContextMenu} style={{ margin: 0, padding: '14px 16px 12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 14, color: '#1a1a1a', lineHeight: 1.7, fontFamily: 'DM Sans, sans-serif', background: 'white', borderRadius: isMobile || !framed ? 0 : 8, border: isMobile || !framed ? 'none' : '1px solid var(--border-subtle)', overflow: 'hidden' }} dangerouslySetInnerHTML={{ __html: linkifyText(body.text) }}/></div>}
     </>
   );
-}
+});
+
+export default MessageBodyView;

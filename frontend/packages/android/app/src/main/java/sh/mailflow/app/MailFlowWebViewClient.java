@@ -27,11 +27,12 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
     @Override
     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
         Uri uri = request == null ? null : request.getUrl();
-        if (request != null && request.isForMainFrame() && uri != null) {
-            String url = uri.toString();
-            if (shouldStayInWebView(view, url)) return false;
-            if (openExternallyIfNeeded(url)) return true;
-        }
+        if (request == null || uri == null) return super.shouldOverrideUrlLoading(view, request);
+
+        String url = uri.toString();
+        if (shouldStayInWebView(view, url)) return false;
+        if (!request.isForMainFrame()) return isWebUrl(uri);
+        if (openExternallyIfNeeded(url)) return true;
 
         return super.shouldOverrideUrlLoading(view, request);
     }
@@ -88,11 +89,11 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
 
     private boolean isConfiguredHost(String url) {
         String host = MailFlowNativePlugin.getSavedHost(context);
-        return WebNavigationPolicy.isConfiguredOrigin(host, url);
+        return host != null && NativeSecurity.isSameOrigin(host, url);
     }
 
     private boolean shouldStayInWebView(WebView view, String url) {
-        if (isConfiguredHost(url)) return true;
+        if (isConfiguredHost(url) || FALLBACK_URL.equals(url)) return true;
 
         String currentUrl = view == null ? null : view.getUrl();
         if (!WebNavigationPolicy.isInitialHostNavigation(localUrl, SETUP_URL, currentUrl, url)) {
@@ -100,8 +101,15 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
         }
 
         // Fallback for setup pages whose asynchronous Capacitor bridge did not
-        // finish saving before location.replace() started navigation.
+        // finish saving before location.replace() started navigation. Never
+        // bypass the explicit warning required for unencrypted HTTP hosts.
+        if (!NativeSecurity.isHttpsUrl(url)) return false;
         return MailFlowNativePlugin.saveHost(context, url) != null;
+    }
+
+    private boolean isWebUrl(Uri uri) {
+        String scheme = uri == null ? null : uri.getScheme();
+        return "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
     }
 
     private boolean openExternallyIfNeeded(String url) {

@@ -28,6 +28,7 @@ If you contribute code, please read the [Contributor License Agreement](CLA.md).
 ## Features
 
 - **Unified inbox** — all accounts merged in one view, sorted by date
+- **Sender imagery** — real manual/CardDAV contact photos take priority, with optional domain favicons proxied and cached through Twenty Icons and deterministic initials as the offline fallback; disable sender favicons under Appearance to prevent lookups for your user
 - **Email categorization** — automatic inbox tabs (Primary, Newsletters, Social, Notifications, Other) sort incoming mail by type using header detection and sender heuristics; AI reclassify button for misclassifications
 - **Unsubscribe** — one-click unsubscribe button appears in the message pane for detected newsletters; sends the request or opens the unsubscribe URL automatically
 - **Conversation threads** — choose flat messages, expandable thread rows, or a Gmail-style full conversation reading pane; the full pane includes sent replies, keeps older messages collapsed, and loads historical message bodies on demand
@@ -51,11 +52,11 @@ If you contribute code, please read the [Contributor License Agreement](CLA.md).
 - **Block list** — automatically move mail from blocked senders to trash before inbox rules run
 - **Spam reporting** — mark messages as spam or not spam from the context menu, toolbar, or bulk actions; feedback will feed into automated filtering in a future release
 - **Snooze** — snooze messages until a chosen time; they reappear at the top of the inbox
-- **AI assistant** — connect any OpenAI-compatible provider (local models or cloud); summarise threads, draft replies, ask questions about a message
+- **AI assistant** — use an OpenAI-compatible API provider or a ChatGPT Codex subscription; summarise threads, draft replies, ask questions about a message
 - **Password recovery** — recover your account via a recovery email address configured in profile settings
 - **User management** — admin panel, invite-only registration, invite emails
 - **Two-factor authentication** — TOTP (any authenticator app), email OTP fallback, persistent device trust; admin-configurable enforcement policy
-- **SSO / OIDC** — single sign-on via any OpenID Connect provider; group claims from the IdP can be mapped to the MailFlow admin role
+- **SSO / OIDC** — single sign-on via any OpenID Connect provider; group claims from the IdP can be mapped to the MailFlow admin role, with optional RP-initiated (end-session) logout to sign out of the provider too
 - **Microsoft 365 / OAuth2** — work accounts via Azure App Registration; personal Outlook.com via device code flow
 - **Todoist integration** — create tasks directly from emails; tasks include a deep link back to the original message
 - **CardDAV** — expose your MailFlow contacts as a CardDAV address book for sync with phone and desktop contact apps; contact photos sync and appear as sender avatars in the message list
@@ -253,7 +254,7 @@ No container runtime required. The steps below use Ubuntu/Debian; adapt package 
 
 ### Prerequisites
 
-- **Node.js 22+** — [nodejs.org](https://nodejs.org) or via your package manager
+- **Node.js 22 (LTS)** — [nodejs.org](https://nodejs.org) or via your package manager. Newer majors break the backend: Node's built-in `fetch` conflicts with the pinned `undici` dispatcher.
 - **PostgreSQL 16+**
 - **Redis 7+**
 - **nginx** — serves the built frontend and proxies API/WebSocket requests to the backend
@@ -442,26 +443,52 @@ Gmail requires an **App Password** (not your normal password):
 
 Microsoft has disabled basic (password) auth for Outlook.com, Hotmail, and most
 Microsoft 365 accounts, so they connect via OAuth2 under **Settings → Integrations →
-Microsoft 365** (not the normal Add Account form). Both paths need a free
-[Microsoft Entra app registration](https://portal.azure.com) for a **Client ID**.
-When registering, choose "Accounts in any organizational directory and personal
-Microsoft accounts" so it covers both.
+Microsoft 365** (not the normal Add Account form). This is a one-time setup: you
+create a free [Microsoft Entra app registration](https://portal.azure.com) once, and
+the same app then serves every account and user on your instance.
 
-**Work / school accounts (Microsoft 365)** (confidential client):
+**1. Register the app.** In the Azure portal, go to **Microsoft Entra ID → App
+registrations → New registration**. Under **Supported account types**, choose
+**"Accounts in any organizational directory and personal Microsoft accounts"** so it
+covers both Outlook.com/Hotmail and work/school accounts. After creating it, copy the
+**Application (Client) ID**.
 
-1. In the Azure app, add a **client secret** and a redirect URI of
-   `https://<your-mailflow-host>/oauth/microsoft/callback` (the exact value is shown
-   on the Integrations screen).
-2. In Integrations → Microsoft 365, enter the Client ID, Tenant ID, Client Secret,
-   and Redirect URI, then save and click **Connect Microsoft account**.
+**2. Grant the mail permissions.** Open the app's **API permissions** page and add
+both of these, then follow the consent note:
+
+- **Add a permission → APIs my organization uses → Office 365 Exchange Online →
+  Delegated permissions**, and add **`IMAP.AccessAsUser.All`** and **`SMTP.Send`**
+  (if Exchange Online is not listed, type "Exchange" in the search box).
+- **Add a permission → Microsoft Graph → Delegated permissions**, and add
+  **`offline_access`**, **`openid`**, **`email`**, and **`profile`**.
+- For **work / school** accounts, click **Grant admin consent for your
+  organization**. Personal accounts consent at sign-in and can skip this.
+
+> This step is required. Without these permissions the account still "connects" and
+> is added, but no mail loads and sending fails with a credentials error, because
+> Outlook's IMAP and SMTP servers reject a token that lacks the mail scopes.
+
+Then follow the steps for your account type:
 
 **Personal accounts (Outlook.com / Hotmail)** (public client, device code):
 
-1. In Integrations → Microsoft 365, enter just the **Client ID** and **Tenant ID**
-   (`common`), leaving Client Secret and Redirect URI blank, then save.
-2. Start the device-code flow shown there. MailFlow displays a short code; visit
+1. In the Azure app, open **Authentication** and set **"Allow public client flows"**
+   to **Yes**. No client secret or redirect URI is needed.
+2. In Integrations → Microsoft 365, enter the **Client ID** and **Tenant ID**
+   (`common`), leave Client Secret and Redirect URI blank, then save.
+3. Start the device-code flow shown there. MailFlow displays a short code; visit
    [microsoft.com/devicelogin](https://microsoft.com/devicelogin) and enter it to
    authorise.
+
+**Work / school accounts (Microsoft 365)** (confidential client):
+
+1. In the Azure app, open **Authentication → Add a platform → Web**, and set the
+   redirect URI to `https://<your-mailflow-host>/oauth/microsoft/callback` (the exact
+   value is shown on the Integrations screen).
+2. Under **Certificates & secrets → New client secret**, create a secret and copy its
+   **Value** (not the Secret ID).
+3. In Integrations → Microsoft 365, enter the Client ID, Tenant ID, Client Secret,
+   and Redirect URI, then save and click **Connect Microsoft account**.
 
 ### Custom IMAP
 
@@ -590,7 +617,6 @@ MailFlow is free and open source. If it's useful to you, consider supporting dev
 
 <!-- SPONSORS-START -->
 <a href="https://github.com/MikeScanlan5" title="MikeScanlan5"><img src="https://avatars.githubusercontent.com/u/44779151?s=64&u=e7dfabc231fa876f879e63b4cd1c897036751467&v=4" width="48" height="48" alt="MikeScanlan5" style="border-radius:50%;margin:4px"></a>
-<a href="https://github.com/rahhing" title="rahhing"><img src="https://avatars.githubusercontent.com/u/192337730?s=64&u=ef3c773f0ccac769353d63545e0ff6a0c885294a&v=4" width="48" height="48" alt="rahhing" style="border-radius:50%;margin:4px"></a>
 <!-- SPONSORS-END -->
 
 ---

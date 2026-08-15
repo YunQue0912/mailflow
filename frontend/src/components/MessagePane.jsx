@@ -12,11 +12,15 @@ import DOMPurify from 'dompurify';
 import { BUILTIN_SUMMARIZE } from '../aiActions.js';
 import { getResults, saveResult, removeResult } from '../aiResults.js';
 import { renderMarkdown } from '../utils/renderMarkdown.js';
+import { pickReplyAlias } from '../utils/replyAlias.js';
+import { classifyThread, unclassifyThread } from '../utils/gtd.js';
 import { senderColor } from '../themes.js';
 import MessageHeaderModal from './MessageHeaderModal.jsx';
 import FolderIcon from './FolderIcon.jsx';
 import TodoistTaskModal from './TodoistTaskModal.jsx';
 import MessageBodyView from './MessageBodyView.jsx';
+import SenderAvatarImage from './SenderAvatarImage.jsx';
+import ContextMenu from './ContextMenu.jsx';
 
 const MESSAGE_OPENING_EVENT = 'mailflow:message-opening';
 const SPAM_NAME_RE = /(spam|junk|bulk|indesiderata|spamverdacht|courrier\s*ind|posta\s*indesiderata)/i;
@@ -212,6 +216,10 @@ export default function MessagePane() {
   const [movePickerLoading, setMovePickerLoading] = useState(false);
   const [moveSearch, setMoveSearch] = useState('');
   const [showMoreMenu, setShowMoreMenu] = useState(false);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [findDialogOpen, setFindDialogOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findMatchCase, setFindMatchCase] = useState(false);
   const [showTodoistModal, setShowTodoistModal] = useState(false);
   const [aiStatus, setAiStatus] = useState(null);
   // Per-action results for the current message: { [actionKey]: { status, text, label } }.
@@ -226,6 +234,8 @@ export default function MessagePane() {
   // One AbortController per in-flight action, keyed by action key.
   const aiAbortRefs = useRef({});
   const scrollContainerRef = useRef(null);
+  const bodyViewRef = useRef(null);
+  const findInputRef = useRef(null);
   // Ref holding the latest pane action handlers so shortcut subscriptions ([] deps) never go stale
   const paneActionsRef = useRef({});
 
@@ -382,25 +392,13 @@ export default function MessagePane() {
     const myAccount = accounts.find(a => a.id === message.account_id);
     const myEmail = myAccount?.email_address || '';
 
-    const replyAliasId = (() => {
-      const aliases = myAccount?.aliases || [];
-      if (!aliases.length) return null;
-      try {
-        const toArr = Array.isArray(message.to_addresses)
-          ? message.to_addresses
-          : JSON.parse(message.to_addresses || '[]');
-        const ccArr = Array.isArray(message.cc_addresses)
-          ? message.cc_addresses
-          : JSON.parse(message.cc_addresses || '[]');
-        const allEmails = [...toArr, ...ccArr].map(t => t.email?.toLowerCase()).filter(Boolean);
-        const fromEmail = (message.from_email || '').toLowerCase();
-        const match = aliases.find(al => {
-          const aliasEmail = al.email.toLowerCase();
-          return allEmails.includes(aliasEmail) || fromEmail === aliasEmail;
-        });
-        return match ? match.id : null;
-      } catch { return null; }
-    })();
+    const replyAliasId = pickReplyAlias({
+      aliases: myAccount?.aliases || [],
+      deliveryAddresses: message.delivery_addresses,
+      toAddresses: message.to_addresses,
+      ccAddresses: message.cc_addresses,
+      fromEmail: message.from_email,
+    });
 
     const myAddresses = new Set([
       myEmail.toLowerCase(),
@@ -752,6 +750,8 @@ ${bodyContent}
     setShowMovePicker(false);
     setShowHeaderModal(false);
     setShowMoreMenu(false);
+    setContextMenu(null);
+    setFindDialogOpen(false);
     setUnsubscribeStatus(null);
     setAiClassifying(false);
   }, [selectedMessageId]);
@@ -889,6 +889,117 @@ ${bodyContent}
         if (!archived.is_read) incrementUnread(archived.account_id);
       },
     });
+  };
+
+  const openPaneContextMenu = (details) => {
+    if (!message) return;
+    setShowReplyMenu(false);
+    setShowMovePicker(false);
+    setShowMoreMenu(false);
+    setShowAiMenu(false);
+    setContextMenu({
+      x: details.x,
+      y: details.y,
+      selectedText: details.selectedText || '',
+      source: details.source || 'pane',
+      message,
+    });
+  };
+
+  const handlePaneContextMenu = (event) => {
+    if (event.target?.closest?.('a[href], img, input, textarea, select, button, [contenteditable="true"]')) return;
+    event.preventDefault();
+    openPaneContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      selectedText: window.getSelection?.().toString() || '',
+      source: 'pane',
+    });
+  };
+
+  const handlePaneContextAction = async (action, data) => {
+    if (!message) return;
+    switch (action) {
+      case 'copy':
+      case 'copySelection': {
+        const text = contextMenu?.selectedText || bodyViewRef.current?.getSelectionText?.() || '';
+        if (text) navigator.clipboard?.writeText(text).catch(() => {});
+        break;
+      }
+      case 'selectAllContent':
+        bodyViewRef.current?.selectAll?.();
+        break;
+      case 'findInContent':
+        setFindDialogOpen(true);
+        setTimeout(() => findInputRef.current?.focus(), 0);
+        break;
+      case 'print': handlePrint(); break;
+      case 'markRead':
+        if (!message.is_read) {
+          updateMessage(message.id, { is_read: true });
+          decrementUnread(message.account_id);
+          adjustCategoryCount(message.category, -1);
+          setPending(message.id, message.account_id);
+          api.bulkRead([message.id], true).catch(() => {
+            updateMessage(message.id, { is_read: false });
+            incrementUnread(message.account_id);
+            adjustCategoryCount(message.category, 1);
+            pendingMarkReadMap.delete(message.id);
+          });
+        }
+        break;
+      case 'markUnread': handleMarkUnread(); break;
+      case 'toggleStar': await handleStarToggle(); break;
+      case 'reply': handleReply(false); break;
+      case 'replyAll': handleReply(true); break;
+      case 'forward': handleForward(); break;
+      case 'archive': handleArchive(); break;
+      case 'moveTo': if (data) handleMoveToFolder(data); break;
+      case 'delete': handleDelete(); break;
+      case 'markSpam': await performSingleSpamLabel('spam'); break;
+      case 'markHam': await performSingleSpamLabel('ham'); break;
+      case 'gtdClassify':
+        await classifyThread(message.id, data, {
+          gtdClassify: api.gtdClassify,
+          addNotification,
+          scheduleGtdSectionsFetch: useStore.getState().scheduleGtdSectionsFetch,
+          t,
+        });
+        break;
+      case 'gtdRemove':
+        await unclassifyThread(message.id, data, {
+          gtdUnclassify: api.gtdUnclassify,
+          addNotification,
+          scheduleGtdSectionsFetch: useStore.getState().scheduleGtdSectionsFetch,
+          t,
+        });
+        break;
+      case 'createRuleFromMessage':
+        useStore.getState().setRulesPreFill?.({ fromEmail: message.from_email, fromName: message.from_name });
+        setAdminTab('rules');
+        setShowAdmin(true);
+        break;
+      case 'addToBlockList':
+        if (message.from_email) {
+          api.addToBlockList(message.from_email)
+            .then(() => addNotification({ title: t('blockList.blocked'), body: message.from_email }))
+            .catch(() => addNotification({ type: 'error', title: t('blockList.errorAdd'), body: message.from_email }));
+        }
+        break;
+      case 'setCategory': {
+        const category = data || 'primary';
+        await api.setMessageCategory(message.id, category);
+        updateMessage(message.id, { category: category === 'primary' ? null : category });
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  const runMessageFind = (backwards = false) => {
+    if (!findQuery) return;
+    bodyViewRef.current?.find?.(findQuery, findMatchCase, backwards);
   };
 
   const handleUnsubscribe = async () => {
@@ -1548,6 +1659,7 @@ ${bodyContent}
       <div
         ref={scrollContainerRef}
         onScroll={e => setPaneScrolled(e.currentTarget.scrollTop > 4)}
+        onContextMenu={handlePaneContextMenu}
         style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', background: 'var(--bg-primary)' }}
       >
       <div style={{ padding: isMobile ? '12px 0 0' : '24px 28px 0' }}>
@@ -1588,8 +1700,13 @@ ${bodyContent}
               background: senderColor(message.from_email || message.from_name),
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               fontSize: 16, fontWeight: 700, color: 'white',
+              position: 'relative', overflow: 'hidden',
             }}>
               {(message.from_name || message.from_email || '?')[0].toUpperCase()}
+              <SenderAvatarImage
+                email={message.from_email}
+                hasContactPhoto={message.has_contact_photo}
+              />
             </div>
 
             {/* Sender info */}
@@ -1688,9 +1805,11 @@ ${bodyContent}
         </div>
 
         <MessageBodyView
+          ref={bodyViewRef}
           message={message}
           eager
           onBodyLoaded={setBody}
+          onContextMenu={openPaneContextMenu}
           onOpenHeaders={() => setShowHeaderModal(true)}
           beforeContent={messageAiResults}
           banner={messageBodyBanner}
@@ -1826,6 +1945,54 @@ ${bodyContent}
             </div>
           </div>
         </>
+      )}
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          message={contextMenu.message}
+          variant="messagePane"
+          selectedText={contextMenu.selectedText}
+          onClose={() => setContextMenu(null)}
+          onAction={handlePaneContextAction}
+        />
+      )}
+
+      {findDialogOpen && (
+        <div style={{
+          position: 'fixed', top: 80, left: '50%', transform: 'translateX(-50%)', zIndex: 4100,
+          width: 456, maxWidth: 'calc(100vw - 24px)', background: 'var(--bg-elevated)',
+          border: '1px solid var(--border)', borderRadius: 6, boxShadow: 'var(--shadow-modal)',
+          color: 'var(--text-primary)', padding: '10px 16px 14px',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16 }}>
+            <div style={{ flex: 1, textAlign: 'center', fontSize: 18, fontWeight: 500 }}>{t('message.find.title')}</div>
+            <button onClick={() => setFindDialogOpen(false)} aria-label={t('message.find.close')} style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 28 }}>&times;</button>
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14, fontSize: 14 }}>
+            <span>{t('message.find.label')}</span>
+            <input
+              ref={findInputRef}
+              value={findQuery}
+              onChange={event => setFindQuery(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter') { event.preventDefault(); runMessageFind(event.shiftKey); }
+                if (event.key === 'Escape') setFindDialogOpen(false);
+              }}
+              style={{ flex: 1, height: 34, border: '1px solid var(--accent)', borderRadius: 4, padding: '5px 8px', background: 'var(--bg-primary)', color: 'var(--text-primary)' }}
+            />
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 22px 4px', fontSize: 14 }}>
+            <input type="checkbox" checked={findMatchCase} onChange={event => setFindMatchCase(event.target.checked)} />
+            {t('message.find.matchCase')}
+          </label>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <button onClick={() => runMessageFind(true)} disabled={!findQuery}>{t('message.find.previous')}</button>
+            <button onClick={() => runMessageFind(false)} disabled={!findQuery}>{t('message.find.next')}</button>
+            <button onClick={() => setFindDialogOpen(false)}>{t('message.find.closeButton')}</button>
+          </div>
+        </div>
       )}
 
       {showHeaderModal && (

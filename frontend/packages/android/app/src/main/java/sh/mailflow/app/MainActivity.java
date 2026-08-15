@@ -4,16 +4,12 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.util.Log;
 import android.webkit.CookieManager;
 import android.webkit.WebView;
 import androidx.activity.OnBackPressedCallback;
 import com.getcapacitor.BridgeActivity;
-import com.getcapacitor.PluginHandle;
-import com.getcapacitor.PluginLoadException;
 
 public class MainActivity extends BridgeActivity {
-    private static final String TAG = "MailFlowMain";
     private String lastHandledIntentKey = null;
 
     @Override
@@ -32,20 +28,9 @@ public class MainActivity extends BridgeActivity {
 
         if (bridge != null) {
             configureCookies();
-            bridge.getWebView().addJavascriptInterface(
-                new MailFlowNativePlugin.NotificationBridge(
-                    this,
-                    new MailFlowNativePlugin.NativePluginProvider() {
-                        @Override
-                        public MailFlowNativePlugin get() {
-                            return resolveNativePlugin();
-                        }
-                    }
-                ),
-                "MailFlowAndroid"
-            );
             bridge.setWebViewClient(new MailFlowWebViewClient(bridge, this));
             String savedHost = MailFlowNativePlugin.getSavedHost(this);
+            configureNativeMessageBridge(savedHost);
             if (savedHost != null) {
                 MailFlowBackgroundSync.schedule(this);
                 bridge.getWebView().post(() -> bridge.getWebView().loadUrl(savedHost));
@@ -53,27 +38,6 @@ public class MainActivity extends BridgeActivity {
         }
 
         handleNativeIntent(getIntent());
-    }
-
-    private MailFlowNativePlugin resolveNativePlugin() {
-        if (bridge == null) return null;
-
-        PluginHandle handle = bridge.getPlugin("MailFlowNative");
-        if (handle == null) {
-            Log.e(TAG, "MailFlowNative plugin is not registered");
-            return null;
-        }
-
-        try {
-            Object plugin = handle.getInstance();
-            if (plugin == null) plugin = handle.load();
-            return plugin instanceof MailFlowNativePlugin
-                ? (MailFlowNativePlugin) plugin
-                : null;
-        } catch (PluginLoadException error) {
-            Log.e(TAG, "Unable to load MailFlowNative plugin", error);
-            return null;
-        }
     }
 
     @Override
@@ -131,10 +95,12 @@ public class MainActivity extends BridgeActivity {
 
     private void handleNativeIntent(Intent intent) {
         if (intent == null) return;
-        if (!markIntentHandled(intent)) return;
 
         String action = intent.getAction();
         Uri data = intent.getData();
+        if (MailFlowNativePlugin.isPrivilegedNativeAction(action)
+            && !MailFlowNativePlugin.isTrustedNativeIntent(this, intent)) return;
+        if (!markIntentHandled(intent)) return;
 
         if (MailFlowNativePlugin.ACTION_OPEN_MESSAGE.equals(action)) {
             MailFlowNativePlugin.sendOpenMessageAction(intent);
@@ -208,8 +174,13 @@ public class MainActivity extends BridgeActivity {
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && bridge != null && bridge.getWebView() != null) {
-            cookieManager.setAcceptThirdPartyCookies(bridge.getWebView(), true);
+            cookieManager.setAcceptThirdPartyCookies(bridge.getWebView(), false);
         }
+    }
+
+    void configureNativeMessageBridge(String configuredHost) {
+        if (bridge == null || bridge.getWebView() == null) return;
+        MailFlowNativeMessageBridge.configure(bridge.getWebView(), this, configuredHost);
     }
 
     private void flushCookies() {

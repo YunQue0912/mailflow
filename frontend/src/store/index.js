@@ -1,13 +1,25 @@
 import { create } from 'zustand';
 import { api } from '../utils/api.js';
+import { accountAffectsUnifiedInbox } from '../utils/unifiedInbox.js';
 import { applyTheme, applyCustomCss, getInitialTheme } from '../themes.js';
 import { applyFontSet, applyFontSize } from '../fonts.js';
 import { applyLayout, normalizeLayout } from '../layouts.js';
 import { DEFAULT_AI_ACTIONS } from '../aiActions.js';
-import { removeGtdThreadFromSections, setGtdThreadReadInSections } from '../utils/gtd.js';
+import {
+  removeGtdThreadFromSections,
+  restoreGtdThreadRemoval,
+  setGtdThreadReadInSections,
+  snapshotGtdThreadRemoval,
+} from '../utils/gtd.js';
+import { applyGtdRemovalGuard } from '../utils/pendingGtdRemovals.js';
 import { clampRightSidebarWidth } from '../utils/rightSidebar.js';
 import { conversationModeTransition, resolveConversationMode } from '../utils/conversationMode.js';
 import { selectedMessageTransition } from '../utils/conversation.js';
+import {
+  cacheFolderOrderFromPreferences,
+  mergeFolderOrder,
+  readFolderOrder,
+} from './folderOrder.js';
 import i18n from '../i18n.js';
 
 // Accumulate rapid preference changes and flush at most once per second.
@@ -42,7 +54,14 @@ function readGtdCollapsedSections() {
 export const useStore = create((set, get) => ({
   // Auth
   user: null,
-  setUser: (user) => set({ user }),
+  setUser: (user) => set(state => ({
+    user,
+    ...(state.user?.id !== user?.id ? {
+      senderFaviconsLoaded: false,
+      senderFavicons: false,
+      senderFaviconsSaving: false,
+    } : {}),
+  })),
   updateUser: (updates) => set(state => ({ user: state.user ? { ...state.user, ...updates } : state.user })),
 
   // Todoist integration status (persisted across page loads via localStorage)
@@ -226,13 +245,18 @@ export const useStore = create((set, get) => ({
   decrementUnread: (accountId, count = 1) => set(state => {
     const byAccount = { ...state.unreadCounts.byAccount };
     byAccount[accountId] = Math.max(0, (byAccount[accountId] || 0) - count);
-    const total = Math.max(0, state.unreadCounts.total - count);
+    const total = accountAffectsUnifiedInbox(state.accounts, accountId)
+      ? Math.max(0, state.unreadCounts.total - count)
+      : state.unreadCounts.total;
     return { unreadCounts: { total, byAccount } };
   }),
   incrementUnread: (accountId, count = 1) => set(state => {
     const byAccount = { ...state.unreadCounts.byAccount };
     byAccount[accountId] = (byAccount[accountId] || 0) + count;
-    return { unreadCounts: { total: state.unreadCounts.total + count, byAccount } };
+    const total = accountAffectsUnifiedInbox(state.accounts, accountId)
+      ? state.unreadCounts.total + count
+      : state.unreadCounts.total;
+    return { unreadCounts: { total, byAccount } };
   }),
 
   // Folders
@@ -445,6 +469,14 @@ export const useStore = create((set, get) => ({
     schedulePrefSave({ gravatarAvatars: val });
   },
 
+  // Show message preview snippets in the message list (on by default).
+  showMessagePreviews: localStorage.getItem('mailflow_show_message_previews') !== 'false',
+  setShowMessagePreviews: (val) => {
+    localStorage.setItem('mailflow_show_message_previews', String(val));
+    set({ showMessagePreviews: val });
+    schedulePrefSave({ showMessagePreviews: val });
+  },
+
   replyDefault: localStorage.getItem('mailflow_reply_default') || 'reply',
   setReplyDefault: (val) => {
     localStorage.setItem('mailflow_reply_default', val);
@@ -573,7 +605,7 @@ export const useStore = create((set, get) => ({
     try {
       const data = await api.getGtdSections({ accountId, limit: 50 });
       if (seq !== _gtdSectionsSeq) return; // superseded by a newer fetch
-      set({ gtdSections: data.sections || {} });
+      set({ gtdSections: applyGtdRemovalGuard(data.sections || {}) });
     } catch {
       // Best-effort; scheduleGtdSectionsFetch/the next context change will retry.
     }
@@ -590,8 +622,17 @@ export const useStore = create((set, get) => ({
   // are the backend section keys whose labels were removed (todo/watch/delegated/…).
   // Delegates to a pure helper (unit-tested in gtd.test.js) that also keeps the deduped
   // Waiting rollup in step so the Waiting badge is correct instantly.
-  removeGtdThread: (identity, states) => set(state => {
-    const next = removeGtdThreadFromSections(state.gtdSections, identity, states);
+  removeGtdThread: (identity, states) => {
+    let snapshot = null;
+    set(state => {
+      snapshot = snapshotGtdThreadRemoval(state.gtdSections, identity, states);
+      const next = removeGtdThreadFromSections(state.gtdSections, identity, states);
+      return next === state.gtdSections ? {} : { gtdSections: next };
+    });
+    return snapshot;
+  },
+  restoreGtdThread: (snapshot) => set(state => {
+    const next = restoreGtdThreadRemoval(state.gtdSections, snapshot);
     return next === state.gtdSections ? {} : { gtdSections: next };
   }),
   // Optimistically flip a section thread's read flag so a rail row's bold/normal styling
@@ -657,6 +698,35 @@ export const useStore = create((set, get) => ({
   // Image privacy
   blockRemoteImages: true,
   imageWhitelist: { addresses: [], domains: [] },
+  senderFaviconsLoaded: false,
+  senderFavicons: false,
+  senderFaviconsSaving: false,
+  // Monotonic counter bumped on every toggle. loadPreferences captures it before
+  // its GET so a stale hydration response can't clobber a toggle the user made
+  // while the fetch was in flight. Never reset — the user-id guard covers account
+  // switches, and monotonicity avoids ABA.
+  senderFaviconsEpoch: 0,
+  setSenderFavicons: async (enabled) => {
+    if (get().senderFaviconsSaving) return;
+    const userId = get().user?.id;
+    set(state => ({ senderFaviconsSaving: true, senderFaviconsEpoch: state.senderFaviconsEpoch + 1 }));
+    if (!enabled) {
+      set({ senderFavicons: false });
+      try { await api.savePreferences({ senderFavicons: false }); }
+      finally {
+        if (get().user?.id === userId) set({ senderFaviconsSaving: false });
+      }
+      return;
+    }
+    try {
+      await api.savePreferences({ senderFavicons: true });
+      if (get().user?.id === userId) {
+        set({ senderFaviconsLoaded: true, senderFavicons: true });
+      }
+    } finally {
+      if (get().user?.id === userId) set({ senderFaviconsSaving: false });
+    }
+  },
   setBlockRemoteImages: (val) => {
     set({ blockRemoteImages: val });
     return api.savePreferences({ blockRemoteImages: val });
@@ -706,6 +776,14 @@ export const useStore = create((set, get) => ({
   setHiddenFolders: (hf) => {
     set({ hiddenFolders: hf });
     return api.savePreferences({ hiddenFolders: hf }).catch(() => {});
+  },
+
+  // Custom per-account folder display order — { [accountId]: [path, ...] }
+  folderOrder: readFolderOrder(),
+  setFolderOrder: (accountId, paths) => {
+    const next = mergeFolderOrder(get().folderOrder, accountId, paths);
+    set({ folderOrder: next });
+    schedulePrefSave({ folderOrder: next });
   },
 
   // Sidebar tree state — persisted so the tree looks the same after reload/re-login
@@ -787,8 +865,11 @@ export const useStore = create((set, get) => ({
   // Fetch server preferences and apply them — call after any successful login.
   // Sets localStorage so subsequent page loads apply the right values instantly.
   loadPreferences: async () => {
+    const userId = get().user?.id;
+    const faviconEpoch = get().senderFaviconsEpoch;
     try {
       const prefs = await api.getPreferences();
+      if (get().user?.id !== userId) return;
       if (prefs.theme) {
         localStorage.setItem('mailflow_theme', prefs.theme);
         set({ theme: prefs.theme });
@@ -857,6 +938,13 @@ export const useStore = create((set, get) => ({
         set({ autoLockMinutes: [0, 1, 5, 15, 30].includes(n) ? n : 0 });
       }
       if (prefs.imageWhitelist) set({ imageWhitelist: prefs.imageWhitelist });
+      // Hydration is done, but if the user toggled while this GET was in flight
+      // (epoch bumped), the toggle owns senderFavicons — only mark it loaded.
+      if (get().senderFaviconsEpoch === faviconEpoch) {
+        set({ senderFaviconsLoaded: true, senderFavicons: prefs.senderFavicons === true });
+      } else {
+        set({ senderFaviconsLoaded: true });
+      }
       if (prefs.shortcuts) set({ shortcuts: prefs.shortcuts });
       if (Array.isArray(prefs.aiActions)) {
         set({ aiActions: prefs.aiActions });
@@ -867,6 +955,7 @@ export const useStore = create((set, get) => ({
         api.savePreferences({ aiActions: DEFAULT_AI_ACTIONS }).catch(() => {});
       }
       if (prefs.hiddenFolders) set({ hiddenFolders: prefs.hiddenFolders });
+      set({ folderOrder: cacheFolderOrderFromPreferences(prefs) });
       if (prefs.expandedAccounts && typeof prefs.expandedAccounts === 'object' && !Array.isArray(prefs.expandedAccounts)) {
         localStorage.setItem('mailflow_expanded_accounts', JSON.stringify(prefs.expandedAccounts));
         set({ expandedAccounts: prefs.expandedAccounts });
@@ -906,6 +995,10 @@ export const useStore = create((set, get) => ({
       if (typeof prefs.gravatarAvatars === 'boolean') {
         localStorage.setItem('mailflow_gravatar_avatars', String(prefs.gravatarAvatars));
         set({ gravatarAvatars: prefs.gravatarAvatars });
+      }
+      if (typeof prefs.showMessagePreviews === 'boolean') {
+        localStorage.setItem('mailflow_show_message_previews', String(prefs.showMessagePreviews));
+        set({ showMessagePreviews: prefs.showMessagePreviews });
       }
       if (prefs.replyDefault === 'reply' || prefs.replyDefault === 'replyAll') {
         localStorage.setItem('mailflow_reply_default', prefs.replyDefault);

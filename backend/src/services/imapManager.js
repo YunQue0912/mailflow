@@ -277,48 +277,126 @@ function extractBodyFromMsg(msg) {
 // Key invariant: we work with Buffers of raw bytes until the very last step so
 // that multi-byte sequences (e.g. =E2=80=94 → em-dash in UTF-8) are reassembled
 // correctly before being interpreted as any character set.
-function decodeBody(buf, encoding, charset) {
-  const enc = (encoding || '').toLowerCase();
-  // Normalise charset — TextDecoder knows aliases like 'latin-1', but strip quotes
-  // that some mailers wrap around the value (charset="utf-8").
+function decodeQuotedPrintableToBuffer(input) {
+  const qpStr = Buffer.isBuffer(input) ? input.toString('ascii') : String(input || '');
+  const cleaned = qpStr.replace(/=\r\n/g, '').replace(/=\n/g, '');
+  const bytes = [];
+  let i = 0;
+  while (i < cleaned.length) {
+    if (cleaned[i] === '=' && i + 2 < cleaned.length) {
+      const hex = cleaned.slice(i + 1, i + 3);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+        bytes.push(parseInt(hex, 16));
+        i += 3;
+        continue;
+      }
+    }
+    bytes.push(cleaned.charCodeAt(i) & 0xFF);
+    i++;
+  }
+  return Buffer.from(bytes);
+}
+
+function decodeBytes(rawBytes, charset) {
   let cs = (charset || 'utf-8').toLowerCase().trim().replace(/^['"]|['"]$/g, '');
   if (!cs || cs === 'us-ascii' || cs === 'ascii') cs = 'utf-8'; // ASCII ⊂ UTF-8
-
-  let rawBytes;
-  if (enc === 'base64') {
-    // base64 payload is 7-bit ASCII so toString('ascii') is safe here
-    const b64 = (Buffer.isBuffer(buf) ? buf : Buffer.from(buf)).toString('ascii').replace(/\s/g, '');
-    try { rawBytes = Buffer.from(b64, 'base64'); } catch { rawBytes = buf; }
-  } else if (enc === 'quoted-printable') {
-    const qpStr = (Buffer.isBuffer(buf) ? buf : Buffer.from(buf)).toString('ascii');
-    const cleaned = qpStr.replace(/=\r\n/g, '').replace(/=\n/g, '');
-    const bytes = [];
-    let i = 0;
-    while (i < cleaned.length) {
-      if (cleaned[i] === '=' && i + 2 < cleaned.length) {
-        const hex = cleaned.slice(i + 1, i + 3);
-        if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
-          bytes.push(parseInt(hex, 16));
-          i += 3;
-          continue;
-        }
-      }
-      bytes.push(cleaned.charCodeAt(i) & 0xFF);
-      i++;
-    }
-    rawBytes = Buffer.from(bytes);
-  } else {
-    // 7bit / 8bit / binary — the buffer already holds the raw content bytes
-    rawBytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-  }
-
-  // TextDecoder handles utf-8, iso-8859-*, windows-125*, koi8-r, big5, etc.
-  // fatal:false replaces unrecognised bytes with U+FFFD rather than throwing.
   try {
     return new TextDecoder(cs, { fatal: false }).decode(rawBytes);
   } catch {
     return rawBytes.toString('utf8'); // unknown charset — best effort
   }
+}
+
+function decodeTransferPayload(payload, encoding, charset) {
+  const enc = (encoding || '').toLowerCase();
+  if (enc === 'base64') {
+    const b64 = String(payload || '').replace(/\s/g, '');
+    try { return decodeBytes(Buffer.from(b64, 'base64'), charset); } catch { /* fall through */ }
+  }
+  if (enc === 'quoted-printable') {
+    return decodeBytes(decodeQuotedPrintableToBuffer(payload), charset);
+  }
+  return decodeBytes(Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload || ''), 'utf8'), charset);
+}
+
+function parseMimeHeaders(headerBlock) {
+  const headers = {};
+  for (const line of headerBlock.replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/)) {
+    const m = line.match(/^([^:]+):\s*([\s\S]*)$/);
+    if (m) headers[m[1].toLowerCase()] = m[2].trim();
+  }
+  return headers;
+}
+
+// Some broken IMAP servers/messages return a whole multipart fragment when a text
+// part is requested: the payload starts with a MIME boundary and embedded
+// Content-Type/Content-Transfer-Encoding headers. If passed to the sanitizer as
+// HTML, users see boundary lines and quoted-printable garbage (=D0=..., =3D).
+function unwrapEmbeddedMimeText(decoded, depth = 0) {
+  if (depth >= 5) return decoded;
+  const start = String(decoded || '').trimStart();
+  if (!/^--[^\r\n]+\r?\nContent-/i.test(start)) return decoded;
+
+  const firstLineEnd = start.search(/\r?\n/);
+  if (firstLineEnd < 0) return decoded;
+  const marker = start.slice(0, firstLineEnd).trim();
+  const boundary = marker.replace(/^--/, '');
+  if (!boundary) return decoded;
+
+  const escapedBoundary = boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const partRe = new RegExp(`(?:^|\\r?\\n)--${escapedBoundary}(?:--)?\\r?\\n?`, 'g');
+  const candidates = [];
+
+  for (const part of start.split(partRe)) {
+    const trimmed = part.replace(/^\r?\n/, '');
+    const sep = trimmed.search(/\r?\n\r?\n/);
+    if (sep < 0) continue;
+    const headerBlock = trimmed.slice(0, sep);
+    const payload = trimmed.slice(sep + (trimmed.slice(sep).startsWith('\r\n\r\n') ? 4 : 2));
+    const headers = parseMimeHeaders(headerBlock);
+    const ct = headers['content-type']?.match(/^([^;]+)([\s\S]*)$/);
+    if (!ct) continue;
+    const type = ct[1].toLowerCase().trim();
+    if (type !== 'text/html' && type !== 'text/plain') continue;
+    const charset = ct[2].match(/charset=(?:"([^"]+)"|([^;\s]+))/i)?.[1]
+      || ct[2].match(/charset=(?:"([^"]+)"|([^;\s]+))/i)?.[2]
+      || 'utf-8';
+    candidates.push({
+      type,
+      text: decodeTransferPayload(payload, headers['content-transfer-encoding'] || '', charset),
+    });
+  }
+  const best = candidates.find(p => p.type === 'text/html') || candidates.find(p => p.type === 'text/plain');
+  return best ? unwrapEmbeddedMimeText(best.text, depth + 1) : decoded;
+}
+
+// Decode a MIME body part from its raw Buffer.
+//
+// encoding: transfer encoding (quoted-printable, base64, 7bit, 8bit, binary)
+// charset:  character set from Content-Type (utf-8, windows-1252, iso-8859-1, …)
+//
+// Key invariant: we work with Buffers of raw bytes until the very last step so
+// that multi-byte sequences (e.g. =E2=80=94 → em-dash in UTF-8) are reassembled
+// correctly before being interpreted as any character set.
+function decodeBody(buf, encoding, charset) {
+  const enc = (encoding || '').toLowerCase();
+  let rawBytes;
+  if (enc === 'base64') {
+    const b64 = (Buffer.isBuffer(buf) ? buf : Buffer.from(buf)).toString('ascii').replace(/\s/g, '');
+    try { rawBytes = Buffer.from(b64, 'base64'); } catch { rawBytes = buf; }
+  } else if (enc === 'quoted-printable') {
+    rawBytes = decodeQuotedPrintableToBuffer(buf);
+  } else {
+    rawBytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  }
+
+  return unwrapEmbeddedMimeText(decodeBytes(rawBytes, charset));
+}
+
+function looksLikeTextPayload(buf) {
+  if (!buf || buf.length === 0) return false;
+  const sample = Buffer.isBuffer(buf) ? buf.subarray(0, 512).toString('ascii') : String(buf).slice(0, 512);
+  return /(?:<html|<!doctype|<style|Content-Type:|Content-Transfer-Encoding:|=D0|=D1|=3D|&lt;html|&lt;style)/i.test(sample);
 }
 
 function decodeAttachmentBuffer(buf, encoding) {
@@ -587,7 +665,7 @@ export async function insertCopiedSibling(accountId, uid, fromFolder, toFolder, 
       thread_references, thread_id, is_bulk,
       read_changed_at, star_changed_at, spam_score_sa, spam_score_ml,
       spam_verdict, spam_analyzed_at, spam_details, spam_user_override,
-      category, list_unsubscribe, list_unsubscribe_post, unsubscribed_at
+      category, list_unsubscribe, list_unsubscribe_post, unsubscribed_at, delivery_addresses
     )
     SELECT
       account_id, $4, $5, message_id, subject,
@@ -597,7 +675,7 @@ export async function insertCopiedSibling(accountId, uid, fromFolder, toFolder, 
       thread_references, thread_id, is_bulk,
       read_changed_at, star_changed_at, spam_score_sa, spam_score_ml,
       spam_verdict, spam_analyzed_at, spam_details, spam_user_override,
-      category, list_unsubscribe, list_unsubscribe_post, unsubscribed_at
+      category, list_unsubscribe, list_unsubscribe_post, unsubscribed_at, delivery_addresses
     FROM messages
     WHERE account_id = $1 AND folder = $2 AND uid = $3
     ON CONFLICT (account_id, uid, folder) DO NOTHING
@@ -1024,6 +1102,13 @@ async function acquirePooledClient(account) {
     const freshAccount = await ensureFreshToken(account);
     const { resolved, policy } = await resolveAccountHost(freshAccount);
     const client = new ImapFlow(makeClientCfg(freshAccount, resolved, { policy }));
+    // Attach 'error' BEFORE connect (#360): an ImapFlow 'error' emitted during the
+    // handshake (e.g. socket timeout) with no listener is an unhandled EventEmitter
+    // error, which crashes the whole process. The handler only logs, so a genuine
+    // connect() failure still rejects and propagates through the caller's try/catch.
+    client.on('error', (err) => {
+      console.error(`IMAP pool error for account ${id}:`, err.message);
+    });
     await Promise.race([
       client.connect(),
       new Promise((_, reject) =>
@@ -1039,9 +1124,6 @@ async function acquirePooledClient(account) {
         p.inUse.delete(client);
         drainWaiters(p);
       }
-    });
-    client.on('error', (err) => {
-      console.error(`IMAP pool error for account ${id}:`, err.message);
     });
     pool.clients.push(client);
     pool.inUse.add(client);
@@ -1707,6 +1789,15 @@ export class ImapManager {
     let client;
     try {
       client = new ImapFlow(makeClientCfg(account, resolved, { enableIdle: providerProfile(account).usesIdle !== false, policy, idleKeepaliveMs: providerProfile(account).idleKeepaliveMs }));
+      // Prevent unhandled 'error' events from crashing the Node.js process.
+      // ImapFlow emits 'error' on socket timeouts and other transport-level failures;
+      // without this listener Node throws on unhandled EventEmitter errors. It MUST be
+      // attached before connect() — an 'error' emitted during the handshake window is
+      // otherwise unhandled and takes the whole process down (#360). It only logs, so a
+      // real connect() failure still rejects and is handled by the try/catch below.
+      client.on('error', (err) => {
+        console.error(`IMAP error for ${logAccount(account)}:`, err.message);
+      });
       // Race the connect against a 30-second timeout.
       // client.connect() has no built-in connection timeout — on slow or unresponsive
       // IMAP servers (e.g. purelymail.com during cold starts) it can hang indefinitely,
@@ -1727,15 +1818,18 @@ export class ImapManager {
           console.log(`IMAP connection closed for ${logAccount(account)}`);
         }
       });
-      // Prevent unhandled 'error' events from crashing the Node.js process.
-      // ImapFlow emits 'error' on socket timeouts and other transport-level failures;
-      // without this listener Node throws on unhandled EventEmitter errors.
-      client.on('error', (err) => {
-        console.error(`IMAP error for ${logAccount(account)}:`, err.message);
-      });
       this._attachIdleListeners(client, account);
       this.connections.set(account.id, client);
       await query('UPDATE email_accounts SET sync_error = NULL WHERE id = $1', [account.id]);
+
+      // Decide whether to auto-backfill BEFORE the initial sync below runs. For providers
+      // with autoBackfillExistingOnConnect:false (e.g. PurelyMail) the gate skips backfill
+      // when the account already has cached mail — but the initial INBOX sync inserts ~20
+      // recent rows, so evaluating this AFTER the sync made a genuinely fresh account
+      // (0 messages, e.g. right after delete + re-add) look non-empty and never backfill
+      // until a manual /reindex (#354). Capturing it here preserves the "don't re-backfill
+      // an established account on reconnect" intent while fixing the fresh-account case.
+      const shouldBackfill = await this._shouldAutoBackfillOnConnect(account);
 
       // Initial sync is non-fatal — throttling or temporary IMAP errors here should
       // not prevent the account from being marked connected. The 60-second interval
@@ -1774,7 +1868,7 @@ export class ImapManager {
 
       // Backfill uses its OWN connection so it doesn't block the sync connection.
       // backfillAllFolders runs INBOX first, then all other known folders sequentially.
-      if (await this._shouldAutoBackfillOnConnect(account)) {
+      if (shouldBackfill) {
         this.backfillAllFolders(account).catch(err =>
           console.error(`Backfill error for ${logAccount(account)}:`, err.message)
         );
@@ -1935,6 +2029,13 @@ export class ImapManager {
               const freshAccount = await ensureFreshToken(accountResult.rows[0]);
               const { resolved, policy } = await resolveAccountHost(freshAccount);
               pendingClient = new ImapFlow(makeClientCfg(freshAccount, resolved, { enableIdle: providerProfile(freshAccount).usesIdle !== false, policy, idleKeepaliveMs: providerProfile(freshAccount).idleKeepaliveMs }));
+              // Attach 'error' BEFORE connect (#360): a handshake-time 'error' with no
+              // listener is unhandled and crashes the process. Only logs; connect() still
+              // rejects into the outer catch. freshAccount === syncAccount here, so this is
+              // the same log line the post-connect listener used to emit.
+              pendingClient.on('error', (err) => {
+                console.error(`IMAP error for ${logAccount(freshAccount)}:`, err.message);
+              });
               await pendingClient.connect();
               return { client: pendingClient, account: freshAccount };
             })(),
@@ -1950,9 +2051,8 @@ export class ImapManager {
               this.connections.delete(account.id);
             }
           });
-          activeClient.on('error', (err) => {
-            console.error(`IMAP error for ${logAccount(syncAccount)}:`, err.message);
-          });
+          // NB: the 'error' listener is attached before connect() inside the IIFE above
+          // (#360) — activeClient is that same pendingClient, so it's already covered here.
           this._attachIdleListeners(activeClient, syncAccount);
           this.connections.set(account.id, activeClient);
           // Mirror connectAccount's success cleanup: clear the refusal backoff so the next
@@ -2476,8 +2576,8 @@ export class ImapManager {
                 date, snippet, is_read, is_starred, has_attachments, flags,
                 body_html, body_text, attachments,
                 thread_references, thread_id, is_bulk, category,
-                list_unsubscribe, list_unsubscribe_post
-              ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+                list_unsubscribe, list_unsubscribe_post, delivery_addresses
+              ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
               ON CONFLICT (account_id, uid, folder) DO UPDATE
               SET subject = CASE
                     WHEN EXCLUDED.subject IS NOT NULL
@@ -2523,7 +2623,8 @@ export class ImapManager {
                   is_bulk = COALESCE(messages.is_bulk, EXCLUDED.is_bulk),
                   category = COALESCE(messages.category, EXCLUDED.category),
                   list_unsubscribe = COALESCE(messages.list_unsubscribe, EXCLUDED.list_unsubscribe),
-                  list_unsubscribe_post = COALESCE(messages.list_unsubscribe_post, EXCLUDED.list_unsubscribe_post)
+                  list_unsubscribe_post = COALESCE(messages.list_unsubscribe_post, EXCLUDED.list_unsubscribe_post),
+                  delivery_addresses = COALESCE(messages.delivery_addresses, EXCLUDED.delivery_addresses)
               RETURNING id, (xmax = 0) as is_new
             `, [
               account.id, parsed.uid, folder,
@@ -2538,6 +2639,7 @@ export class ImapManager {
               refs, threadId, parsed.isBulk ?? null, msgCategory,
               sanitizeStr(decodeMimeWords(parsed.parsedHeaders?.['list-unsubscribe'] ?? null)),
               sanitizeStr(decodeMimeWords(parsed.parsedHeaders?.['list-unsubscribe-post'] ?? null)),
+              JSON.stringify(parsed.deliveryAddresses || []),
             ]);
             if (result.rows[0]?.is_new) {
               insertedCount++;
@@ -3127,8 +3229,8 @@ export class ImapManager {
                     date, snippet, is_read, is_starred, has_attachments, flags,
                     body_html, body_text, attachments,
                     thread_references, thread_id, is_bulk, category,
-                    list_unsubscribe, list_unsubscribe_post
-                  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+                    list_unsubscribe, list_unsubscribe_post, delivery_addresses
+                  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
                   ON CONFLICT (account_id, uid, folder) DO UPDATE
                   SET subject = CASE
                         WHEN EXCLUDED.subject IS NOT NULL
@@ -3174,7 +3276,8 @@ export class ImapManager {
                       is_bulk = COALESCE(messages.is_bulk, EXCLUDED.is_bulk),
                       category = COALESCE(messages.category, EXCLUDED.category),
                       list_unsubscribe = COALESCE(messages.list_unsubscribe, EXCLUDED.list_unsubscribe),
-                      list_unsubscribe_post = COALESCE(messages.list_unsubscribe_post, EXCLUDED.list_unsubscribe_post)
+                      list_unsubscribe_post = COALESCE(messages.list_unsubscribe_post, EXCLUDED.list_unsubscribe_post),
+                      delivery_addresses = COALESCE(messages.delivery_addresses, EXCLUDED.delivery_addresses)
                 `, [
                   account.id, parsed.uid, folder,
                   bfMsgId, sanitizeStr(parsed.subject),
@@ -3188,6 +3291,7 @@ export class ImapManager {
                   bfRefs, bfThreadId, parsed.isBulk ?? null, bfCategory,
                   sanitizeStr(decodeMimeWords(parsed.parsedHeaders?.['list-unsubscribe'] ?? null)),
                   sanitizeStr(decodeMimeWords(parsed.parsedHeaders?.['list-unsubscribe-post'] ?? null)),
+                  JSON.stringify(parsed.deliveryAddresses || []),
                 ]);
                 backfilledRows++;
                 if (bfThreadId && bfThreadId !== bfMsgId) {
@@ -3969,23 +4073,38 @@ export class ImapManager {
               }
             }
           }
+        }
 
-          // Per-part individual retry for any text/image part that came back missing or
-          // zero-length from the batched fetch.  Some IMAP servers (confirmed on
-          // purelymail.com) return a 0-byte literal for non-empty parts when one sibling
-          // part in the same FETCH command happens to be empty — the batched
-          // BODY[1] BODY[2] response is malformed, but BODY[2] alone works correctly.
-          const individualParts = [...results.textParts, ...(results.inlineImages || [])];
-          for (const part of individualParts) {
-            const existing = prefetched.get(part.part);
-            if (existing && existing.length > 0) continue; // already have content
-            try {
-              for await (const msg of client.fetch(uidStr, { uid: true, bodyParts: [part.part] }, { uid: true })) {
-                const v = msg.bodyParts?.get(part.part);
-                if (v && v.length > 0) prefetched.set(part.part, v);
-              }
-            } catch { /* don't let a single part failure block others */ }
-          }
+        // Per-part individual fetch for text parts. Some IMAP servers return a
+        // non-empty but malformed text payload for speculative/batched sibling
+        // requests while BODY[2.1] alone is correct; accepting the batched value
+        // leaks MIME boundaries and quoted-printable fragments into the UI. Do
+        // this even when speculative fetch already returned the part, so the
+        // direct text result overwrites any malformed batched value. Inline
+        // images keep the batched value because they are binary and are not
+        // parsed as HTML.
+        for (const part of results.textParts) {
+          try {
+            for await (const msg of client.fetch(uidStr, { uid: true, bodyParts: [part.part] }, { uid: true })) {
+              const v = msg.bodyParts?.get(part.part);
+              if (v && v.length > 0) prefetched.set(part.part, v);
+            }
+          } catch { /* don't let a single part failure block others */ }
+        }
+
+        // Inline images normally keep the batched value for performance. Retry
+        // only the suspicious ones: some servers return a text/html sibling for
+        // an image part in a multi-part batch, producing data:image URLs that
+        // contain escaped HTML/QP text and leak quoted-message garbage.
+        for (const part of inlineImages) {
+          const existing = prefetched.get(part.part);
+          if (!looksLikeTextPayload(existing)) continue;
+          try {
+            for await (const msg of client.fetch(uidStr, { uid: true, bodyParts: [part.part] }, { uid: true })) {
+              const v = msg.bodyParts?.get(part.part);
+              if (v && v.length > 0) prefetched.set(part.part, v);
+            }
+          } catch { /* keep the batched value if the direct retry fails */ }
         }
 
         for (const part of results.textParts) {
@@ -4002,7 +4121,7 @@ export class ImapManager {
           for (const img of inlineImages) {
             if (!img.cid) continue;
             const buf = prefetched.get(img.part);
-            if (!buf) continue;
+            if (!buf || looksLikeTextPayload(buf)) continue;
             const enc = (img.encoding || '').toLowerCase();
             const b64 = enc === 'base64'
               ? buf.toString('ascii').replace(/\s/g, '')
