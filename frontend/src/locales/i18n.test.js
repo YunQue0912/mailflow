@@ -117,6 +117,7 @@ const SAME_VALUE_ALLOWED = {
   // ── Universal placeholders / brand names (all locales share) ───────────────
   'admin.about.kofi':                       'any', // Ko-fi — brand name, same everywhere
   'admin.about.githubSponsors':             'any', // GitHub Sponsors — product name, same everywhere
+  'admin.ai.subscriptionProviderChatgpt':    'any', // ChatGPT Plus/Pro (Codex Subscription) — product name, same everywhere
   'admin.categories.gtdReveal':             'any', // "GTD" — brand-like acronym, same everywhere
   'admin.accounts.imapHostPh':              'any', // imap.gmail.com
   'admin.accounts.presetGmail':             'any', // Gmail
@@ -124,6 +125,7 @@ const SAME_VALUE_ALLOWED = {
   'admin.accounts.presetYahoo':             'any', // Yahoo Mail
   'admin.accounts.smtpHostPh':              'any', // smtp.gmail.com
   'admin.ai.baseUrlPh':                      'any', // http://localhost:11434/v1
+  'admin.ai.chatgptModelPh':                 'any', // gpt-5.6-luna
   'admin.appearance.customCssPlaceholder':   'any', // CSS code snippet, same in all locales
   'admin.integrations.microsoft.clientIdPh':'any', // xxxxxxxx-xxxx-…
   'admin.integrations.microsoft.title':     'any', // Microsoft 365 / Outlook.com
@@ -153,6 +155,7 @@ const SAME_VALUE_ALLOWED = {
   'admin.aliases.emailPh':     [['de', 'en', 'ru', 'zhCN']],
   'admin.privacy.addDomainPh': [['de', 'en', 'ru', 'zhCN']],
   'admin.privacy.addSenderPh': [['en', 'ru', 'zhCN']],
+  'admin.rules.actionForwardPlaceholder': [['es', 'it']],
   'admin.sso.domainsPh':       [['de', 'en', 'ru', 'zhCN']],
   'admin.users.invitePh':      [['de', 'en', 'ru', 'zhCN']],
   'compose.bccPh':             [['de', 'en', 'ru', 'zhCN']],
@@ -512,6 +515,33 @@ function loadSourceText() {
   return out.join('\n');
 }
 
+function loadLiteralSourceTranslationKeys(prefix) {
+  const srcRoot = resolve(dir, '../..');
+  const keys = new Set();
+  const literalTranslationCall = /(?<![\w$.])t\(\s*['"]([^'"]+)['"]/g;
+
+  function walk(d) {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      const full = join(d, entry.name);
+      if (entry.isDirectory()) {
+        if (full === dir) continue; // skip locales/
+        walk(full);
+      } else if (
+        (entry.name.endsWith('.js') || entry.name.endsWith('.jsx'))
+        && !entry.name.includes('.test.')
+      ) {
+        const source = readFileSync(full, 'utf8');
+        for (const match of source.matchAll(literalTranslationCall)) {
+          if (match[1].startsWith(prefix)) keys.add(match[1]);
+        }
+      }
+    }
+  }
+
+  walk(srcRoot);
+  return [...keys].sort();
+}
+
 function isAllowedPair(key, lang1, lang2) {
   const rule = SAME_VALUE_ALLOWED[key];
   if (!rule) return false;
@@ -527,12 +557,43 @@ const allKeys = [...new Set(langs.flatMap(l => Object.keys(locales[l])))].sort()
 
 describe('i18n locale files', () => {
 
+  it('places sender favicon setting copy under the admin message-list namespace', () => {
+    const keys = [
+      'senderFavicons',
+      'senderFaviconsDesc',
+      'senderFaviconsSaveError',
+    ];
+    for (const lang of langs) {
+      for (const key of keys) {
+        assert.equal(typeof locales[lang][`admin.messageList.${key}`], 'string',
+          `${lang} is missing admin.messageList.${key}`);
+        assert.equal(locales[lang][`messageList.${key}`], undefined,
+          `${lang} has misplaced messageList.${key}`);
+      }
+    }
+  });
+
   describe('source coverage — every key must be referenced in the source', () => {
     it('no unused keys', () => {
       const source = loadSourceText();
       const unused = allKeys.filter(k => !DYNAMIC_KEYS.has(k) && !source.includes(baseKey(k)));
       assert.equal(unused.length, 0,
         `Unused keys (remove from all locale files or add to DYNAMIC_KEYS if referenced dynamically):\n${unused.map(k => `  - ${k}`).join('\n')}`);
+    });
+
+    it('every literal admin.ai source translation key exists in every locale', () => {
+      const sourceKeys = loadLiteralSourceTranslationKeys('admin.ai.');
+      const missing = [];
+      for (const lang of langs) {
+        const present = new Set(Object.keys(locales[lang]));
+        for (const key of sourceKeys) {
+          const hasKey = present.has(key)
+            || PLURAL_SUFFIXES.some(suffix => present.has(`${key}${suffix}`));
+          if (!hasKey) missing.push(`  - ${lang}: ${key}`);
+        }
+      }
+      assert.equal(missing.length, 0,
+        `Literal source translation keys missing from locale files:\n${missing.join('\n')}`);
     });
   });
 

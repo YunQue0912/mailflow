@@ -37,28 +37,41 @@ const nativePlugin = fs.readFileSync(
   ),
   'utf8',
 );
+const nativeMessageBridge = fs.readFileSync(
+  path.join(
+    __dirname,
+    '..',
+    'android',
+    'app',
+    'src',
+    'main',
+    'java',
+    'sh',
+    'mailflow',
+    'app',
+    'MailFlowNativeMessageBridge.java',
+  ),
+  'utf8',
+);
 
-test('resolves the Android update plugin lazily after Capacitor creates its bridge', () => {
+test('registers the Capacitor plugin before creating an origin-scoped native message bridge', () => {
   const registerIndex = mainActivity.indexOf('registerPlugin(MailFlowNativePlugin.class);');
   const createIndex = mainActivity.indexOf('super.onCreate(savedInstanceState);');
 
   assert.ok(registerIndex >= 0 && registerIndex < createIndex);
   assert.match(
     mainActivity,
-    /new MailFlowNativePlugin\.NativePluginProvider\(\)/,
+    /configureNativeMessageBridge\(savedHost\);/,
   );
   assert.match(
-    mainActivity,
-    /return resolveNativePlugin\(\);/,
+    nativeMessageBridge,
+    /WebViewCompat\.addWebMessageListener/,
   );
   assert.match(
-    mainActivity,
-    /PluginHandle handle = bridge\.getPlugin\("MailFlowNative"\);/,
+    nativeMessageBridge,
+    /NativeSecurity\.isSameOrigin\(configuredHost, sourceOrigin\.toString\(\)\)/,
   );
-  assert.match(
-    mainActivity,
-    /if \(plugin == null\) plugin = handle\.load\(\);/,
-  );
+  assert.doesNotMatch(mainActivity, /addJavascriptInterface/);
   assert.doesNotMatch(
     mainActivity,
     /private final MailFlowNativePlugin nativePlugin = new MailFlowNativePlugin\(\);/,

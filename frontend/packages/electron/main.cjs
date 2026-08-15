@@ -1,10 +1,18 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, shell, Notification, session } = require('electron');
+const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, shell, dialog, Notification, session, clipboard } = require('electron');
 const { execFileSync, spawn } = require('child_process');
+
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
 const { createNativeUpdater } = require('./native-updater.cjs');
+const { pathToFileURL } = require('url');
+const {
+  createNavigationPolicy,
+  isSameOrigin,
+  normalizeHost,
+} = require('./security.cjs');
+
 
 const CONFIG_FILE = 'mailflow-host.json';
 const UPDATE_RELEASE_URL = 'https://api.github.com/repos/YunQue0912/mailflow/releases/latest';
@@ -168,23 +176,6 @@ function clearHost() {
   const config = readConfig();
   delete config.host;
   writeConfig(config);
-}
-
-function normalizeHost(value) {
-  const input = String(value || '').trim();
-  const url = new URL(input);
-
-  if (!['https:', 'http:'].includes(url.protocol)) {
-    throw new Error('Host must start with https:// or http://');
-  }
-
-  url.username = '';
-  url.password = '';
-  url.hash = '';
-  url.search = '';
-  url.pathname = '/';
-
-  return url.toString().replace(/\/$/, '');
 }
 
 function requestJson(url) {
@@ -499,7 +490,7 @@ function showInAppNotification({ title = '', message = '', type = 'info', action
       body.textContent = notification.message;
       body.style.fontSize = '12px';
       body.style.color = '#9898a8';
-      body.style.whiteSpace = 'normal';
+      body.style.whiteSpace = 'pre-wrap';
       body.style.overflow = 'visible';
       body.style.textOverflow = 'clip';
       body.style.lineHeight = '1.35';
@@ -531,6 +522,8 @@ function showInAppNotification({ title = '', message = '', type = 'info', action
         action.addEventListener('click', () => {
           if (notification.action === 'install-update') {
             window.mailflowNative?.updates?.installDownloaded?.();
+          } else if (notification.action === 'copy-update-command-and-quit') {
+            window.mailflowNative?.updates?.copyInstallCommandAndQuit?.();
           }
           dismiss();
         });
@@ -692,6 +685,13 @@ async function checkForUpdates(verbose = false) {
 
 function installDownloadedUpdate() {
   return Promise.resolve(nativeUpdater.install());
+
+}
+
+function copyLinuxUpdateCommandAndQuit({ installCommand, filePath } = {}) {
+  void installCommand;
+  void filePath;
+  return { copied: false, reason: 'unsupported-by-custom-updater' };
 }
 
 function openDownloadedUpdatePath() {
@@ -795,20 +795,9 @@ function sendNativeAction(action, data = {}) {
   const payload = createNativeActionPayload(action, data);
   showMainWindow();
 
-  const dispatchScript = `
-    window.dispatchEvent(new CustomEvent('mailflow:native-action', {
-      detail: ${JSON.stringify(payload)}
-    }));
-    window.postMessage({
-      type: 'mailflow:native-action',
-      payload: ${JSON.stringify(payload)}
-    }, '*');
-  `;
-
   const send = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send(NATIVE_ACTION_CHANNEL, payload);
-    mainWindow.webContents.executeJavaScript(dispatchScript).catch(() => {});
   };
 
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -1016,6 +1005,60 @@ function setupMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+function showContextMenu(webContents, params) {
+  const template = [];
+  const hasSelection = Boolean(params.selectionText && params.selectionText.trim());
+  const hasLink = Boolean(params.linkURL);
+  const hasImage = params.mediaType === 'image' && Boolean(params.srcURL);
+
+  if (params.isEditable) {
+    template.push(
+      { label: 'Cut', role: 'cut' },
+      { label: 'Copy', role: 'copy', enabled: hasSelection },
+      { label: 'Paste', role: 'paste' },
+      { type: 'separator' },
+      { label: 'Select All', role: 'selectAll' },
+    );
+  } else {
+    if (hasLink) {
+      template.push(
+        {
+          label: 'Open Link',
+          click: () => {
+            if (isAllowedExternalUrl(params.linkURL)) shell.openExternal(params.linkURL);
+          },
+        },
+        {
+          label: 'Copy Link',
+          click: () => clipboard.writeText(params.linkURL),
+        },
+      );
+    }
+
+    if (hasImage) {
+      if (template.length > 0) template.push({ type: 'separator' });
+      template.push({
+        label: 'Copy Image Address',
+        click: () => clipboard.writeText(params.srcURL),
+      });
+    }
+
+    if (hasSelection) {
+      if (template.length > 0) template.push({ type: 'separator' });
+      template.push(
+        { label: 'Copy', role: 'copy' },
+        { label: 'Select All', role: 'selectAll' },
+      );
+    }
+  }
+
+  if (template.length === 0) return;
+
+  Menu.buildFromTemplate(template).popup({
+    window: BrowserWindow.fromWebContents(webContents) || mainWindow,
+  });
+}
+
 function getDefaultWindowBounds() {
   return {
     width: 1280,
@@ -1180,10 +1223,36 @@ function createWindow() {
     return { action: 'deny' };
   });
 
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    showContextMenu(mainWindow.webContents, params);
+  });
+
+  const navigationPolicy = createNavigationPolicy(readHost);
+  const internalPages = new Set([
+    pathToFileURL(path.join(__dirname, '..', 'native-shell', 'index.html')).toString(),
+    pathToFileURL(path.join(__dirname, '..', 'native-shell', 'host-unavailable.html')).toString(),
+  ]);
+  const guardNavigation = (event, url, kind) => {
+    if (internalPages.has(url)) {
+      navigationPolicy.reset();
+      return;
+    }
+    if (navigationPolicy.decide(kind, url) === 'allow') return;
+    event.preventDefault();
+  };
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    guardNavigation(event, url, 'navigate');
+  });
+  mainWindow.webContents.on('will-redirect', (event, url, _isInPlace, isMainFrame) => {
+    if (!isMainFrame) return;
+    guardNavigation(event, url, 'redirect');
+  });
+
   mainWindow.webContents.on('did-fail-load', (_event, _errorCode, _errorDescription, validatedURL, isMainFrame) => {
     if (!isMainFrame) return;
     const host = readHost();
-    if (!host || !String(validatedURL || '').startsWith(host)) return;
+    if (!host || !isSameOrigin(host, validatedURL)) return;
     loadHostUnavailable();
   });
 
@@ -1194,7 +1263,7 @@ function createWindow() {
     if (!HOST_UNAVAILABLE_STATUS_CODES.has(details.statusCode)) return;
 
     const host = readHost();
-    if (!host || !String(details.url || '').startsWith(host)) return;
+    if (!host || !isSameOrigin(host, details.url)) return;
 
     setTimeout(() => loadHostUnavailable(), 0);
   });
@@ -1246,7 +1315,7 @@ function detectRewriteErrorPage() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const currentUrl = mainWindow.webContents.getURL();
   const host = readHost();
-  if (!host || !currentUrl.startsWith(host)) return;
+  if (!host || !isSameOrigin(host, currentUrl)) return;
 
   mainWindow.webContents.executeJavaScript('document.body ? document.body.innerText : ""', true)
     .then((text) => {
@@ -1278,7 +1347,24 @@ function scheduleStartupUpdateCheck() {
 ipcMain.handle('mailflow:getHost', () => readHost());
 
 ipcMain.handle('mailflow:saveHost', async (_event, host) => {
-  const normalized = writeHost(host);
+  const normalized = normalizeHost(host);
+  if (new URL(normalized).protocol === 'http:') {
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Use unencrypted connection', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: 'Unencrypted MailFlow connection',
+      message: 'Traffic to this MailFlow server is not encrypted.',
+      detail: 'Your session cookie and email data can be read or changed by anyone who can observe this network. Continue only on a private network you trust.',
+    });
+    if (result.response !== 0) {
+      throw new Error('The unencrypted MailFlow host was not saved.');
+    }
+  }
+
+  writeHost(normalized);
   return normalized;
 });
 
@@ -1312,6 +1398,10 @@ ipcMain.handle('mailflow:updates:install-downloaded', () => {
 
 ipcMain.handle('mailflow:updates:install-auto', () => {
   return installDownloadedUpdate();
+});
+
+ipcMain.handle('mailflow:updates:copy-install-command-and-quit', (_event, options) => {
+  return copyLinuxUpdateCommandAndQuit(options);
 });
 
 ipcMain.handle('mailflow:updates:open-download', () => {

@@ -1,9 +1,23 @@
-import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
+import { useCallback, useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { newAiAction, AI_ACTION_LIMITS } from '../aiActions.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { api } from '../utils/api.js';
+import {
+  AI_ACCOUNT_PROVIDER_OPTIONS,
+  AI_CONNECTION_METHOD_ACCOUNT,
+  AI_CONNECTION_METHOD_API,
+  AI_CONNECTION_METHOD_OPTIONS,
+  AI_PROVIDER_API_KEY,
+  AI_PROVIDER_CHATGPT,
+  OPENAI_MODELS_URL,
+  buildAiSavePayload,
+  createCodexDevicePoller,
+  isAiFormValid,
+  normalizeAiForm,
+  selectAiConnectionMethod,
+} from '../utils/aiConfig.js';
 import { THEMES, applyTheme, applyCustomCss } from '../themes.js';
 import { FONT_SETS, loadFontSet } from '../fonts.js';
 import { LAYOUTS, applyLayout } from '../layouts.js';
@@ -14,6 +28,8 @@ import GtdZeroPet from './GtdZeroPet.jsx';
 import { getEffectiveShortcuts, getGroupedActions, ACTION_DEFS, SPECIAL_KEY_LABELS, parseModKey, modLabel } from '../utils/defaultShortcuts.js';
 import { DEFAULT_GTD_FOLDERS, GTD_STATES, resolveAccountGtdFolders, diffGtdFolders, findGtdFolderCollisions } from '../utils/gtd.js';
 import NativeUpdatePanel from './NativeUpdatePanel.jsx';
+import { unifiedUnreadTotal } from '../utils/unifiedInbox.js';
+import { isValidForwardAddress } from '../utils/ruleActions.js';
 
 // ─── Shared field component ───────────────────────────────────────────────────
 function Field({ label, required, children }) {
@@ -65,11 +81,13 @@ function AccountForm({ initial, onSave, onCancel }) {
     name: '', email_address: '', color: '#6366f1', protocol: 'imap',
     imap_host: '', imap_port: 993, imap_skip_tls_verify: false,
     smtp_host: '', smtp_port: 587, smtp_tls: 'STARTTLS',
+    smtp_auth_user: '', smtp_auth_pass: '',
     auth_user: '', auth_pass: '', categorization_enabled: false,
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [showPass, setShowPass] = useState(false);
+  const [showSmtpPass, setShowSmtpPass] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState(null);
   const [mailPolicy, setMailPolicy] = useState({ allowPrivateHosts: false, allowInsecureTls: false, allowNonstandardPorts: false });
 
@@ -170,6 +188,29 @@ function AccountForm({ initial, onSave, onCancel }) {
         </Field>
       )}
 
+      <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
+      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+        {t('admin.accounts.imapSection')}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 90px', gap: 10 }}>
+        <Field label={t('admin.accounts.imapHost')} required>
+          <input value={form.imap_host || ''} onChange={e => set('imap_host', e.target.value)}
+            placeholder={t('admin.accounts.imapHostPh')} style={inputStyle}
+            onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+            onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+        </Field>
+        <Field label={t('admin.accounts.imapPort')}>
+          <input
+            type={mailPolicy.allowNonstandardPorts ? 'text' : 'number'}
+            value={form.imap_port || 993}
+            onChange={e => set('imap_port', mailPolicy.allowNonstandardPorts ? e.target.value : parseInt(e.target.value))}
+            style={inputStyle}
+            onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+            onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+        </Field>
+      </div>
+
       <Field label={t('admin.accounts.authUser')} required>
         <input value={form.auth_user || ''} onChange={e => set('auth_user', e.target.value)}
           placeholder={t('admin.accounts.authUserPh')} style={inputStyle}
@@ -199,29 +240,6 @@ function AccountForm({ initial, onSave, onCancel }) {
           </button>
         </div>
       </Field>
-
-      <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
-      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
-        {t('admin.accounts.imapSection')}
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 90px', gap: 10 }}>
-        <Field label={t('admin.accounts.imapHost')} required>
-          <input value={form.imap_host || ''} onChange={e => set('imap_host', e.target.value)}
-            placeholder={t('admin.accounts.imapHostPh')} style={inputStyle}
-            onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-            onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-        </Field>
-        <Field label={t('admin.accounts.imapPort')}>
-          <input
-            type={mailPolicy.allowNonstandardPorts ? 'text' : 'number'}
-            value={form.imap_port || 993}
-            onChange={e => set('imap_port', mailPolicy.allowNonstandardPorts ? e.target.value : parseInt(e.target.value))}
-            style={inputStyle}
-            onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-            onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-        </Field>
-      </div>
 
       {mailPolicy.allowInsecureTls && (
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginTop: 10 }}>
@@ -287,6 +305,38 @@ function AccountForm({ initial, onSave, onCancel }) {
         </Field>
       </div>
 
+      <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 12, marginBottom: 4, lineHeight: 1.5 }}>
+        {t('admin.accounts.smtpAuthNote')}
+      </div>
+      <Field label={t('admin.accounts.smtpAuthUser')}>
+        <input value={form.smtp_auth_user || ''} onChange={e => set('smtp_auth_user', e.target.value)}
+          placeholder={t('admin.accounts.smtpAuthUserPh')} style={inputStyle}
+          onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+          onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+      </Field>
+      <Field label={t('admin.accounts.smtpAuthPass')}>
+        <div style={{ position: 'relative' }}>
+          <input type={showSmtpPass ? 'text' : 'password'}
+            value={form.smtp_auth_pass || ''} onChange={e => set('smtp_auth_pass', e.target.value)}
+            placeholder={isEdit ? '••••••••' : ''}
+            style={{ ...inputStyle, paddingRight: 36 }}
+            onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+            onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+          <button type="button" onClick={() => setShowSmtpPass(!showSmtpPass)} style={{
+            position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+            background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer',
+            display: 'flex', padding: 2,
+          }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              {showSmtpPass
+                ? <><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></>
+                : <><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></>
+              }
+            </svg>
+          </button>
+        </div>
+      </Field>
+
       <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
       <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
         {t('admin.accounts.signatureSection')}
@@ -298,6 +348,37 @@ function AccountForm({ initial, onSave, onCancel }) {
 
       {isEdit && (
         <>
+          <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+            {t('admin.accounts.unifiedInboxSection')}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+            <button
+              type="button"
+              aria-pressed={form.include_in_unified_inbox !== false}
+              onClick={() => set('include_in_unified_inbox', form.include_in_unified_inbox === false)}
+              style={{
+                width: 36, height: 20, borderRadius: 10, border: 'none',
+                cursor: 'pointer', padding: 0,
+                background: form.include_in_unified_inbox !== false ? 'var(--accent)' : TOGGLE_OFF_BACKGROUND,
+                position: 'relative', transition: 'background 0.2s', flexShrink: 0, marginTop: 1,
+              }}
+            >
+              <span style={{
+                position: 'absolute', top: 2,
+                left: form.include_in_unified_inbox !== false ? 18 : 2,
+                width: 16, height: 16,
+                borderRadius: '50%', background: 'white', transition: 'left 0.2s',
+              }} />
+            </button>
+            <div>
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{t('admin.accounts.unifiedInboxEnabled')}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>
+                {t('admin.accounts.unifiedInboxEnabledDesc')}
+              </div>
+            </div>
+          </div>
+
           <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
           <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
             {t('admin.accounts.categorizationSection')}
@@ -366,7 +447,7 @@ function AccountForm({ initial, onSave, onCancel }) {
 // ─── Accounts Tab ─────────────────────────────────────────────────────────────
 function AccountsTab() {
   const { t } = useTranslation();
-  const { accounts, setAccounts, updateAccount, addNotification, backfillProgress } = useStore();
+  const { accounts, setAccounts, updateAccount, unreadCounts, setUnreadCounts, addNotification, backfillProgress } = useStore();
   const [subview, setSubview] = useState('list'); // 'list' | 'add' | 'edit' | 'folders' | 'aliases'
   const [editTarget, setEditTarget] = useState(null);
   const [folderMappings, setFolderMappings] = useState({});
@@ -389,11 +470,28 @@ function AccountsTab() {
   };
 
   const handleEdit = async (form) => {
-    const updates = { name: form.name, sender_name: form.sender_name || null, color: form.color, imap_host: form.imap_host, imap_port: form.imap_port, imap_skip_tls_verify: !!form.imap_skip_tls_verify, smtp_host: form.smtp_host, smtp_port: form.smtp_port, smtp_tls: form.smtp_tls, signature: form.signature || null, categorization_enabled: !!form.categorization_enabled };
+    const updates = { name: form.name, sender_name: form.sender_name || null, color: form.color, imap_host: form.imap_host, imap_port: form.imap_port, imap_skip_tls_verify: !!form.imap_skip_tls_verify, smtp_host: form.smtp_host, smtp_port: form.smtp_port, smtp_tls: form.smtp_tls, signature: form.signature || null, categorization_enabled: !!form.categorization_enabled, include_in_unified_inbox: form.include_in_unified_inbox !== false };
     if (form.auth_pass) updates.auth_pass = form.auth_pass;
     if (form.auth_user) updates.auth_user = form.auth_user;
-    await api.updateAccount(editTarget.id, updates);
-    updateAccount(editTarget.id, updates);
+    // Separate SMTP credentials (optional). A username sends both (a blank password on
+    // edit keeps the stored one); a blank username clears both back to the IMAP login.
+    if (form.smtp_auth_user) {
+      updates.smtp_auth_user = form.smtp_auth_user;
+      if (form.smtp_auth_pass) updates.smtp_auth_pass = form.smtp_auth_pass;
+    } else {
+      updates.smtp_auth_user = null;
+      updates.smtp_auth_pass = null;
+    }
+    const updated = await api.updateAccount(editTarget.id, updates);
+    const nextAccounts = accounts.map(account => account.id === editTarget.id
+      ? { ...account, ...updated }
+      : account);
+    updateAccount(editTarget.id, updated);
+    setUnreadCounts({
+      total: unifiedUnreadTotal(unreadCounts.byAccount, nextAccounts),
+      byAccount: unreadCounts.byAccount,
+    });
+    api.getUnreadCounts().then(setUnreadCounts).catch(console.error);
     setSubview('list');
     setEditTarget(null);
   };
@@ -1420,7 +1518,8 @@ function SwipeActionIcon({ action, size = 17 }) {
 function LayoutsTab() {
   const { t } = useTranslation();
   const isMobile = useMobile();
-  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, conversationMode, setConversationMode, plaintextEmail, setPlaintextEmail, hoverQuickActions, setHoverQuickActions, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, replyDefault, setReplyDefault, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay } = useStore();
+  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, conversationMode, setConversationMode, plaintextEmail, setPlaintextEmail, hoverQuickActions, setHoverQuickActions, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, replyDefault, setReplyDefault, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, senderFavicons, senderFaviconsSaving, setSenderFavicons, showMessagePreviews, setShowMessagePreviews } = useStore();
+  const [senderFaviconsError, setSenderFaviconsError] = useState('');
 
   // "Set MailFlow as your default email app": registerProtocolHandler is the
   // cross-browser path (works in Firefox and non-installed Chromium) and must be
@@ -1644,6 +1743,37 @@ function LayoutsTab() {
 
         <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
           <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
+            {t('admin.messageList.showMessagePreviews')}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {[
+              { id: false, label: t('admin.messageList.previewOff'), desc: t('admin.messageList.previewOffDesc') },
+              { id: true, label: t('admin.messageList.previewOn'), desc: t('admin.messageList.previewOnDesc') },
+            ].map(({ id, label, desc }) => {
+              const active = showMessagePreviews === id;
+              return (
+                <button
+                  key={String(id)}
+                  onClick={() => setShowMessagePreviews(id)}
+                  style={{
+                    flex: 1, padding: '10px 12px', textAlign: 'left',
+                    background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
+                    border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
+                    borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
+                  }}
+                  onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
+                  onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
             {t('admin.messageList.gravatarMode')}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -1705,6 +1835,54 @@ function LayoutsTab() {
             </div>
           </div>
         )}
+
+        <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16,
+            padding: '12px 14px', borderRadius: 8,
+            background: 'var(--bg-tertiary)', border: '1px solid var(--border-subtle)',
+          }}>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>
+                {t('admin.messageList.senderFavicons')}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>
+                {t('admin.messageList.senderFaviconsDesc')}
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={senderFavicons}
+              aria-label={t('admin.messageList.senderFavicons')}
+              disabled={senderFaviconsSaving}
+              onClick={async () => {
+                setSenderFaviconsError('');
+                try { await setSenderFavicons(!senderFavicons); }
+                catch { setSenderFaviconsError(t('admin.messageList.senderFaviconsSaveError')); }
+              }}
+              style={{
+                width: 44, height: 24, borderRadius: 12,
+                background: senderFavicons ? 'var(--accent)' : 'var(--bg-elevated)',
+                border: `1px solid ${senderFavicons ? 'var(--accent)' : 'var(--border)'}`,
+                cursor: senderFaviconsSaving ? 'not-allowed' : 'pointer',
+                position: 'relative', transition: 'all 0.2s', flexShrink: 0,
+                opacity: senderFaviconsSaving ? 0.6 : 1,
+              }}
+            >
+              <span style={{
+                position: 'absolute', top: 3, left: senderFavicons ? 22 : 3,
+                width: 16, height: 16, borderRadius: '50%', background: 'white',
+                transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+              }} />
+            </button>
+          </div>
+          {senderFaviconsError && (
+            <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 8 }}>
+              {senderFaviconsError}
+            </div>
+          )}
+        </div>
 
         {isMobile && (
           <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
@@ -2926,7 +3104,7 @@ const emptyProvider = {
   name: '', slug: '', issuer_url: '', client_id: '', client_secret: '',
   scopes: 'openid email profile', provisioning_mode: 'login_existing_only',
   allowed_domains: '', enabled: true, require_email_verified: true, allow_insecure: false,
-  admin_group_claim: '', admin_group_value: '',
+  admin_group_claim: '', admin_group_value: '', rp_initiated_logout: false,
 };
 
 function SSOTab() {
@@ -2996,7 +3174,7 @@ function SSOTab() {
     setError('');
   };
   const openEdit = (p) => {
-    setForm({ ...p, client_secret: '••••••••', allowed_domains: p.allowed_domains || '', require_email_verified: p.require_email_verified !== false, allow_insecure: p.allow_insecure === true, admin_group_claim: p.admin_group_claim || '', admin_group_value: p.admin_group_value || '' });
+    setForm({ ...p, client_secret: '••••••••', allowed_domains: p.allowed_domains || '', require_email_verified: p.require_email_verified !== false, allow_insecure: p.allow_insecure === true, admin_group_claim: p.admin_group_claim || '', admin_group_value: p.admin_group_value || '', rp_initiated_logout: p.rp_initiated_logout === true });
     setTemplateNote('');
     setEditing(p);
     setError('');
@@ -3026,6 +3204,7 @@ function SSOTab() {
         allow_insecure: !!form.allow_insecure,
         admin_group_claim: form.admin_group_claim.trim() || null,
         admin_group_value: form.admin_group_value.trim() || null,
+        rp_initiated_logout: !!form.rp_initiated_logout,
         ...(form.client_secret && form.client_secret !== '••••••••' ? { client_secret: form.client_secret } : {}),
       };
       if (editing === 'new') {
@@ -3402,6 +3581,27 @@ function SSOTab() {
             </div>
           </div>
 
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 16 }}>
+            <button
+              type="button"
+              onClick={() => setForm(f => ({ ...f, rp_initiated_logout: !f.rp_initiated_logout }))}
+              style={{
+                width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer', padding: 0,
+                background: form.rp_initiated_logout ? 'var(--accent)' : TOGGLE_OFF_BACKGROUND,
+                position: 'relative', transition: 'background 0.2s', flexShrink: 0, marginTop: 1,
+              }}
+            >
+              <span style={{
+                position: 'absolute', top: 2, left: form.rp_initiated_logout ? 18 : 2, width: 16, height: 16,
+                borderRadius: '50%', background: 'white', transition: 'left 0.2s',
+              }} />
+            </button>
+            <div>
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{t('admin.sso.rpLogout')}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>{t('admin.sso.rpLogoutDesc')}</div>
+            </div>
+          </div>
+
           {error && (
             <div style={{
               marginBottom: 14, padding: '9px 12px', borderRadius: 7,
@@ -3439,31 +3639,104 @@ function SSOTab() {
 // ─── AI Section ───────────────────────────────────────────────────────────────
 function AISection() {
   const { t } = useTranslation();
+  const isMobile = useMobile();
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [form, setForm] = useState({ enabled: true, baseUrl: '', apiKey: '', model: '', features: { compose: true, summarize: true } });
+  const [form, setForm] = useState(() => normalizeAiForm());
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [codexStatus, setCodexStatus] = useState({ connected: false, state: 'disconnected', reconnectRequired: false });
+  const [deviceState, setDeviceState] = useState(null);
+  const [copied, setCopied] = useState(false);
   const [msg, setMsg] = useState(null);
+  const pollerRef = useRef(null);
+  const formRef = useRef(form);
+  const tRef = useRef(t);
+
+  const persistForm = useCallback(async (nextForm) => {
+    const payload = buildAiSavePayload(nextForm);
+    const result = await api.ai.saveConfig(payload);
+    const saved = result.config || payload;
+    const normalized = normalizeAiForm(saved);
+    setConfig(saved);
+    formRef.current = normalized;
+    setForm(normalized);
+  }, []);
+
+  formRef.current = form;
+  tRef.current = t;
 
   useEffect(() => {
-    api.ai.getConfig()
-      .then(({ config: cfg }) => {
-        if (cfg) {
-          setConfig(cfg);
-          setForm({ enabled: cfg.enabled !== false, baseUrl: cfg.baseUrl || '', apiKey: cfg.apiKey || '', model: cfg.model || '', features: { compose: cfg.features?.compose !== false, summarize: cfg.features?.summarize !== false } });
+    let active = true;
+    const refreshCodexStatus = () => api.ai.codex.status()
+      .then((status) => {
+        if (!active) return;
+        setCodexStatus(status);
+        if (status.state === 'pending' && status.device) {
+          pollerRef.current?.start(status.device).catch(() => {});
         }
+      });
+    pollerRef.current = createCodexDevicePoller({
+      startDevice: api.ai.codex.start,
+      pollDevice: api.ai.codex.poll,
+      cancelDevice: api.ai.codex.cancel,
+      onState: (state) => {
+        if (!active) return;
+        setDeviceState(state);
+        setCopied(false);
+        if (state.phase === 'connected') {
+          const connectedForm = selectAiConnectionMethod({
+            ...formRef.current,
+            accountProvider: AI_PROVIDER_CHATGPT,
+          }, AI_CONNECTION_METHOD_ACCOUNT);
+          persistForm(connectedForm)
+            .then(() => {
+              if (active) setMsg({ type: 'ok', text: tRef.current('admin.ai.saved') });
+            })
+            .catch((error) => {
+              if (active) setMsg({ type: 'error', text: error.message });
+            });
+          refreshCodexStatus().catch(() => {
+            if (active) setCodexStatus({ connected: true, state: 'connected' });
+          });
+        } else if (state.phase === 'failed') {
+          setCodexStatus({ connected: false, state: 'reconnect_required', reconnectRequired: true, reason: state.reason });
+        } else if (['cancelled', 'expired'].includes(state.phase)) {
+          setCodexStatus({ connected: false, state: 'disconnected', reconnectRequired: false });
+        }
+      },
+    });
+
+    Promise.all([
+      api.ai.getConfig().then(({ config: cfg }) => {
+        if (!active) return;
+        const normalized = normalizeAiForm(cfg || {});
+        setConfig(cfg);
+        formRef.current = normalized;
+        setForm(normalized);
+      }),
+      refreshCodexStatus(),
+    ])
+      .catch((error) => {
+        if (active) setMsg({ type: 'error', text: error.message });
       })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, []);
+      .finally(() => { if (active) setLoading(false); });
+
+    return () => {
+      active = false;
+      pollerRef.current?.dispose();
+      pollerRef.current = null;
+    };
+  }, [persistForm]);
 
   const handleSave = async (e) => {
     e.preventDefault();
     setSaving(true); setMsg(null);
     try {
-      await api.ai.saveConfig(form);
-      setConfig({ ...form });
+      await persistForm(form);
       setMsg({ type: 'ok', text: t('admin.ai.saved') });
     } catch (err) {
       setMsg({ type: 'error', text: err.message });
@@ -3480,20 +3753,62 @@ function AISection() {
     } finally { setTesting(false); }
   };
 
-  const handleRemove = async () => {
-    await api.ai.deleteConfig();
-    setConfig(null);
-    setForm({ enabled: true, baseUrl: '', apiKey: '', model: '', features: { compose: true, summarize: true } });
-    setMsg({ type: 'ok', text: t('admin.ai.removed') });
+  const handleConnect = async () => {
+    setConnecting(true); setMsg(null); setDeviceState(null); setCopied(false);
+    try {
+      await pollerRef.current?.start();
+      setCodexStatus({ connected: false, state: 'pending', reconnectRequired: false });
+    } catch (error) {
+      setMsg({ type: 'error', text: error.message });
+    } finally {
+      setConnecting(false);
+    }
   };
 
-  const field = (label, key, type = 'text', placeholder = '') => (
+  const handleCancel = async () => {
+    setCancelling(true); setMsg(null);
+    try {
+      await pollerRef.current?.cancel();
+      setCodexStatus({ connected: false, state: 'disconnected', reconnectRequired: false });
+    } catch (error) {
+      setMsg({ type: 'error', text: error.message });
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const handleDisconnect = async () => {
+    setDisconnecting(true); setMsg(null);
+    try {
+      await api.ai.codex.disconnect();
+      setDeviceState(null);
+      setCodexStatus({ connected: false, state: 'disconnected', reconnectRequired: false });
+    } catch (error) {
+      setMsg({ type: 'error', text: error.message });
+    } finally {
+      setDisconnecting(false);
+    }
+  };
+
+  const handleCopyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(deviceState.userCode);
+      setCopied(true);
+    } catch {
+      setMsg({ type: 'error', text: t('admin.ai.copyFailed') });
+    }
+  };
+
+  const field = (label, value, onChange, type = 'text', placeholder = '', help = null) => (
     <div style={{ marginBottom: 14 }}>
-      <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 5 }}>{label}</label>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 5 }}>
+        <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{label}</label>
+        {help && <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{help}</span>}
+      </div>
       <input
         type={type}
-        value={form[key]}
-        onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
+        value={value}
+        onChange={e => onChange(e.target.value)}
         placeholder={placeholder}
         autoComplete={type === 'password' ? 'new-password' : 'off'}
         style={{ width: '100%', background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6, padding: '7px 10px', color: 'var(--text-primary)', fontSize: 13 }}
@@ -3520,7 +3835,7 @@ function AISection() {
   );
 
   const msgBox = msg && (
-    <div style={{ padding: '8px 12px', borderRadius: 6, marginBottom: 14, fontSize: 13,
+    <div role="status" aria-live="polite" style={{ padding: '8px 12px', borderRadius: 6, marginBottom: 14, fontSize: 13,
       background: msg.type === 'ok' ? 'rgba(74,222,128,0.1)' : 'rgba(248,113,113,0.1)',
       color: msg.type === 'ok' ? 'var(--green)' : 'var(--red)',
       border: `1px solid ${msg.type === 'ok' ? 'rgba(74,222,128,0.2)' : 'rgba(248,113,113,0.2)'}`,
@@ -3528,6 +3843,25 @@ function AISection() {
   );
 
   if (loading) return <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{t('common.loading')}</div>;
+
+  const apiSelected = form.connectionMethod === AI_CONNECTION_METHOD_API;
+  const accountSelected = form.connectionMethod === AI_CONNECTION_METHOD_ACCOUNT;
+  const chatgptSelected = accountSelected && form.accountProvider === AI_PROVIDER_CHATGPT;
+  const chatgptConnected = codexStatus.connected === true || deviceState?.phase === 'connected';
+  const reconnectRequired = codexStatus.reconnectRequired === true || codexStatus.state === 'reconnect_required' || deviceState?.phase === 'failed';
+  const pendingDevice = deviceState?.phase === 'pending' ? deviceState : null;
+  const formValid = isAiFormValid(form);
+  const statusLabel = chatgptConnected
+    ? t('admin.ai.statusConnected')
+    : pendingDevice
+      ? t('admin.ai.statusPending')
+      : reconnectRequired
+        ? t('admin.ai.statusReconnect')
+        : deviceState?.phase === 'expired'
+          ? t('admin.ai.statusExpired')
+          : deviceState?.phase === 'cancelled'
+            ? t('admin.ai.statusCancelled')
+            : t('admin.ai.statusDisconnected');
 
   return (
     <div>
@@ -3544,39 +3878,126 @@ function AISection() {
       <form onSubmit={handleSave}>
         {toggle(t('admin.ai.enabled'), form.enabled, () => setForm(f => ({ ...f, enabled: !f.enabled })))}
 
-        {config && (
-          <div style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', margin: '14px 0', display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{config.model}</div>
-              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{config.baseUrl}</div>
-            </div>
-            {/* type="button" is required: these live inside the form now, so without it they
-                would default to submit and trigger handleSave on click. */}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button type="button" onClick={handleTest} disabled={testing} style={{ fontSize: 12, padding: '5px 12px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text-primary)', cursor: testing ? 'default' : 'pointer', opacity: testing ? 0.6 : 1 }}>
-                {testing ? t('admin.ai.testing') : t('admin.ai.test')}
-              </button>
-              <button type="button" onClick={handleRemove} style={{ fontSize: 12, padding: '5px 12px', background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 6, color: 'var(--red)', cursor: 'pointer' }}>
-                {t('admin.ai.remove')}
-              </button>
-            </div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 5 }}>{t('admin.ai.connectionMethod')}</label>
+          <select
+            value={form.connectionMethod}
+            onChange={e => setForm(f => selectAiConnectionMethod(f, e.target.value))}
+            style={{ ...inputStyle, cursor: 'pointer' }}
+          >
+            <option value="" disabled>{t('admin.ai.connectionMethodPlaceholder')}</option>
+            {AI_CONNECTION_METHOD_OPTIONS.map(({ value, labelKey }) => (
+              <option key={value} value={value}>{t(labelKey)}</option>
+            ))}
+          </select>
+        </div>
+
+        {accountSelected && (
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 5 }}>{t('admin.ai.subscriptionProvider')}</label>
+            <select
+              value={form.accountProvider}
+              onChange={e => setForm(f => normalizeAiForm({ ...f, accountProvider: e.target.value }))}
+              style={{ ...inputStyle, cursor: 'pointer' }}
+            >
+              {AI_ACCOUNT_PROVIDER_OPTIONS.map(({ value, labelKey }) => (
+                <option key={value} value={value}>{t(labelKey)}</option>
+              ))}
+            </select>
           </div>
         )}
 
-        {field(t('admin.ai.baseUrl'), 'baseUrl', 'text', t('admin.ai.baseUrlPh'))}
-        {field(t('admin.ai.apiKey'), 'apiKey', 'password', t('admin.ai.apiKeyPh'))}
-        {field(t('admin.ai.model'), 'model', 'text', t('admin.ai.modelPh'))}
+        {!chatgptSelected && msgBox}
 
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>{t('admin.ai.features')}</div>
-          {toggle(t('admin.ai.featureCompose'), form.features.compose, () => setForm(f => ({ ...f, features: { ...f.features, compose: !f.features.compose } })))}
-          {toggle(t('admin.ai.featureSummarize'), form.features.summarize, () => setForm(f => ({ ...f, features: { ...f.features, summarize: !f.features.summarize } })))}
-        </div>
+        {apiSelected && (
+          <>
+            {field(t('admin.ai.baseUrl'), form.apiKeyConfig.baseUrl, value => setForm(f => ({ ...f, apiKeyConfig: { ...f.apiKeyConfig, baseUrl: value } })), 'text', t('admin.ai.baseUrlPh'))}
+            {field(t('admin.ai.apiKey'), form.apiKeyConfig.apiKey, value => setForm(f => ({ ...f, apiKeyConfig: { ...f.apiKeyConfig, apiKey: value } })), 'password', t('admin.ai.apiKeyPh'))}
+            {field(t('admin.ai.model'), form.apiKeyConfig.model, value => setForm(f => ({ ...f, apiKeyConfig: { ...f.apiKeyConfig, model: value } })), 'text', t('admin.ai.modelPh'))}
+            {config?.provider === AI_PROVIDER_API_KEY && (
+              <button type="button" onClick={handleTest} disabled={testing} style={{ fontSize: 12, padding: '6px 12px', marginBottom: 14, background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text-primary)', cursor: testing ? 'default' : 'pointer', opacity: testing ? 0.6 : 1 }}>
+                {testing ? t('admin.ai.testing') : t('admin.ai.test')}
+              </button>
+            )}
+          </>
+        )}
 
-        {msgBox}
+        {chatgptSelected && (
+          <>
+            {field(
+              t('admin.ai.chatgptModel'),
+              form.chatgptConfig.model,
+              value => setForm(f => ({ ...f, chatgptConfig: { ...f.chatgptConfig, model: value } })),
+              'text',
+              t('admin.ai.chatgptModelPh'),
+              <>
+                <a href={OPENAI_MODELS_URL} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>
+                  {t('admin.ai.chatgptModelDocs')}
+                </a>
+              </>,
+            )}
 
-        <button type="submit" disabled={saving || !form.baseUrl || !form.model}
-          style={{ padding: '8px 18px', background: 'var(--accent)', color: 'var(--accent-text)', border: 'none', borderRadius: 7, fontSize: 13, fontWeight: 500, cursor: 'pointer', opacity: (saving || !form.baseUrl || !form.model) ? 0.5 : 1 }}>
+            <div style={{ marginBottom: 14, padding: '12px 14px', borderRadius: 8, background: 'var(--bg-tertiary)', border: '1px solid var(--border)' }}>
+              <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', justifyContent: 'space-between', alignItems: isMobile ? 'stretch' : 'center', gap: 12, marginBottom: (pendingDevice || msg) ? 12 : 0 }}>
+                <div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{t('admin.ai.connectionStatus')}</div>
+                  <div style={{ fontSize: 13, color: chatgptConnected ? 'var(--green)' : reconnectRequired ? 'var(--red)' : 'var(--text-primary)', marginTop: 2 }}>{statusLabel}</div>
+                  {chatgptConnected && codexStatus.accountLabel && (
+                    <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>{t('admin.ai.connectedAs', { account: codexStatus.accountLabel })}</div>
+                  )}
+                </div>
+                <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', gap: 8 }}>
+                  {chatgptConnected && (
+                    <button type="button" onClick={handleTest} disabled={testing} style={{ fontSize: 12, padding: '6px 12px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text-primary)', cursor: testing ? 'default' : 'pointer', opacity: testing ? 0.6 : 1 }}>
+                      {testing ? t('admin.ai.testing') : t('admin.ai.test')}
+                    </button>
+                  )}
+                  {chatgptConnected ? (
+                    <button type="button" onClick={handleDisconnect} disabled={disconnecting} style={{ fontSize: 12, padding: '6px 12px', background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 6, color: 'var(--red)', cursor: disconnecting ? 'default' : 'pointer', opacity: disconnecting ? 0.6 : 1 }}>
+                      {disconnecting ? t('admin.ai.disconnecting') : t('admin.ai.disconnect')}
+                    </button>
+                  ) : !pendingDevice && (
+                    <button type="button" onClick={handleConnect} disabled={connecting} style={{ fontSize: 12, padding: '6px 12px', background: 'var(--accent)', border: 'none', borderRadius: 6, color: 'var(--accent-text)', cursor: connecting ? 'default' : 'pointer', opacity: connecting ? 0.6 : 1 }}>
+                      {connecting ? t('admin.ai.connecting') : reconnectRequired ? t('admin.ai.reconnect') : t('admin.ai.connect')}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {msgBox}
+
+              {pendingDevice && (
+                <div style={{ paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>{t('admin.ai.deviceInstructions')}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <code style={{ padding: '8px 12px', borderRadius: 6, background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 18, letterSpacing: 1.5, fontWeight: 600 }}>{pendingDevice.userCode}</code>
+                    <button type="button" onClick={handleCopyCode} style={{ fontSize: 12, padding: '6px 10px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text-primary)', cursor: 'pointer' }}>
+                      {copied ? t('admin.ai.copied') : t('admin.ai.copyCode')}
+                    </button>
+                    <a href={pendingDevice.verificationUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12, padding: '6px 10px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--accent)', textDecoration: 'none' }}>
+                      {t('admin.ai.openAuthorization')}
+                    </a>
+                    <button type="button" onClick={handleCancel} disabled={cancelling} style={{ fontSize: 12, padding: '6px 10px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text-secondary)', cursor: cancelling ? 'default' : 'pointer' }}>
+                      {cancelling ? t('admin.ai.cancelling') : t('common.cancel')}
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 8 }}>{t('admin.ai.deviceExpires', { time: new Date(pendingDevice.expiresAt).toLocaleTimeString() })}</div>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {(apiSelected || chatgptSelected) && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>{t('admin.ai.features')}</div>
+            {toggle(t('admin.ai.featureCompose'), form.features.compose, () => setForm(f => ({ ...f, features: { ...f.features, compose: !f.features.compose } })))}
+            {toggle(t('admin.ai.featureSummarize'), form.features.summarize, () => setForm(f => ({ ...f, features: { ...f.features, summarize: !f.features.summarize } })))}
+          </div>
+        )}
+
+        <button type="submit" disabled={saving || !formValid}
+          style={{ padding: '8px 18px', background: 'var(--accent)', color: 'var(--accent-text)', border: 'none', borderRadius: 7, fontSize: 13, fontWeight: 500, cursor: 'pointer', opacity: (saving || !formValid) ? 0.5 : 1 }}>
           {saving ? t('common.saving') : t('common.save')}
         </button>
       </form>
@@ -5663,6 +6084,11 @@ function RulesTab() {
       setFormError(t('admin.rules.errorMoveFolder'));
       return;
     }
+    const forwardAction = actions.find(action => action.type === 'forward');
+    if (forwardAction && !isValidForwardAddress(forwardAction.value)) {
+      setFormError(t('admin.rules.errorForwardEmail'));
+      return;
+    }
     setFormSaving(true);
     setFormError('');
     try {
@@ -5759,7 +6185,7 @@ function RulesTab() {
   function actionSummary(rule) {
     const acts = Array.isArray(rule.actions) ? rule.actions : [];
     if (!acts.length) return '—';
-    const labels = { mark_read: t('admin.rules.actionMarkRead'), star: t('admin.rules.actionStar'), archive: t('admin.rules.actionArchive'), delete: t('admin.rules.actionDelete'), move: t('admin.rules.actionMove') };
+    const labels = { mark_read: t('admin.rules.actionMarkRead'), star: t('admin.rules.actionStar'), forward: t('admin.rules.actionForward'), archive: t('admin.rules.actionArchive'), delete: t('admin.rules.actionDelete'), move: t('admin.rules.actionMove') };
     return acts.map(a => labels[a.type] || a.type).join(', ');
   }
 
@@ -5783,6 +6209,7 @@ function RulesTab() {
   const ACTION_TYPES = [
     { type: 'mark_read', label: t('admin.rules.actionMarkRead') },
     { type: 'star',      label: t('admin.rules.actionStar') },
+    { type: 'forward',   label: t('admin.rules.actionForward') },
     { type: 'archive',   label: t('admin.rules.actionArchive') },
     { type: 'delete',    label: t('admin.rules.actionDelete') },
     { type: 'move',      label: t('admin.rules.actionMove') },
@@ -5981,6 +6408,17 @@ function RulesTab() {
                     />
                   );
                 })()}
+                {type === 'forward' && checked && (
+                  <input
+                    type="email"
+                    autoComplete="off"
+                    aria-label={t('admin.rules.actionForward')}
+                    style={{ ...inputStyle, marginTop: 6, marginLeft: 22 }}
+                    value={fd.actions.find(action => action.type === 'forward')?.value || ''}
+                    onChange={event => setActionValue('forward', event.target.value)}
+                    placeholder={t('admin.rules.actionForwardPlaceholder')}
+                  />
+                )}
               </div>
             );
           })}
@@ -7757,6 +8195,11 @@ function makeSearchIndex(t) {
     { label: t('admin.messageList.scrollingMode'), keywords: ['scroll', 'infinite', 'paginated', 'pagination', 'pages'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.perPagePaginated'), keywords: ['per page', 'batch', 'messages per page', 'count', '25', '50', '100', '200', 'page size'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.hoverQuickActionsMode'), keywords: ['hover', 'quick actions', 'hover buttons', 'row actions'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
+    {
+      label: t('admin.messageList.senderFavicons'),
+      keywords: ['sender', 'favicon', 'avatar', 'contact photo', 'website icon', 'logo'],
+      tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb,
+    },
     { label: t('admin.messageList.swipeActions'), keywords: ['swipe', 'gesture', 'mobile', 'swipe left', 'swipe right', 'touch'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.syncFrequency'), keywords: ['sync', 'interval', 'frequency', 'refresh', 'poll', 'check mail', '15s', '30s', '60s'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.folderSyncFrequency'), keywords: ['folder', 'sync', 'structure', 'list', 'refresh', 'mailbox', '15 min', '30 min', '1 hour', 'never'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },

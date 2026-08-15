@@ -5,6 +5,7 @@ import { api } from '../utils/api.js';
 import { LAYOUTS } from '../layouts.js';
 import { senderColor } from '../themes.js';
 import { useMobile } from '../hooks/useMobile.js';
+import { isAccountInUnifiedInbox } from '../utils/unifiedInbox.js';
 import { useSwipeRow } from '../hooks/useSwipeRow.js';
 import ContextMenu from './ContextMenu.jsx';
 import RowHoverActions from './RowHoverActions.jsx';
@@ -16,6 +17,7 @@ import {
 } from '../utils/gtd.js';
 import { formatDate } from '../utils/formatDate.js';
 import { openReplyFromMessage, openForwardFromMessage } from '../utils/composeFromMessage.js';
+import SenderAvatarImage from './SenderAvatarImage.jsx';
 import { shortcutBus } from '../utils/shortcutBus.js';
 import { createLatestRequest } from '../utils/latestRequest.js';
 import { pendingMarkReadMap, completedMarkReadMap, setPending } from '../utils/pendingReads.js';
@@ -113,7 +115,7 @@ export default function MessageList() {
     setMobileSidebarOpen, unreadCounts, showContacts, setShowContacts,
     conversationMode, expandedThreadId, setExpandedThreadId,
     threadMessages, setThreadMessages, loadingThread, setLoadingThread,
-    hoverQuickActions, showMobileAvatars, gravatarAvatars,
+    hoverQuickActions, showMobileAvatars, showMessagePreviews,
     swipeActions,
     folders, favoriteFolders, addFavoriteFolder, removeFavoriteFolder, setSelectedAccount,
     categorizationEnabled, categoryCounts, setCategoryCounts, adjustCategoryCount,
@@ -130,6 +132,10 @@ export default function MessageList() {
   const isMobile = useMobile();
   const isUnified = selectedAccountId === null;
   const selectedAccount = accounts.find(a => a.id === selectedAccountId);
+  const unifiedInboxAccountKey = accounts
+    .filter(isAccountInUnifiedInbox)
+    .map(account => account.id)
+    .join(',');
   // Search is scoped to the current folder unless we're in the unified view or the
   // user toggled "search all folders". An in: operator in the query overrides this
   // server-side. undefined = search all folders.
@@ -252,7 +258,7 @@ export default function MessageList() {
       .then(data => { if (!cancelled) setCategoryCounts(data.counts || {}); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [categorizationActive, selectedAccountId, selectedFolder, messagesRefreshToken, setCategoryCounts]);
+  }, [categorizationActive, selectedAccountId, selectedFolder, messagesRefreshToken, unifiedInboxAccountKey, setCategoryCounts]);
 
   const searchSeq = useRef(0);
   const refreshRequestRef = useRef(null);
@@ -363,7 +369,7 @@ export default function MessageList() {
     };
     run();
     return () => { cancelled = true; };
-  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, scrollMode, accountsReady, accounts.length, messagesRefreshToken, conversationMode, categorizationEnabled, selectedAccount?.categorization_enabled, applyReadGuard, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
+  }, [selectedAccountId, selectedFolder, unreadOnly, activeCategory, pageSize, scrollMode, accountsReady, unifiedInboxAccountKey, messagesRefreshToken, conversationMode, categorizationEnabled, selectedAccount?.categorization_enabled, applyReadGuard, setHasMoreMessages, setLoadingMessages, setMessages, setMessagesOffset, setMessagesTotal]);
 
   // Load next page (called by scroll or button)
   const loadMore = useCallback(async () => {
@@ -481,7 +487,7 @@ export default function MessageList() {
       }
     }, 300);
     return () => clearTimeout(searchTimer.current);
-  }, [searchQuery, selectedAccountId, searchFolder, searchPageSize, searchReloadToken, applyReadGuard, setIsSearching, setSearchResults]);
+  }, [searchQuery, selectedAccountId, searchFolder, searchPageSize, searchReloadToken, unifiedInboxAccountKey, applyReadGuard, setIsSearching, setSearchResults]);
 
   // Re-run an active search (and refresh the folder view) after inbox rules run, since
   // rules can move messages out of the searched folder and a search snapshot would
@@ -692,9 +698,9 @@ export default function MessageList() {
       return threadMessages[tid];
     }
     const effectiveFolder = selectedAccountId ? selectedFolder : 'INBOX';
-    const data = await api.getThread(tid, effectiveFolder);
+    const data = await api.getThread(tid, effectiveFolder, isUnified);
     return data.messages?.length ? data.messages : [message];
-  }, [isThreadListRow, threadMessages, selectedAccountId, selectedFolder]);
+  }, [isThreadListRow, threadMessages, selectedAccountId, selectedFolder, isUnified]);
 
   const setCachedThreadRead = useCallback((message, read) => {
     const tid = message.thread_id || message.id;
@@ -1392,11 +1398,21 @@ export default function MessageList() {
     lastSelectIdxRef.current = clickedIdx;
   }, [displayMessages]);
 
-  const handleBulkDelete = useCallback((ids, msgs) => {
+  const handleBulkDelete = useCallback(async (ids, msgs) => {
     const key = `bulk:${ids[0]}`;
+    // Selected thread rows delete the whole conversation, matching the
+    // single-row delete path — without this only each thread's visible
+    // (newest) message was deleted and the rest of the thread survived.
+    let deleteIds = ids;
+    try {
+      const resolved = await Promise.all(msgs.map(m => resolveMessagesForThreadAction(m)));
+      deleteIds = [...new Set([...ids, ...resolved.flat().map(m => m?.id).filter(Boolean)])];
+    } catch (err) {
+      console.error('Failed to load thread for bulk delete:', err.message);
+    }
     const searchOffsetBeforeRemoval = searchFetchedOffsetRef.current;
     const shouldPrefetchSearch = Boolean(useStore.getState().searchQuery.trim() && searchHasMore);
-    ids.forEach(id => setPendingDelete(id));
+    deleteIds.forEach(id => setPendingDelete(id));
     ids.forEach(id => removeMessage(id));
     if (shouldPrefetchSearch) {
       prefetchSearchAfterRemoval(searchOffsetBeforeRemoval);
@@ -1413,7 +1429,7 @@ export default function MessageList() {
       pendingDeleteTimers.current.delete(key);
       if (undone) return;
       const chunks = [];
-      for (let i = 0; i < ids.length; i += 500) chunks.push(ids.slice(i, i + 500));
+      for (let i = 0; i < deleteIds.length; i += 500) chunks.push(deleteIds.slice(i, i + 500));
       const results = await Promise.allSettled(chunks.map(chunk => api.bulkDelete(chunk)));
       results
         .filter(r => r.status === 'rejected')
@@ -1422,8 +1438,8 @@ export default function MessageList() {
         .filter(r => r.status === 'fulfilled')
         .flatMap(r => r.value.deleted ?? []);
       const deletedSet = new Set(deleted);
-      ids.forEach(id => (deletedSet.has(id) ? setCompletedDelete(id) : clearDeleteGuard(id)));
-      const failedIds = ids.filter(id => !deletedSet.has(id));
+      deleteIds.forEach(id => (deletedSet.has(id) ? setCompletedDelete(id) : clearDeleteGuard(id)));
+      const failedIds = deleteIds.filter(id => !deletedSet.has(id));
       if (failedIds.length > 0) {
         const failedSet = new Set(failedIds);
         const failedMsgs = msgs.filter(msg => failedSet.has(msg.id));
@@ -1438,15 +1454,15 @@ export default function MessageList() {
         setSearchReloadToken(token => token + 1);
       }
     }, 4500);
-    pendingDeleteTimers.current.set(key, { timer, message: msgs[0], ids });
+    pendingDeleteTimers.current.set(key, { timer, message: msgs[0], ids: deleteIds });
     addNotification({
-      title: t('messageList.bulkDeleted.title', { count: ids.length }),
+      title: t('messageList.bulkDeleted.title', { count: deleteIds.length }),
       body: t('messageList.bulkDeleted.body'),
       onUndo: () => {
         undone = true;
         clearTimeout(timer);
         pendingDeleteTimers.current.delete(key);
-        ids.forEach(id => clearPendingDelete(id));
+        deleteIds.forEach(id => clearPendingDelete(id));
         useStore.getState().restoreMessages(msgs);
         msgs.forEach(msg => {
           const delta = parseInt(msg.unread_count) || (msg.is_read ? 0 : 1);
@@ -1454,9 +1470,23 @@ export default function MessageList() {
         });
       },
     });
-  }, [searchHasMore, removeMessage, prefetchSearchAfterRemoval, decrementUnread, incrementUnread, addNotification, t]);
+  }, [searchHasMore, removeMessage, prefetchSearchAfterRemoval, resolveMessagesForThreadAction, decrementUnread, incrementUnread, addNotification, t]);
 
-  const handleBulkMove = useCallback((ids, msgs, folder) => {
+  const handleBulkMove = useCallback(async (ids, msgs, folder) => {
+    // Selected thread rows move the whole conversation. A folder path is
+    // account-specific, so scope each thread's expansion to its row's own
+    // account — the server would just skip (and previously silently drop)
+    // another account's copies from a folder that doesn't exist there.
+    let moveIds = ids;
+    try {
+      const resolved = await Promise.all(msgs.map(async (m) => {
+        const thread = await resolveMessagesForThreadAction(m);
+        return thread.filter(tm => tm?.account_id === m.account_id);
+      }));
+      moveIds = [...new Set([...ids, ...resolved.flat().map(m => m?.id).filter(Boolean)])];
+    } catch (err) {
+      console.error('Failed to load thread for bulk move:', err.message);
+    }
     ids.forEach(id => removeMessage(id));
     msgs.forEach(msg => { if (!msg.is_read) decrementUnread(msg.account_id); });
     setSelectedIds(new Set());
@@ -1466,23 +1496,24 @@ export default function MessageList() {
     const timer = setTimeout(async () => {
       if (undone) return;
       try {
-        const result = await api.bulkMove(ids, folder);
+        const result = await api.bulkMove(moveIds, folder);
         const movedSet = new Set(result.moved ?? []);
-        const failedMsgs = msgs.filter(msg => !movedSet.has(msg.id));
-        if (failedMsgs.length > 0) {
-          useStore.getState().restoreMessages(failedMsgs);
-          addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failedMsgs.length }) });
+        const failedCount = moveIds.filter(id => !movedSet.has(id)).length;
+        if (failedCount > 0) {
+          const failedMsgs = msgs.filter(msg => !movedSet.has(msg.id));
+          if (failedMsgs.length > 0) useStore.getState().restoreMessages(failedMsgs);
+          addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failedCount }) });
         } else if (msgs[0]?.account_id) {
           useStore.getState().recordRecentFolder({ accountId: msgs[0].account_id, path: folder });
         }
       } catch (err) {
         console.error('Bulk move failed:', err);
         useStore.getState().restoreMessages(msgs);
-        addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: ids.length }) });
+        addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: moveIds.length }) });
       }
     }, 4500);
     addNotification({
-      title: t('messageList.bulkMoved.title', { count: ids.length }),
+      title: t('messageList.bulkMoved.title', { count: moveIds.length }),
       body: folder,
       onUndo: () => {
         undone = true;
@@ -1491,7 +1522,7 @@ export default function MessageList() {
         msgs.forEach(msg => { if (!msg.is_read) incrementUnread(msg.account_id); });
       },
     });
-  }, [removeMessage, decrementUnread, incrementUnread, addNotification, t]);
+  }, [removeMessage, decrementUnread, incrementUnread, resolveMessagesForThreadAction, addNotification, t]);
 
   const handleRowMove = useCallback((e, msg) => {
     e.stopPropagation();
@@ -1919,7 +1950,13 @@ export default function MessageList() {
           addNotification({ title: t('message.moved.failTitle'), body: t('message.moved.failBody') });
           break;
         }
+        // A folder path is account-specific: a thread can span accounts (and
+        // always includes Sent copies), and the server skips messages whose
+        // account lacks the destination folder. Scope the move to the
+        // right-clicked message's account so nothing is silently dropped.
+        moveMessages = moveMessages.filter(msg => msg?.account_id === moved.account_id);
         const moveIds = [...new Set(moveMessages.map(msg => msg.id).filter(Boolean))];
+        if (!moveIds.length) moveIds.push(moved.id);
         removeMessage(moved.id);
         if (!moved.is_read) decrementUnread(moved.account_id);
         // Remove the moved message from the selection so the action bar doesn't
@@ -1934,10 +1971,25 @@ export default function MessageList() {
         const moveTimer = setTimeout(async () => {
           if (moveUndone) return;
           try {
-            await api.bulkMove(moveIds, folder);
-            useStore.getState().recordRecentFolder({ accountId: moved.account_id, path: folder });
+            const result = await api.bulkMove(moveIds, folder);
+            // The server reports per-message success (200 even when some IMAP
+            // moves fail or are skipped) — surface partial failures instead of
+            // letting the thread silently reappear on the next sync.
+            const movedSet = new Set(result.moved ?? []);
+            const failedCount = moveIds.filter(id => !movedSet.has(id)).length;
+            if (failedCount > 0) {
+              if (!movedSet.has(moved.id)) {
+                useStore.getState().restoreMessages([moved]);
+                if (!moved.is_read) incrementUnread(moved.account_id);
+              }
+              addNotification({ type: 'error', title: t('message.moved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failedCount }) });
+            } else {
+              useStore.getState().recordRecentFolder({ accountId: moved.account_id, path: folder });
+            }
           } catch (err) {
             console.error('Move failed:', err.message);
+            useStore.getState().restoreMessages([moved]);
+            if (!moved.is_read) incrementUnread(moved.account_id);
             addNotification({ title: t('message.moved.failTitle'), body: t('message.moved.failBody') });
           }
         }, 4500);
@@ -2175,7 +2227,7 @@ export default function MessageList() {
       setLoadingThread(tid);
       try {
         const effectiveFolder = selectedAccountId ? selectedFolder : 'INBOX';
-        const data = await api.getThread(tid, effectiveFolder);
+        const data = await api.getThread(tid, effectiveFolder, isUnified);
         const msgs = data.messages || [];
         setThreadMessages(tid, msgs);
         if (!isMobile && msgs.length > 0) handleSelect(msgs[msgs.length - 1]);
@@ -3395,7 +3447,7 @@ export default function MessageList() {
                 isNarrow={isNarrow}
                 onThreadClick={() => handleThreadClick(message)}
                 showMobileAvatars={showMobileAvatars}
-                gravatarAvatars={gravatarAvatars}
+                showMessagePreviews={showMessagePreviews}
                 onSelect={handleSelect}
                 onMarkRead={handleThreadMarkRead}
                 onStar={handleStar}
@@ -3439,7 +3491,7 @@ export default function MessageList() {
                 onRangeSelect={handleRangeSelect}
                 onAvatarClick={!isMobile ? handleAvatarClick : undefined}
                 showMobileAvatars={showMobileAvatars}
-                gravatarAvatars={gravatarAvatars}
+                showMessagePreviews={showMessagePreviews}
                 onMarkRead={handleMarkRead}
                 onStar={handleStar}
                 onDelete={handleDelete}
@@ -3873,7 +3925,7 @@ function EmptyState({ folderSyncing, searchQuery, unreadOnly, selectedFolder, ac
   );
 }
 
-function ThreadRow({ message, isExpanded, inlineExpansion, threadMsgs, isLoadingThread, selectedMessageId, selectedMid, lastViewedMessageId, showAccount, isNarrow, onThreadClick, showMobileAvatars, gravatarAvatars, onSelect, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, onGtdDone, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, isChecked, selectionMode, onToggleSelect, onRangeSelect, onLongPress }) {
+function ThreadRow({ message, isExpanded, inlineExpansion, threadMsgs, isLoadingThread, selectedMessageId, selectedMid, lastViewedMessageId, showAccount, isNarrow, onThreadClick, showMobileAvatars, showMessagePreviews, onSelect, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, onGtdDone, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, isChecked, selectionMode, onToggleSelect, onRangeSelect, onLongPress }) {
   const { t } = useTranslation();
   const [hovered, setHovered] = useState(false);
   const messageCount = message.message_count || 1;
@@ -3997,23 +4049,10 @@ function ThreadRow({ message, isExpanded, inlineExpansion, threadMsgs, isLoading
             ) : (
               <>
                 {(message.from_name || message.from_email || '?')[0].toUpperCase()}
-                {message.has_contact_photo && message.from_email && (
-                  <img
-                    src={`/api/contacts/photo?email=${encodeURIComponent(message.from_email)}`}
-                    alt=""
-                    style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
-                    onError={e => { e.currentTarget.style.display = 'none'; }}
-                  />
-                )}
-                {!message.has_contact_photo && gravatarAvatars && message.from_email && (
-                  <img
-                    src={`/api/contacts/gravatar?email=${encodeURIComponent(message.from_email)}`}
-                    alt=""
-                    loading="lazy"
-                    style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
-                    onError={e => { e.currentTarget.style.display = 'none'; }}
-                  />
-                )}
+                <SenderAvatarImage
+                  email={message.from_email}
+                  hasContactPhoto={message.has_contact_photo}
+                />
               </>
             )}
           </div>
@@ -4079,12 +4118,14 @@ function ThreadRow({ message, isExpanded, inlineExpansion, threadMsgs, isLoading
             {message.subject || t('common.noSubject')}
           </div>
           {/* Row 3: snippet */}
-          <div style={{
-            fontSize: 12, color: 'var(--text-tertiary)',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>
-            {message.snippet || ''}
-          </div>
+          {showMessagePreviews && (
+            <div style={{
+              fontSize: 12, color: 'var(--text-tertiary)',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>
+              {message.snippet || ''}
+            </div>
+          )}
         </div>
         {hovered && hoverQuickActions && (
           <RowHoverActions
@@ -4148,12 +4189,13 @@ function ThreadRow({ message, isExpanded, inlineExpansion, threadMsgs, isLoading
                     {formatDate(msg.date)}
                   </span>
                 </div>
+                {showMessagePreviews && (
                 <div style={{
                   fontSize: 11, color: 'var(--text-tertiary)',
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1,
                 }}>
                   {msg.snippet || ''}
-                </div>
+                </div>)}
               </div>
             </div>
           ))}
@@ -4163,7 +4205,7 @@ function ThreadRow({ message, isExpanded, inlineExpansion, threadMsgs, isLoading
   );
 }
 
-function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, showAccount, isNarrow, onSelect, onToggleSelect, onRangeSelect, onAvatarClick, showMobileAvatars, gravatarAvatars, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, onGtdDone, onDragStart, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, onLongPress }) {
+function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, showAccount, isNarrow, onSelect, onToggleSelect, onRangeSelect, onAvatarClick, showMobileAvatars, showMessagePreviews, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, onGtdDone, onDragStart, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, onLongPress }) {
   const { t } = useTranslation();
   const [hovered, setHovered] = useState(false);
   const [avatarHovered, setAvatarHovered] = useState(false);
@@ -4331,23 +4373,10 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
             ) : (
               <>
                 {(message.from_name || message.from_email || '?')[0].toUpperCase()}
-                {message.has_contact_photo && message.from_email && (
-                  <img
-                    src={`/api/contacts/photo?email=${encodeURIComponent(message.from_email)}`}
-                    alt=""
-                    style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
-                    onError={e => { e.currentTarget.style.display = 'none'; }}
-                  />
-                )}
-                {!message.has_contact_photo && gravatarAvatars && message.from_email && (
-                  <img
-                    src={`/api/contacts/gravatar?email=${encodeURIComponent(message.from_email)}`}
-                    alt=""
-                    loading="lazy"
-                    style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
-                    onError={e => { e.currentTarget.style.display = 'none'; }}
-                  />
-                )}
+                <SenderAvatarImage
+                  email={message.from_email}
+                  hasContactPhoto={message.has_contact_photo}
+                />
               </>
             )}
           </div>
@@ -4404,15 +4433,17 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
         </div>
 
         {/* Row 3: Snippet */}
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <span style={{
-            fontSize: 12, color: 'var(--text-tertiary)',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-            flex: 1,
-          }}>
-            {message.snippet || '\u00a0'}
-          </span>
-        </div>
+        {showMessagePreviews && (
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <span style={{
+              fontSize: 12, color: 'var(--text-tertiary)',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              flex: 1,
+            }}>
+              {message.snippet || '\u00a0'}
+            </span>
+          </div>
+        )}
         </div>
       </div>
 

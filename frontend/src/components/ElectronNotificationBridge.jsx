@@ -10,6 +10,31 @@ import {
   shouldRecordNativeUpdateCheck,
   shouldRunAutomaticNativeUpdateCheck,
 } from '../utils/nativeUpdatePolicy.js';
+import { createBoundedActionIdTracker, isTrustedNativeMessage } from '../utils/nativeActionSecurity.js';
+
+function linuxInstructionPath(filePath) {
+  const normalized = String(filePath || '').replace(/\\/g, '/');
+  if (!normalized) return null;
+  return normalized.replace(/^\/home\/[^/]+(?=\/)/, '$HOME');
+}
+
+function getLinuxInstallCommandFromPath(filePath) {
+  const normalized = linuxInstructionPath(filePath);
+  if (!normalized) return null;
+
+  const escaped = normalized.startsWith('$HOME/')
+    ? normalized.replace(/(["\\`])/g, '\\$1')
+    : normalized.replace(/(["\\$`])/g, '\\$1');
+  const quotedPath = `"${escaped}"`;
+
+  if (/\.deb$/i.test(normalized)) return `sudo apt install ${quotedPath}`;
+  if (/\.rpm$/i.test(normalized)) return `sudo dnf install ${quotedPath}`;
+  return null;
+}
+
+function isLinuxPackagePath(filePath) {
+  return /\.(deb|rpm)$/i.test(String(filePath || ''));
+}
 
 export default function ElectronNotificationBridge() {
   const { t } = useTranslation();
@@ -21,7 +46,7 @@ export default function ElectronNotificationBridge() {
   const totalUnread = useStore(state => state.unreadCounts.total);
   const lastActionRef = useRef({ action: null, time: 0 });
   const lastUpdateNoticeRef = useRef('');
-  const processedActionIdsRef = useRef(new Set());
+  const processedActionIdsRef = useRef(createBoundedActionIdTracker());
   const [nativeBridgeReady, setNativeBridgeReady] = useState(() => Boolean(window.mailflowNative));
 
   useEffect(() => {
@@ -100,17 +125,63 @@ export default function ElectronNotificationBridge() {
       if (lastUpdateNoticeRef.current === noticeKey) return;
       lastUpdateNoticeRef.current = noticeKey;
 
+      const platform = window.mailflowNative?.platform;
+      const filePath = status?.data?.filePath || status?.data?.updatePath || '';
+      const installCommand = status?.data?.installCommand
+        || (platform === 'linux' ? getLinuxInstallCommandFromPath(filePath) : null);
+      const manualInstall = Boolean(
+        status?.data?.manualInstall
+        || installCommand
+        || (platform === 'linux' && (isLinuxPackagePath(filePath) || status?.data?.manual))
+      );
       addNotification({
         type: 'success',
         title: t('admin.about.updates.notificationReadyTitle'),
-        body: t('admin.about.updates.notificationReadyBody', { version: status.version }),
+        body: manualInstall
+          ? `MailFlow downloaded and verified the update.${installCommand ? ` Install it from a terminal with:\n${installCommand}` : ''}`
+          : t('admin.about.updates.notificationReadyBody', { version: status.version }),
         allowWrap: true,
         persistent: true,
-        actionLabel: window.mailflowNative?.platform === 'android'
-          ? t('admin.about.updates.installAndroid')
-          : t('admin.about.updates.install'),
+        actionLabel: manualInstall
+          ? 'Copy & Quit'
+          : platform === 'android'
+            ? t('admin.about.updates.installAndroid')
+            : t('admin.about.updates.install'),
         onAction: async () => {
+          if (manualInstall) {
+            const result = await window.mailflowNative?.updates?.copyInstallCommandAndQuit?.({
+              installCommand,
+              filePath,
+            });
+            if (!result?.copied) {
+              addNotification({
+                type: 'error',
+                title: 'Copy failed',
+                body: 'The update command could not be copied.',
+              });
+            }
+            return;
+          }
+
           const result = await window.mailflowNative?.updates?.installDownloaded?.();
+          if (result?.reason === 'manual-install-required' && result.installCommand) {
+            addNotification({
+              type: 'success',
+              title: 'Update ready',
+              body: `MailFlow downloaded and verified the update. Install it from a terminal with:\n${result.installCommand}`,
+              allowWrap: true,
+              persistent: true,
+              actionLabel: 'Copy & Quit',
+              onAction: async () => {
+                await window.mailflowNative?.updates?.copyInstallCommandAndQuit?.({
+                  installCommand: result.installCommand,
+                  filePath,
+                });
+              },
+            });
+            return;
+          }
+
           if (result && result.installed === false) {
             addNotification({
               type: 'error',
@@ -287,8 +358,7 @@ export default function ElectronNotificationBridge() {
       const id = typeof payload === 'object' ? payload?.id : null;
 
       if (!action) return;
-      if (id && processedActionIdsRef.current.has(id)) return;
-      if (id) processedActionIdsRef.current.add(id);
+      if (id && !processedActionIdsRef.current.remember(id)) return;
 
       const now = Date.now();
       const last = lastActionRef.current;
@@ -359,7 +429,7 @@ export default function ElectronNotificationBridge() {
     };
 
     const handleNativeMessage = (event) => {
-      if (event.source !== window) return;
+      if (!isTrustedNativeMessage(event)) return;
       if (event.data?.type === 'mailflow:native-action') {
         runNativeAction(event.data.payload);
       } else if (event.data?.type === 'mailflow:native-actions-ready') {
