@@ -36,7 +36,7 @@ If you contribute code, please read the [Contributor License Agreement](CLA.md).
 - **Attachments** — send and receive file attachments across all accounts
 - **Multiple layouts** — classic, compact, wide reader, vertical split, and more
 - **Multiple themes** — dark, light, and several color schemes; custom CSS field for per-user style overrides
-- **Multi-language UI** — English, French, Spanish, Italian, German, Russian, and Simplified Chinese
+- **Multi-language UI** — English, French, Spanish, Italian, German, Russian, Simplified Chinese, and Polish
 - **Full-text search** — across all connected accounts simultaneously
 - **Real-time notifications** — WebSocket-powered new-mail toasts and web push notifications
 - **PWA** — installable as a desktop or mobile app with push notification support
@@ -616,7 +616,7 @@ MailFlow is free and open source. If it's useful to you, consider supporting dev
 ### GitHub Sponsors
 
 <!-- SPONSORS-START -->
-<a href="https://github.com/MikeScanlan5" title="MikeScanlan5"><img src="https://avatars.githubusercontent.com/u/44779151?s=64&u=e7dfabc231fa876f879e63b4cd1c897036751467&v=4" width="48" height="48" alt="MikeScanlan5" style="border-radius:50%;margin:4px"></a>
+_No sponsors yet — be the first!_
 <!-- SPONSORS-END -->
 
 ---

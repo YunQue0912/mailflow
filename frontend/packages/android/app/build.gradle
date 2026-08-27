@@ -22,8 +22,8 @@ android {
         applicationId "sh.mailflow.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 209000001
-        versionName "2.9.0-custom.1"
+        versionCode 303000001
+        versionName "3.3.0-custom.1"
         buildConfigField "String", "MAILFLOW_ANDROID_CERTIFICATE_SHA256", "\"${androidCertificateSha256}\""
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {

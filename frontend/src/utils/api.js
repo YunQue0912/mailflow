@@ -244,6 +244,11 @@ export const api = {
   bulkArchive: (ids) => request('POST', '/mail/messages/bulk-archive', { ids }),
   getUnreadCounts: () => request('GET', '/mail/unread-counts'),
 
+  // Mailbox cleanup (read-only analysis; actual cleanup reuses bulkDelete above).
+  mailboxUsage: (accountId) => request('GET', `/mail/mailbox-usage?accountId=${encodeURIComponent(accountId)}`),
+  cleanupPreview: (accountId, fromEmail) =>
+    request('GET', `/mail/cleanup-preview?accountId=${encodeURIComponent(accountId)}&fromEmail=${encodeURIComponent(fromEmail)}`),
+
   // Antispam (v0.1) — manual user feedback.
   // markSpam moves the message to the account's spam/junk folder and
   // records the decision in spam_training_log. markHam moves it back to
@@ -253,6 +258,9 @@ export const api = {
 
   getMessageHeaders: (id) => request('GET', `/mail/messages/${id}/headers`),
   snoozeMessage: (id, until) => request('POST', `/mail/messages/${id}/snooze`, { until }),
+
+  // Sanitized diagnostics report (server-owned sections; scoped to the user).
+  diagnosticsReport: (salt) => request('POST', '/diagnostics/report', { salt }),
 
   // Integrations
   getIntegrations: () => request('GET', '/integrations'),
@@ -391,6 +399,7 @@ export const api = {
     return request('GET', `/gtd/sections${qs ? '?' + qs : ''}`);
   },
   gtdClassify: (messageId, state) => request('POST', '/gtd/classify', { messageId, state }),
+  gtdUndoClassify: (undoToken) => request('POST', '/gtd/classify/undo', undoToken),
   gtdUnclassify: (messageId, state) => request('DELETE', '/gtd/classify', { messageId, state }),
   // GTD "done": strip the row's label(s) for these states, mark read, archive the INBOX
   // copy. id is the rail head's row id (its label-folder copy); the server resolves the
@@ -404,6 +413,13 @@ export const api = {
   importGtdPet: (payload) => request('POST', '/gtd/pet/import', payload),
   getGtdPetMeta: (slug) => request('GET', `/gtd/pet/${encodeURIComponent(slug)}/meta`),
   gtdPetSheetUrl: (slug) => `${BASE}/gtd/pet/${encodeURIComponent(slug)}/sheet`,
+
+  // Plugins — registered plugins for this build plus the user's per-user activation. Activation is
+  // independent of a plugin's own per-account config (e.g. GTD's gtd_enabled).
+  plugins: {
+    list: () => request('GET', '/plugins'),
+    setActivated: (id, activated) => request('PATCH', `/plugins/${encodeURIComponent(id)}`, { activated }),
+  },
 
   // Todoist integration
   todoist: {

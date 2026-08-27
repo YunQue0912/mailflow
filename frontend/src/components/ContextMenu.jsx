@@ -2,10 +2,11 @@ import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
-import { GTD_STATES, GTD_COLORS, resolveAccountGtdFolders, gtdStatesInFolders } from '../utils/gtd.js';
 import { getContextMenuPolicy, resolveContextMenuMessage } from '../utils/contextMenuPolicy.js';
+import { usePluginCollected } from '../plugins/PluginSlot.jsx';
 import MessageHeaderModal from './MessageHeaderModal.jsx';
 import { useUiScale, descale } from '../hooks/useUiScale.js';
+import { useMobile } from '../hooks/useMobile.js';
 
 // Module-level regex — spam-name heuristic shared with MessagePane.jsx so
 // it isn't recompiled on every render. Mirrors resolveAllSpamPaths on the
@@ -18,6 +19,7 @@ const CATEGORIES = ['primary', 'newsletter', 'promotion', 'automated', 'social']
 export default function ContextMenu({ x, y, message, onClose, onAction, defaultMoveView = false, variant = 'inbox', selectedText = '' }) {
   const { t } = useTranslation();
   const uiScale = useUiScale();
+  const isMobile = useMobile();
   // Variants share one menu; the policy removes actions that depend on the center
   // list or conflict with GTD's Done contract while preserving ordinary mail actions.
   const menuPolicy = getContextMenuPolicy(variant);
@@ -29,15 +31,11 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
   const accountFolders = useStore(s => s.folders[message.account_id] || []);
   const categorizationEnabled = useStore(s => s.categorizationEnabled);
   const categorizationActive = categorizationEnabled || !!account?.categorization_enabled;
-  // GTD classify is available only for accounts with GTD enabled. "Remove from
-  // <state>" is offered only for the states this thread is actually labelled with
-  // (its folders[] — present on GTD entries, absent on plain inbox rows).
-  const gtdActive = !!account?.gtd_enabled;
-  const gtdFolders = resolveAccountGtdFolders(account);
-  const gtdRemovableStates = gtdStatesInFolders(message.folders, gtdFolders);
   const menuRef = useRef(null);
   const [headerMessage, setHeaderMessage] = useState(null);
-  const [gtdView, setGtdView] = useState(false);
+  // A plugin submenu (render fn) takes over the menu content area, like categorizeView/moveView.
+  // Set via the openSubmenu capability handed to context-menu-item contributions; null = item list.
+  const [pluginSubmenu, setPluginSubmenu] = useState(null);
   const [moveView, setMoveView] = useState(defaultMoveView);
   const [moveFolders, setMoveFolders] = useState(null);
   const [moveFoldersLoading, setMoveFoldersLoading] = useState(defaultMoveView);
@@ -65,18 +63,30 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
   })();
   const inSpamFolder = spamFolderPaths.has(message.folder);
 
-  // Adjust position to stay within viewport
+  // Adjust position to stay within viewport. The menu's height changes after
+  // mount (folders load async, subviews like Move/Snooze swap in), so re-clamp
+  // on every size change — measuring only at open time lets a menu that grows
+  // near the bottom edge overflow off-screen.
   const [pos, setPos] = useState({ x, y });
   useEffect(() => {
-    if (!menuRef.current) return;
-    const rect = menuRef.current.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    setPos({
-      x: Math.max(0, x + rect.width  > vw ? x - rect.width  : x),
-      y: Math.max(0, y + rect.height > vh ? y - rect.height : y),
-    });
-  }, [x, y]);
+    const menu = menuRef.current;
+    if (!menu) return;
+    // Mobile renders a fixed, vertically-centered slide-out panel (see the
+    // container style below), so the tap-point clamp is desktop-only.
+    if (isMobile) return;
+    const clamp = () => {
+      const rect = menu.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const nx = Math.max(0, x + rect.width  > vw ? x - rect.width  : x);
+      const ny = Math.max(0, y + rect.height > vh ? y - rect.height : y);
+      setPos(prev => (prev.x === nx && prev.y === ny ? prev : { x: nx, y: ny }));
+    };
+    clamp();
+    const observer = new ResizeObserver(clamp);
+    observer.observe(menu);
+    return () => observer.disconnect();
+  }, [x, y, isMobile]);
 
   // Auto-load folders when opened directly in move mode (e.g. from row folder icon)
   useEffect(() => {
@@ -111,6 +121,15 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
     document.addEventListener('keydown', handleKey);
     return () => document.removeEventListener('keydown', handleKey);
   }, [onClose]);
+
+  // Plugin-contributed action items (currently GTD's submenu + sidebar "Done"), spliced into the
+  // Actions group at the seam below. Core stays plugin-agnostic; openSubmenu lets an item take over
+  // the content area with its own submenu render.
+  const pluginActionItems = usePluginCollected('context-menu-actions', {
+    message, account, variant, onAction, onClose,
+    openSubmenu: (render) => setPluginSubmenu(() => render),
+    t,
+  });
 
   const items = [
     ...(isMessagePane ? [
@@ -153,6 +172,13 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
           label: t('contextMenu.open'),
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>,
           action: () => onAction('open'),
+        }]),
+        // Detached windows don't exist on mobile — handleOpenInWindow no-ops
+        // there — so hide this rather than show a dead item.
+        ...(isMessagePane || isMobile ? [] : [{
+          label: t('contextMenu.openInNewWindow'),
+          icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>,
+          action: () => onAction('openWindow'),
         }]),
         {
           label: hasUnread ? t('contextMenu.markRead') : t('contextMenu.markUnread'),
@@ -221,20 +247,9 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
           keepOpen: true,
           hasSubmenu: true,
         }] : []),
-        ...(gtdActive ? [{
-          label: t('gtd.title'),
-          icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>,
-          action: () => setGtdView(true),
-          keepOpen: true,
-          hasSubmenu: true,
-        }] : []),
-        // The sidebar's "done" checkmark — mirrors the row's hover cluster. Section-scoped
-        // stripping happens in the GTD content's onAction (it knows the entry's section).
-        ...(menuPolicy.done ? [{
-          label: t('gtd.done'),
-          icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><polyline points="20 6 9 17 4 12"/></svg>,
-          action: () => onAction('gtdDone'),
-        }] : []),
+        // Plugin-contributed items (GTD's submenu + sidebar "Done") slot in here, exactly where the
+        // GTD entries used to sit — after "Categorize", before "Create rule".
+        ...pluginActionItems,
         ...(!menuPolicy.rules ? [] : [{
           label: t('contextMenu.createRule'),
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>,
@@ -273,6 +288,18 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
           label: t('contextMenu.copySender'),
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
           action: () => { navigator.clipboard.writeText(message.from_email || ''); onAction('copy'); },
+        },
+        {
+          // Durable permalink to this email: keyed on the stable Message-ID header (falls back to
+          // the volatile row UUID only when absent) so it survives the message moving folders /
+          // being re-synced. Resolved by /?m= on load — see MailApp deep-link handling (#270, #375).
+          label: t('contextMenu.copyLink'),
+          icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>,
+          action: () => {
+            const ref = message.message_id || message.id;
+            if (ref) navigator.clipboard.writeText(`${window.location.origin}/?m=${encodeURIComponent(ref)}`);
+            onAction('copy');
+          },
         },
       ]
     },
@@ -313,19 +340,40 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
         ref={menuRef}
         onClick={e => e.stopPropagation()}
         style={{
-          position: 'fixed', left: descale(pos.x, uiScale), top: descale(pos.y, uiScale),
           background: 'var(--bg-elevated)',
           border: '1px solid var(--border)',
           borderRadius: 10, zIndex: 4000,
           boxShadow: 'var(--shadow-modal)',
-          width: 320, maxHeight: 'calc(100vh - 8px)', overflowX: 'hidden', overflowY: 'auto',
-          animation: 'contextMenuIn 0.12s ease',
+          overflowX: 'hidden', overflowY: 'auto',
+          // Mobile: a left-anchored, vertically-centered slide-out panel so the
+          // (often long) menu clears the notch/Dynamic Island top and bottom.
+          // Desktop: positioned at the clamped tap point.
+          ...(isMobile ? {
+            position: 'fixed',
+            left: 'calc(env(safe-area-inset-left, 0px) + 12px)',
+            // Center within the SAFE area, not the raw viewport: with
+            // viewport-fit=cover the island (top inset) is taller than the home
+            // indicator (bottom inset), so a plain 50% sits visibly too high.
+            top: 'calc(50% + (var(--sat) - var(--sab)) / 2)',
+            transform: 'translateY(-50%)',
+            width: 'min(340px, calc(100vw - 24px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)))',
+            maxHeight: 'min(80vh, calc(100vh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 24px))',
+            animation: 'contextMenuSlideIn 0.18s ease',
+          } : {
+            position: 'fixed', left: descale(pos.x, uiScale), top: descale(pos.y, uiScale),
+            width: 320, maxHeight: 'calc(100vh - 8px)',
+            animation: 'contextMenuIn 0.12s ease',
+          }),
         }}
       >
         <style>{`
           @keyframes contextMenuIn {
             from { opacity: 0; transform: scale(0.95) translateY(-4px); }
             to   { opacity: 1; transform: scale(1) translateY(0); }
+          }
+          @keyframes contextMenuSlideIn {
+            from { opacity: 0; transform: translate(-16px, -50%); }
+            to   { opacity: 1; transform: translate(0, -50%); }
           }
         `}</style>
 
@@ -351,54 +399,10 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
           </div>
         )}
 
-        {gtdView ? (
-          <>
-            <div
-              onClick={() => setGtdView(false)}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 8,
-                padding: '8px 14px', cursor: 'pointer',
-                borderBottom: '1px solid var(--border-subtle)',
-                color: 'var(--text-secondary)', fontSize: 12,
-              }}
-              onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <polyline points="15 18 9 12 15 6"/>
-              </svg>
-              {t('gtd.title')}
-            </div>
-            {GTD_STATES.map(state => (
-              <div
-                key={state}
-                onClick={() => { onAction('gtdClassify', state); onClose(); }}
-                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)' }}
-                onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-              >
-                <span style={{ width: 9, height: 9, borderRadius: 3, flexShrink: 0, background: GTD_COLORS[state] }} />
-                <span style={{ flex: 1 }}>{t(`gtd.state.${state}`)}</span>
-              </div>
-            ))}
-            {gtdRemovableStates.length > 0 && (
-              <>
-                <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
-                {gtdRemovableStates.map(state => (
-                  <div
-                    key={`rm-${state}`}
-                    onClick={() => { onAction('gtdRemove', state); onClose(); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-secondary)' }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                    <span style={{ flex: 1 }}>{t('gtd.removeFrom', { state: t(`gtd.state.${state}`) })}</span>
-                  </div>
-                ))}
-              </>
-            )}
-          </>
+        {pluginSubmenu ? (
+          // A plugin item opened its own submenu (e.g. GTD's classify/remove list). It renders its
+          // own back row; onBack returns to the item list.
+          pluginSubmenu(() => setPluginSubmenu(null))
         ) : categorizeView ? (
           <>
             <div
@@ -599,7 +603,7 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
             )}
             <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--border-subtle)' }}>
               <input
-                autoFocus
+                autoFocus={!isMobile}
                 value={folderSearch}
                 onChange={e => setFolderSearch(e.target.value)}
                 placeholder={t('contextMenu.folders.search')}

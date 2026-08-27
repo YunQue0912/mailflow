@@ -1,6 +1,8 @@
 import { useCallback, useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
+import { getPluginMeta } from '../plugins/registry.js';
+import { PluginSlot } from '../plugins/PluginSlot.jsx';
 import { newAiAction, AI_ACTION_LIMITS } from '../aiActions.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { api } from '../utils/api.js';
@@ -19,14 +21,13 @@ import {
   selectAiConnectionMethod,
 } from '../utils/aiConfig.js';
 import { THEMES, applyTheme, applyCustomCss } from '../themes.js';
-import { FONT_SETS, loadFontSet } from '../fonts.js';
+import { FONT_SETS, loadFontSet, isRetroFont } from '../fonts.js';
 import { LAYOUTS, applyLayout } from '../layouts.js';
 import { NOTIFICATION_SOUNDS, playNotificationSound, playCustomSound, warmUpAudioContext } from '../utils/notificationSounds.js';
 import { usePushNotifications } from '../hooks/usePushNotifications.js';
 import SignatureEditor from './SignatureEditor.jsx';
-import GtdZeroPet from './GtdZeroPet.jsx';
+import DiagnosticsReportModal from './DiagnosticsReportModal.jsx';
 import { getEffectiveShortcuts, getGroupedActions, ACTION_DEFS, SPECIAL_KEY_LABELS, parseModKey, modLabel } from '../utils/defaultShortcuts.js';
-import { DEFAULT_GTD_FOLDERS, GTD_STATES, resolveAccountGtdFolders, diffGtdFolders, findGtdFolderCollisions } from '../utils/gtd.js';
 import NativeUpdatePanel from './NativeUpdatePanel.jsx';
 import { unifiedUnreadTotal } from '../utils/unifiedInbox.js';
 import { isValidForwardAddress } from '../utils/ruleActions.js';
@@ -908,7 +909,7 @@ function AccountsTab() {
                   <option value="" style={{ background: 'var(--bg-tertiary)' }}>
                     {autoFolder ? `${t('admin.folderMappings.autoDetect')} (${autoFolder.path})` : t('admin.folderMappings.autoDetectNone')}
                   </option>
-                  {availableFolders.map(f => (
+                  {availableFolders.filter(f => !f.no_select).map(f => (
                     <option key={f.path} value={f.path} style={{ background: 'var(--bg-tertiary)' }}>
                       {f.path}
                     </option>
@@ -1327,7 +1328,7 @@ function FontsTab() {
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {Object.entries(FONT_SETS).map(([key, set]) => {
+        {Object.entries(FONT_SETS).filter(([key]) => !isRetroFont(key)).map(([key, set]) => {
           const isActive = fontSet === key;
           return (
             <button
@@ -2217,7 +2218,6 @@ function CardDavCard() {
         <div style={{ flex: 1 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>{t('admin.integrations.carddav.title')}</span>
-            <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4, background: 'rgba(99,102,241,0.15)', color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{t('todoist.betaLabel')}</span>
             <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: (!loading && connected) ? 'rgba(34,197,94,0.1)' : 'var(--bg-primary)', color: (!loading && connected) ? '#22c55e' : 'var(--text-tertiary)', border: `1px solid ${(!loading && connected) ? '#22c55e' : 'var(--border)'}` }}>
               {loading ? '...' : (connected ? t('admin.integrations.carddav.connected') : t('admin.integrations.carddav.notConnected'))}
             </span>
@@ -2344,6 +2344,12 @@ function IntegrationsTab() {
         })
         .catch(console.error)
         .finally(() => setLoading(false));
+      // Admins configure Microsoft OAuth via the DB form OR via env vars; the env-only case has no
+      // DB row, so also read the env-aware capability status (#359), otherwise the connect button
+      // stays wrongly disabled for admins while non-admins on the same instance can connect.
+      api.getIntegrationsStatus()
+        .then(data => setMsStatus(data.microsoft || null))
+        .catch(console.error);
     } else {
       // Non-admins can only read the capability status, not the config itself.
       api.getIntegrationsStatus()
@@ -2493,7 +2499,9 @@ function IntegrationsTab() {
     }
   };
 
-  const msConfigured = isAdmin ? configs.microsoft?.clientId : msStatus?.configured;
+  // Configured if the admin has a saved DB config OR the server has env-var config (#359);
+  // non-admins only ever have the env-aware capability status.
+  const msConfigured = (isAdmin ? configs.microsoft?.clientId : null) || msStatus?.configured;
 
   const subTabStyle = (key) => ({
     padding: '7px 14px',
@@ -2862,13 +2870,6 @@ function IntegrationsTab() {
                     {t('admin.integrations.todoist.title')}
                   </span>
                   <span style={{
-                    fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
-                    background: 'rgba(99,102,241,0.15)', color: 'var(--accent)',
-                    textTransform: 'uppercase', letterSpacing: '0.06em',
-                  }}>
-                    {t('todoist.betaLabel')}
-                  </span>
-                  <span style={{
                     fontSize: 11, padding: '2px 8px', borderRadius: 10,
                     background: (!tdLoading && tdConnected) ? 'rgba(34,197,94,0.1)' : 'var(--bg-primary)',
                     color: (!tdLoading && tdConnected) ? '#22c55e' : 'var(--text-tertiary)',
@@ -3105,6 +3106,7 @@ const emptyProvider = {
   scopes: 'openid email profile', provisioning_mode: 'login_existing_only',
   allowed_domains: '', enabled: true, require_email_verified: true, allow_insecure: false,
   admin_group_claim: '', admin_group_value: '', rp_initiated_logout: false,
+  login_match_claim: 'email',
 };
 
 function SSOTab() {
@@ -3174,7 +3176,7 @@ function SSOTab() {
     setError('');
   };
   const openEdit = (p) => {
-    setForm({ ...p, client_secret: '••••••••', allowed_domains: p.allowed_domains || '', require_email_verified: p.require_email_verified !== false, allow_insecure: p.allow_insecure === true, admin_group_claim: p.admin_group_claim || '', admin_group_value: p.admin_group_value || '', rp_initiated_logout: p.rp_initiated_logout === true });
+    setForm({ ...p, client_secret: '••••••••', allowed_domains: p.allowed_domains || '', require_email_verified: p.require_email_verified !== false, allow_insecure: p.allow_insecure === true, admin_group_claim: p.admin_group_claim || '', admin_group_value: p.admin_group_value || '', rp_initiated_logout: p.rp_initiated_logout === true, login_match_claim: p.login_match_claim || 'email' });
     setTemplateNote('');
     setEditing(p);
     setError('');
@@ -3205,6 +3207,7 @@ function SSOTab() {
         admin_group_claim: form.admin_group_claim.trim() || null,
         admin_group_value: form.admin_group_value.trim() || null,
         rp_initiated_logout: !!form.rp_initiated_logout,
+        login_match_claim: (form.login_match_claim || '').trim() || 'email',
         ...(form.client_secret && form.client_secret !== '••••••••' ? { client_secret: form.client_secret } : {}),
       };
       if (editing === 'new') {
@@ -3519,6 +3522,22 @@ function SSOTab() {
                 <option key={m.value} value={m.value}>{m.label}</option>
               ))}
             </select>
+          </Field>
+
+          <Field label={t('admin.sso.loginMatchClaim')}>
+            <input
+              value={form.login_match_claim}
+              onChange={e => setForm(f => ({ ...f, login_match_claim: e.target.value }))}
+              placeholder="email"
+              list="oidc-login-match-claims"
+              style={inputStyle}
+            />
+            <datalist id="oidc-login-match-claims">
+              <option value="email" />
+              <option value="preferred_username" />
+              <option value="upn" />
+            </datalist>
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>{t('admin.sso.loginMatchClaimDesc')}</div>
           </Field>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
@@ -4100,19 +4119,6 @@ function AiActionsTab() {
 function CategoriesSection({ initialSubTab }) {
   const { t } = useTranslation();
   const { accounts, categorizationEnabled, setCategorizationEnabled } = useStore();
-  // GTD settings live under Categories now, behind a local disclosure toggle.
-  // This toggle never writes to the backend — the per-account toggles inside
-  // GtdSection stay the real gates. Default open if any account already has GTD
-  // on; a manual choice is remembered in localStorage so it sticks across reopens.
-  const [gtdRevealed, setGtdRevealed] = useState(() => {
-    const stored = localStorage.getItem('mailflow_gtd_settings_reveal');
-    if (stored === '1') return true;
-    if (stored === '0') return false;
-    return accounts.some(a => a.gtd_enabled);
-  });
-  // True once the reveal was set by an explicit choice this session (manual toggle or the
-  // settings-search deep-link) — the accounts-arrived recompute below then stands down.
-  const gtdRevealTouched = useRef(false);
   const [sources, setSources] = useState([]);
   const [builtinSets, setBuiltinSets] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -4130,30 +4136,6 @@ function CategoriesSection({ initialSubTab }) {
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
-
-  // Arriving from the settings-search "GTD" result lands here and reveals the block.
-  useEffect(() => {
-    if (initialSubTab === 'gtd') { gtdRevealTouched.current = true; setGtdRevealed(true); }
-  }, [initialSubTab]);
-
-  // If the panel mounted before accounts resolved, gtdRevealed defaulted to collapsed even
-  // for a GTD user. Once accounts arrive, recompute the default — but only when the user has
-  // neither persisted a manual choice nor revealed/collapsed the block this session.
-  useEffect(() => {
-    if (gtdRevealTouched.current) return;
-    if (localStorage.getItem('mailflow_gtd_settings_reveal') != null) return;
-    if (accounts.length === 0) return;
-    setGtdRevealed(accounts.some(a => a.gtd_enabled));
-  }, [accounts]);
-
-  const handleToggleGtd = () => {
-    gtdRevealTouched.current = true;
-    setGtdRevealed(prev => {
-      const next = !prev;
-      localStorage.setItem('mailflow_gtd_settings_reveal', next ? '1' : '0');
-      return next;
-    });
-  };
 
   const enabledAccounts = categorizationEnabled ? accounts : accounts.filter(a => a.categorization_enabled);
   const addedBuiltins = new Set(sources.filter(s => s.source_type === 'builtin').map(s => s.value));
@@ -4385,349 +4367,105 @@ function CategoriesSection({ initialSubTab }) {
         </>
       )}
 
-      <div style={{ height: 1, background: 'var(--border-subtle)', margin: '24px 0 20px' }} />
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: gtdRevealed ? 20 : 0 }}>
-        <button
-          type="button"
-          onClick={handleToggleGtd}
-          style={{
-            width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer', padding: 0,
-            background: gtdRevealed ? 'var(--accent)' : TOGGLE_OFF_BACKGROUND,
-            position: 'relative', transition: 'background 0.2s', flexShrink: 0, marginTop: 1,
-          }}
-        >
-          <span style={{
-            position: 'absolute', top: 2, left: gtdRevealed ? 18 : 2, width: 16, height: 16,
-            borderRadius: '50%', background: 'white', transition: 'left 0.2s',
-          }} />
-        </button>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <span style={{ fontSize: 13, color: 'var(--text-primary)', fontWeight: 500 }}>{t('admin.categories.gtdReveal')}</span>
-            <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', padding: '1px 4px', borderRadius: 3, background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)' }}>BETA</span>
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>{t('admin.categories.gtdRevealDesc')}</div>
-        </div>
-      </div>
-
-      {gtdRevealed && <GtdSection />}
+      {/* Plugins that contribute settings under the Categories tab (currently GTD). Rendered only
+          while the plugin is activated; core knows nothing plugin-specific here. */}
+      <PluginSlot name="settings-categories" ctx={{ initialSubTab }} />
     </div>
   );
 }
 
-// ─── GTD Section ──────────────────────────────────────────────────────────────
-function GtdSection() {
+// ─── Plugins Section ──────────────────────────────────────────────────────────
+// Plugins settings tab — lists the plugins registered in this build and lets the user activate/
+// deactivate each for themselves. Activation is per-user (persisted server-side) and independent of
+// a plugin's own per-account config; deactivating hides that plugin's UI and makes it inert.
+function PluginsSection({ onNavigate }) {
   const { t } = useTranslation();
-  const { accounts } = useStore();
+  const enabledPlugins = useStore(s => s.enabledPlugins);
+  const setPluginActivated = useStore(s => s.setPluginActivated);
+  const [manifests, setManifests] = useState(null); // null = loading
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api.plugins.list()
+      .then(list => { if (alive) setManifests(Array.isArray(list) ? list : []); })
+      .catch(() => { if (alive) { setManifests([]); setError(true); } });
+    return () => { alive = false; };
+  }, []);
+
+  const toggle = async (id, next) => {
+    setBusyId(id);
+    setError(false);
+    try { await setPluginActivated(id, next); }
+    catch { setError(true); }
+    finally { setBusyId(null); }
+  };
 
   return (
     <div>
-      <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 0, marginBottom: 20 }}>
-        {t('admin.gtd.description')}
-      </p>
-      {accounts.length === 0 ? (
-        <p style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>{t('admin.gtd.noAccounts')}</p>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {accounts.map(account => <GtdAccountBlock key={account.id} account={account} />)}
-        </div>
+      <h2 style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)', margin: '0 0 4px' }}>{t('admin.plugins.title')}</h2>
+      <p style={{ fontSize: 13, color: 'var(--text-tertiary)', margin: '0 0 20px', lineHeight: 1.5 }}>{t('admin.plugins.description')}</p>
+
+      {error && (
+        <div style={{ fontSize: 12, color: 'var(--danger, #d94a4a)', marginBottom: 12 }}>{t('admin.plugins.error')}</div>
+      )}
+      {manifests === null && (
+        <div style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
+      )}
+      {manifests && manifests.length === 0 && !error && (
+        <div style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>{t('admin.plugins.empty')}</div>
       )}
 
-      <GtdPetBlock />
-    </div>
-  );
-}
-
-// Read a File as a base64 data-URL (data:<mime>;base64,…), the transport the import
-// route expects for the spritesheet bytes.
-function readFileAsDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error('Could not read file'));
-    reader.readAsDataURL(file);
-  });
-}
-
-// User-level (not per-account) cosmetic: the inbox-zero pet. Import your own by uploading
-// pet.json + a spritesheet directly; the chosen slug persists as a flat user preference.
-// The preview reuses the live GtdZeroPet, so it shows the dog when cleared and the chosen
-// pet (hover to animate) once set.
-function GtdPetBlock() {
-  const { t } = useTranslation();
-  const gtdPetSlug = useStore(s => s.gtdPetSlug);
-  const setGtdPetSlug = useStore(s => s.setGtdPetSlug);
-  const [msg, setMsg] = useState(null);
-  const [petJsonFile, setPetJsonFile] = useState(null);
-  const [sheetFile, setSheetFile] = useState(null);
-  const [importing, setImporting] = useState(false);
-  // Bumped after a successful import to remount the file inputs empty (a file input's
-  // value can't be set programmatically, so a changed key is the clean reset).
-  const [fileResetKey, setFileResetKey] = useState(0);
-
-  const handleImport = async () => {
-    if (!petJsonFile || !sheetFile) return;
-    setImporting(true); setMsg(null);
-    try {
-      const petJson = await petJsonFile.text();
-      const sheet = await readFileAsDataURL(sheetFile);
-      const pet = await api.importGtdPet({ petJson, sheet });
-      setGtdPetSlug(pet.slug);
-      setPetJsonFile(null); setSheetFile(null); setFileResetKey(k => k + 1);
-      setMsg({ type: 'ok', text: t('admin.gtd.pet.imported', { name: pet.displayName || pet.slug }) });
-    } catch (err) {
-      setMsg({ type: 'error', text: err.message || t('admin.gtd.pet.importFailed') });
-    } finally { setImporting(false); }
-  };
-
-  const handleClear = () => { setGtdPetSlug(null); setMsg(null); };
-
-  const fileLabelStyle = { fontSize: 11, color: 'var(--text-tertiary)', display: 'block', marginBottom: 4 };
-
-  return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px', background: 'var(--bg-secondary)', marginTop: 16 }}>
-      <div style={{ fontSize: 13, color: 'var(--text-primary)', fontWeight: 500 }}>{t('admin.gtd.pet.title')}</div>
-      <p style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4, marginBottom: 12 }}>{t('admin.gtd.pet.description')}</p>
-
-      <div>
-        <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 500 }}>{t('admin.gtd.pet.importTitle')}</div>
-        <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4, marginBottom: 10 }}>{t('admin.gtd.pet.importHint')}</p>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <div>
-            <label style={fileLabelStyle}>{t('admin.gtd.pet.chooseJson')}</label>
-            <input
-              key={`petjson-${fileResetKey}`}
-              type="file"
-              accept=".json,application/json"
-              aria-label={t('admin.gtd.pet.chooseJson')}
-              onChange={e => setPetJsonFile(e.target.files?.[0] || null)}
-              style={{ fontSize: 12, color: 'var(--text-secondary)' }}
-            />
-          </div>
-          <div>
-            <label style={fileLabelStyle}>{t('admin.gtd.pet.chooseSheet')}</label>
-            <input
-              key={`sheet-${fileResetKey}`}
-              type="file"
-              accept="image/png,image/webp,image/gif"
-              aria-label={t('admin.gtd.pet.chooseSheet')}
-              onChange={e => setSheetFile(e.target.files?.[0] || null)}
-              style={{ fontSize: 12, color: 'var(--text-secondary)' }}
-            />
-          </div>
-        </div>
-
-        <button onClick={handleImport} disabled={importing || !petJsonFile || !sheetFile} style={{
-          marginTop: 12, padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 6,
-          color: 'white', fontSize: 13, whiteSpace: 'nowrap',
-          cursor: (importing || !petJsonFile || !sheetFile) ? 'default' : 'pointer',
-          opacity: (importing || !petJsonFile || !sheetFile) ? 0.5 : 1,
-        }}>
-          {importing ? t('admin.gtd.pet.importing') : t('admin.gtd.pet.import')}
-        </button>
-      </div>
-
-      {msg && (
-        <div style={{ padding: '7px 11px', borderRadius: 6, marginTop: 10, fontSize: 12,
-          background: msg.type === 'ok' ? 'rgba(74,222,128,0.1)' : 'rgba(248,113,113,0.1)',
-          color: msg.type === 'ok' ? 'var(--green)' : 'var(--red)',
-          border: `1px solid ${msg.type === 'ok' ? 'rgba(74,222,128,0.2)' : 'rgba(248,113,113,0.2)'}`,
-        }}>{msg.text}</div>
-      )}
-
-      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginTop: 14 }}>
-        <div style={{ width: 88, height: 88, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)', borderRadius: 8, flexShrink: 0 }}>
-          <GtdZeroPet size={72} />
-        </div>
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-            {gtdPetSlug ? t('admin.gtd.pet.current', { slug: gtdPetSlug }) : t('admin.gtd.pet.usingDog')}
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>{t('admin.gtd.pet.hoverHint')}</div>
-          {gtdPetSlug && (
-            <button onClick={handleClear} style={{
-              marginTop: 8, padding: '5px 12px', background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
-              borderRadius: 6, color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer',
-            }}>
-              {t('admin.gtd.pet.clear')}
+      {manifests && manifests.map(p => {
+        const on = enabledPlugins.includes(p.id);
+        const busy = busyId === p.id;
+        return (
+          <div key={p.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '14px 0', borderBottom: '1px solid var(--border-subtle)' }}>
+            <button
+              type="button"
+              onClick={() => toggle(p.id, !on)}
+              disabled={busy}
+              aria-pressed={on}
+              aria-label={p.name}
+              style={{
+                width: 36, height: 20, borderRadius: 10, border: 'none', cursor: busy ? 'default' : 'pointer', padding: 0,
+                background: on ? 'var(--accent)' : TOGGLE_OFF_BACKGROUND,
+                position: 'relative', transition: 'background 0.2s', flexShrink: 0, marginTop: 1, opacity: busy ? 0.6 : 1,
+              }}
+            >
+              <span style={{ position: 'absolute', top: 2, left: on ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s' }} />
             </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Per-account GTD block: an enable toggle, and (only while enabled) the five
-// state→folder inputs with "save" + "create missing folders" actions. A disabled
-// account shows just the toggle so the tab stays quiet for non-GTD accounts.
-function GtdAccountBlock({ account }) {
-  const { t } = useTranslation();
-  const { updateAccount } = useStore();
-  const enabled = !!account.gtd_enabled;
-  const [folders, setFolders] = useState(() => resolveAccountGtdFolders(account));
-  const [toggling, setToggling] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [msg, setMsg] = useState(null);
-  // Set right before handleCreate's own updateAccount so the re-seed effect below skips
-  // that one self-inflicted gtd_folders change — which would otherwise stomp fields the
-  // user is mid-editing. External gtd_folders changes still re-seed as normal.
-  const skipReseedRef = useRef(false);
-
-  // Re-seed the inputs when the stored mapping changes (e.g. after a save round-trip).
-  // Intentionally keyed on gtd_folders only — reacting to the whole account object
-  // would clobber in-progress edits on unrelated account updates.
-  useEffect(() => {
-    if (skipReseedRef.current) { skipReseedRef.current = false; return; }
-    setFolders(resolveAccountGtdFolders(account));
-  }, [account.gtd_folders]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const handleToggle = async () => {
-    if (toggling) return;
-    const next = !enabled;
-    setToggling(true); setMsg(null);
-    try {
-      await api.updateAccount(account.id, { gtd_enabled: next });
-      updateAccount(account.id, { gtd_enabled: next });
-    } catch (err) {
-      setMsg({ type: 'error', text: err.message });
-    } finally { setToggling(false); }
-  };
-
-  // Comma-joined, translated state labels for the collision / rejection notices.
-  const stateNames = (states) => [...new Set(states)].map(s => t(`gtd.state.${s}`)).join(', ');
-
-  const handleSave = async () => {
-    // Mirror the backend guard: block a save that would point two states at the same
-    // folder (which would double-list every thread there across two rail/tab sections).
-    const collisions = findGtdFolderCollisions(folders);
-    if (collisions.length) {
-      setMsg({ type: 'error', text: t('admin.gtd.duplicateFolder', { states: stateNames(collisions.flatMap(c => c.states)) }) });
-      return;
-    }
-    setSaving(true); setMsg(null);
-    try {
-      const gtd_folders = diffGtdFolders(folders);
-      const res = await api.updateAccount(account.id, { gtd_folders });
-      updateAccount(account.id, { gtd_folders });
-      // Some submitted names may have been rejected (over-long / traversal) and reset
-      // to defaults — surface which so the user knows their input didn't stick.
-      const rejected = res?.gtd_folders_rejected;
-      if (rejected?.length) {
-        setMsg({ type: 'error', text: t('admin.gtd.rejectedFolders', { states: stateNames(rejected) }) });
-      } else {
-        setMsg({ type: 'ok', text: t('admin.gtd.savedOk') });
-      }
-    } catch {
-      setMsg({ type: 'error', text: t('admin.gtd.saveFailed') });
-    } finally { setSaving(false); }
-  };
-
-  const handleCreate = async () => {
-    setCreating(true); setMsg(null);
-    try {
-      const { results, folders: persisted } = await api.gtdEnsureFolders(account.id, diffGtdFolders(folders));
-      const created = results.filter(r => r.created).length;
-      const existing = results.filter(r => !r.created && !r.error).length;
-      // On a prefixed-namespace server the folders land under a real path (INBOX.Todo) and
-      // the backend persists those effective paths; reflect them so the inputs show where
-      // labels actually live. Merge the returned states directly onto the current form so a
-      // field the user is mid-editing (that ensure didn't return) survives, and suppress the
-      // re-seed effect for this self-inflicted account update so it can't stomp those edits.
-      if (persisted) {
-        skipReseedRef.current = true;
-        setFolders(prev => ({ ...prev, ...persisted }));
-        updateAccount(account.id, { gtd_folders: persisted });
-      }
-      setMsg({ type: 'ok', text: t('admin.gtd.createResult', { created, existing }) });
-    } catch (err) {
-      // The 400 collision case carries a specific server message (e.g. which two states
-      // clash); show it over the generic fallback. English-only — acceptable for this
-      // admin-surface error detail, so no new i18n key.
-      setMsg({ type: 'error', text: err.message || t('admin.gtd.createFailed') });
-    } finally { setCreating(false); }
-  };
-
-  const inputStyle = { width: '100%', background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6, padding: '6px 9px', color: 'var(--text-primary)', fontSize: 13, boxSizing: 'border-box' };
-
-  return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px', background: 'var(--bg-secondary)' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <button
-          type="button"
-          disabled={toggling}
-          onClick={handleToggle}
-          style={{
-            width: 36, height: 20, borderRadius: 10, border: 'none', cursor: toggling ? 'default' : 'pointer', padding: 0,
-            background: enabled ? 'var(--accent)' : TOGGLE_OFF_BACKGROUND,
-            position: 'relative', transition: 'background 0.2s', flexShrink: 0,
-          }}
-        >
-          <span style={{
-            position: 'absolute', top: 2, left: enabled ? 18 : 2, width: 16, height: 16,
-            borderRadius: '50%', background: 'white', transition: 'left 0.2s',
-          }} />
-        </button>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13, color: 'var(--text-primary)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {account.name || account.email_address}
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>
-            {enabled ? t('admin.gtd.enableDesc') : t('admin.gtd.enableHint')}
-          </div>
-        </div>
-      </div>
-
-      {enabled && (
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--text-secondary)', marginBottom: 4 }}>
-            {t('admin.gtd.foldersTitle')}
-          </div>
-          <p style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 0, marginBottom: 12 }}>
-            {t('admin.gtd.foldersDesc')}
-          </p>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12 }}>
-            {GTD_STATES.map(state => (
-              <div key={state} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <label style={{ flex: '0 0 96px', fontSize: 12, color: 'var(--text-secondary)' }}>
-                  {t(`gtd.state.${state}`)}
-                </label>
-                <input
-                  value={folders[state] ?? ''}
-                  onChange={e => setFolders(prev => ({ ...prev, [state]: e.target.value }))}
-                  placeholder={DEFAULT_GTD_FOLDERS[state]}
-                  style={{ ...inputStyle, flex: 1 }}
-                />
+            <div style={{ minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                <span style={{ fontSize: 14, color: 'var(--text-primary)', fontWeight: 500 }}>{p.name}</span>
+                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>v{p.version}</span>
               </div>
-            ))}
+              {(() => {
+                const loc = getPluginMeta(p.id)?.settingsLocation;
+                // Activated + has a settings home → a clickable pointer to it. Activated with no
+                // settings, or not activated → a plain status line.
+                if (on && loc && onNavigate) {
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate(loc.tab, loc.subtab)}
+                      style={{ marginTop: 3, padding: 0, border: 'none', background: 'none', cursor: 'pointer', fontSize: 12, color: 'var(--accent)', textAlign: 'left' }}
+                    >
+                      {t('admin.plugins.configureIn', { location: t(loc.labelKey) })} →
+                    </button>
+                  );
+                }
+                return (
+                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>
+                    {on ? t('admin.plugins.activated') : t('admin.plugins.deactivated')}
+                  </div>
+                );
+              })()}
+            </div>
           </div>
-
-          {msg && (
-            <div style={{ padding: '7px 11px', borderRadius: 6, marginBottom: 10, fontSize: 12,
-              background: msg.type === 'ok' ? 'rgba(74,222,128,0.1)' : 'rgba(248,113,113,0.1)',
-              color: msg.type === 'ok' ? 'var(--green)' : 'var(--red)',
-              border: `1px solid ${msg.type === 'ok' ? 'rgba(74,222,128,0.2)' : 'rgba(248,113,113,0.2)'}`,
-            }}>{msg.text}</div>
-          )}
-
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={handleSave} disabled={saving} style={{
-              padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 6,
-              color: 'white', fontSize: 13, cursor: saving ? 'default' : 'pointer', opacity: saving ? 0.5 : 1,
-            }}>
-              {saving ? t('common.saving') : t('common.save')}
-            </button>
-            <button onClick={handleCreate} disabled={creating} style={{
-              padding: '7px 14px', background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6,
-              color: 'var(--text-secondary)', fontSize: 13, cursor: creating ? 'default' : 'pointer', opacity: creating ? 0.5 : 1,
-            }}>
-              {creating ? t('admin.gtd.creating') : t('admin.gtd.createFolders')}
-            </button>
-          </div>
-        </div>
-      )}
+        );
+      })}
     </div>
   );
 }
@@ -5736,6 +5474,8 @@ const LANGUAGES = [
   { code: 'it', nativeName: 'Italiano' },
   { code: 'ru', nativeName: 'Русский' },
   { code: 'zhCN', nativeName: '简体中文'},
+  { code: 'pl', nativeName: 'Polski' },
+  { code: 'cs', nativeName: 'Čeština' },
 ];
 
 function LanguageTab() {
@@ -5800,6 +5540,7 @@ function SubTabs({ tabs, initialTab }) {
         {tabs.map(tab => (
           <button
             key={tab.id}
+            className={active === tab.id ? 'admin-subtab admin-subtab-active' : 'admin-subtab'}
             onClick={() => setActive(tab.id)}
             style={{
               padding: '8px 16px',
@@ -5858,6 +5599,7 @@ function SecurityPrivacyTab({ initialSubTab }) {
 function AboutTab() {
   const { t } = useTranslation();
   const [info, setInfo] = useState(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   useEffect(() => {
     fetch('/api/version')
@@ -5928,6 +5670,21 @@ function AboutTab() {
         ))}
       </div>
       <NativeUpdatePanel />
+
+      <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', margin: '18px 0 8px 4px' }}>
+        {t('diagnostics.section')}
+      </div>
+      <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', margin: '0 4px 10px', lineHeight: 1.5 }}>
+        {t('diagnostics.blurb')}
+      </div>
+      <button
+        onClick={() => setShowDiagnostics(true)}
+        style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-primary)', fontSize: 13, cursor: 'pointer' }}
+      >
+        {t('diagnostics.generateReport')}
+      </button>
+
+      {showDiagnostics && <DiagnosticsReportModal onClose={() => setShowDiagnostics(false)} />}
     </div>
   );
 }
@@ -6683,10 +6440,190 @@ function RulesAndBlockListTab({ initialSubTab }) {
   );
 }
 
+// Mailbox Cleanup: analyze an INBOX for bulk-mail bloat and move a chosen sender's mail to Trash.
+// All analysis is read-only; the destructive step reuses the existing, proven bulkDelete (move to
+// Trash, recoverable) in <=500-id batches. Scope is enforced server-side (own account, INBOX, exact
+// sender), and the operation is idempotent: re-running a cleared sender finds nothing.
+function MailboxCleanupTab() {
+  const { t } = useTranslation();
+  const { accounts } = useStore();
+  const [accountId, setAccountId] = useState(accounts[0]?.id || '');
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [busySender, setBusySender] = useState('');
+  const [progress, setProgress] = useState(null);
+  // Cleanup action for the whole view (#403): Archive is the default and recommended
+  // choice; Trash stays available as an explicit alternative. One selector governs
+  // every sender row, not a per-row pair of buttons.
+  const [action, setAction] = useState('archive');
+  const archiveAvailable = data ? data.archiveAvailable !== false : true;
+  // If the selected account has no archive folder, Archive isn't a usable action —
+  // fall back to Trash so the row button never runs an action the server can't honor.
+  useEffect(() => { if (data && data.archiveAvailable === false) setAction('trash'); }, [data]);
+
+  // Re-fetch the summary/sender data without touching the error banner or the loading
+  // spinner, so a caller that just wants fresh counts (after a cleanup, including a partial
+  // failure) can refresh without clobbering an error it already set.
+  const fetchUsage = useCallback(async (id) => {
+    setData(await api.mailboxUsage(id));
+  }, []);
+
+  const load = useCallback(async (id) => {
+    if (!id) return;
+    setLoading(true); setError('');
+    try { await fetchUsage(id); }
+    catch (e) { setError(e.message); setData(null); }
+    finally { setLoading(false); }
+  }, [fetchUsage]);
+
+  useEffect(() => { if (accountId) load(accountId); }, [accountId, load]);
+
+  const cleanupSender = async (s) => {
+    const isArchive = action === 'archive';
+    const label = s.fromName ? `${s.fromName} <${s.fromEmail}>` : s.fromEmail;
+    const confirmKey = isArchive ? 'admin.cleanup.confirmArchive' : 'admin.cleanup.confirm';
+    if (!window.confirm(t(confirmKey, { count: s.count, sender: label }))) return;
+    setBusySender(s.fromEmail); setError(''); setProgress({ done: 0, total: s.count });
+    try {
+      const { ids } = await api.cleanupPreview(accountId, s.fromEmail);
+      const runBatch = isArchive ? api.bulkArchive : api.bulkDelete;
+      let done = 0;
+      for (let i = 0; i < ids.length; i += 500) {
+        const batch = ids.slice(i, i + 500);
+        await runBatch(batch);
+        done += batch.length;
+        setProgress({ done, total: ids.length });
+      }
+    } catch (e) { setError(e.message); }
+    finally {
+      // Always refresh counts so the summary reflects what actually got archived or trashed,
+      // even on a partial failure; preserve any error already set (don't route through load()).
+      try { await fetchUsage(accountId); } catch { /* keep the primary error and last-good data */ }
+      setBusySender(''); setProgress(null);
+    }
+  };
+
+  const bloatPct = data && data.inboxTotal ? Math.round((data.bulkTotal / data.inboxTotal) * 100) : 0;
+  const card = { background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)', borderRadius: 10, padding: 14, marginBottom: 16 };
+  const muted = { fontSize: 12, color: 'var(--text-tertiary)' };
+
+  return (
+    <div>
+      <h2 style={{ fontSize: 18, fontWeight: 600, margin: '0 0 6px' }}>{t('admin.cleanup.title')}</h2>
+      <p style={{ ...muted, marginTop: 0, marginBottom: 16, lineHeight: 1.5 }}>{t('admin.cleanup.intro')}</p>
+
+      {accounts.length > 1 && (
+        <Field label={t('admin.cleanup.account')}>
+          <select value={accountId} onChange={e => setAccountId(e.target.value)} style={{ ...inputStyle, appearance: 'none' }}>
+            {accounts.map(a => <option key={a.id} value={a.id}>{a.email_address}</option>)}
+          </select>
+        </Field>
+      )}
+
+      {loading && <div style={muted}>{t('common.loading')}</div>}
+      {error && <div style={{ color: 'var(--red, #ef4444)', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+
+      {data && !loading && (
+        <>
+          <div style={card}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
+              {t('admin.cleanup.summary', { bulk: data.bulkTotal.toLocaleString(), total: data.inboxTotal.toLocaleString(), pct: bloatPct })}
+            </div>
+          </div>
+
+          <Field label={t('admin.cleanup.action')}>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {[
+                { key: 'archive', label: t('admin.cleanup.actionArchive'), disabled: !archiveAvailable },
+                { key: 'trash', label: t('admin.cleanup.moveToTrash'), disabled: false },
+              ].map(opt => {
+                const selected = action === opt.key;
+                return (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    disabled={opt.disabled || !!busySender}
+                    onClick={() => setAction(opt.key)}
+                    style={{
+                      padding: '7px 14px', borderRadius: 7, fontSize: 13, fontWeight: 500,
+                      cursor: (opt.disabled || busySender) ? 'not-allowed' : 'pointer',
+                      border: `1px solid ${selected ? 'var(--accent)' : 'var(--border)'}`,
+                      background: selected ? 'var(--accent)' : 'var(--bg-secondary)',
+                      color: selected ? 'var(--accent-text, white)' : 'var(--text-secondary)',
+                      opacity: opt.disabled ? 0.5 : 1,
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            {!archiveAvailable && (
+              <div style={{ ...muted, marginTop: 8 }}>{t('admin.cleanup.noArchiveFolder')}</div>
+            )}
+          </Field>
+
+          <h3 style={{ fontSize: 14, fontWeight: 600, margin: '0 0 4px' }}>{t('admin.cleanup.tier1Title')}</h3>
+          <p style={{ ...muted, marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>{t('admin.cleanup.tier1Desc')}</p>
+          {data.tier1Senders.length === 0 ? (
+            <div style={muted}>{t('admin.cleanup.noneFound')}</div>
+          ) : (
+            <div style={{ marginBottom: 20 }}>
+              {data.tier1Senders.map(s => (
+                <div key={s.fromEmail} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 4px', borderBottom: '1px solid var(--border-subtle)' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.fromName || s.fromEmail}</div>
+                    {s.fromName && <div style={{ ...muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.fromEmail}</div>}
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-secondary)', flexShrink: 0 }}>{s.count.toLocaleString()}</div>
+                  <button
+                    type="button"
+                    disabled={!!busySender}
+                    onClick={() => cleanupSender(s)}
+                    style={{
+                      flexShrink: 0, padding: '6px 12px', borderRadius: 7, fontSize: 12, fontWeight: 500,
+                      border: '1px solid var(--border)', cursor: busySender ? 'not-allowed' : 'pointer',
+                      background: busySender === s.fromEmail
+                        ? 'var(--bg-tertiary)'
+                        : (action === 'archive' ? 'var(--accent)' : 'var(--amber, #d97706)'),
+                      color: busySender === s.fromEmail
+                        ? 'var(--text-secondary)'
+                        : (action === 'archive' ? 'var(--accent-text, white)' : 'white'),
+                      opacity: busySender && busySender !== s.fromEmail ? 0.5 : 1,
+                    }}
+                  >
+                    {busySender === s.fromEmail
+                      ? (progress ? `${progress.done.toLocaleString()}/${progress.total.toLocaleString()}` : '...')
+                      : t(action === 'archive' ? 'admin.cleanup.archive' : 'admin.cleanup.moveToTrash')}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <h3 style={{ fontSize: 14, fontWeight: 600, margin: '0 0 4px' }}>{t('admin.cleanup.tier2Title')}</h3>
+          <p style={{ ...muted, marginTop: 0, marginBottom: 10, lineHeight: 1.5 }}>{t('admin.cleanup.tier2Desc')}</p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 20 }}>
+            {data.tier2Keywords.filter(k => k.count > 0).map(k => (
+              <span key={k.keyword} style={{ fontSize: 12, padding: '4px 10px', borderRadius: 20, background: 'var(--bg-tertiary)', border: '1px solid var(--border-subtle)', color: 'var(--text-secondary)' }}>
+                {k.keyword} <span style={{ color: 'var(--text-tertiary)' }}>({k.count.toLocaleString()})</span>
+              </span>
+            ))}
+          </div>
+
+          <h3 style={{ fontSize: 14, fontWeight: 600, margin: '0 0 4px' }}>{t('admin.cleanup.tier3Title')}</h3>
+          <p style={{ ...muted, marginTop: 0, lineHeight: 1.5 }}>{t('admin.cleanup.tier3Desc')}</p>
+        </>
+      )}
+    </div>
+  );
+}
+
 const TAB_GROUPS = [
-  { id: 'account-mail', labelKey: 'admin.tabs.groupAccountMail', tabIds: ['accounts', 'notifications', 'rules', 'categories'] },
+  { id: 'account-mail', labelKey: 'admin.tabs.groupAccountMail', tabIds: ['accounts', 'notifications', 'rules', 'categories', 'cleanup'] },
   { id: 'display', labelKey: 'admin.tabs.groupDisplay', tabIds: ['appearance', 'shortcuts'] },
-  { id: 'security-integrations', labelKey: 'admin.tabs.groupSecurityIntegrations', tabIds: ['security', 'integrations', 'ai', 'ai-actions'] },
+  { id: 'security-integrations', labelKey: 'admin.tabs.groupSecurityIntegrations', tabIds: ['security', 'integrations', 'ai', 'ai-actions', 'plugins'] },
   { id: 'admin', labelKey: 'admin.tabs.groupAdmin', tabIds: ['users', 'sso'] },
 ];
 
@@ -6705,8 +6642,12 @@ const TABS = [
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>,
   },
   {
-    id: 'categories', labelKey: 'admin.tabs.categories', beta: true,
+    id: 'categories', labelKey: 'admin.tabs.categories',
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
+  },
+  {
+    id: 'cleanup', labelKey: 'admin.tabs.cleanup', beta: true,
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M19 3l-6 6"/><path d="M14 4l6 6"/><path d="M11 8l-7 7c-1 1-1 3 0 4s3 1 4 0l7-7"/><path d="M6 20l-3-3"/></svg>,
   },
   // Display
   {
@@ -6728,13 +6669,17 @@ const TABS = [
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><circle cx="12" cy="12" r="3"/><path d="M6.343 6.343a8 8 0 000 11.314M17.657 6.343a8 8 0 010 11.314M3 12h1m16 0h1M12 3v1m0 16v1"/></svg>,
   },
   {
-    id: 'ai', labelKey: 'admin.tabs.ai', beta: true,
+    id: 'ai', labelKey: 'admin.tabs.ai',
     adminOnly: true,
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></svg>,
   },
   {
-    id: 'ai-actions', labelKey: 'admin.tabs.aiActions', beta: true,
+    id: 'ai-actions', labelKey: 'admin.tabs.aiActions',
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h.01M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></svg>,
+  },
+  {
+    id: 'plugins', labelKey: 'admin.tabs.plugins', beta: true,
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M6 3v6M18 3v6M6 21v-6M18 21v-6M4 9h16v3a6 6 0 01-6 6h-4a6 6 0 01-6-6V9z"/></svg>,
   },
   // Admin
   {
@@ -8208,12 +8153,13 @@ function makeSearchIndex(t) {
     { label: t('admin.messageList.defaultReplyAction'), keywords: ['reply', 'reply all', 'default reply'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.markReadBehavior'), keywords: ['mark read', 'mark as read', 'read delay', 'auto read', 'manual read', 'unread'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     // Appearance > Fonts & Language
-    { label: t('admin.appearance.language'), keywords: ['language', 'locale', 'french', 'english', 'spanish', 'german', 'deutsch', 'russian', 'chinese', 'italian', 'français', 'español'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
+    { label: t('admin.appearance.language'), keywords: ['language', 'locale', 'french', 'english', 'spanish', 'german', 'deutsch', 'russian', 'chinese', 'italian', 'czech', 'čeština', 'français', 'español'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
     { label: t('admin.appearance.fontSize'), keywords: ['font size', 'text size', 'zoom', 'scale', 'accessibility', 'larger text'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
     { label: t('admin.appearance.typography'), keywords: ['font', 'typography', 'typeface', 'serif', 'sans', 'monospace', 'reading font'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
     // Integrations
     { label: t('admin.integrations.microsoft.title'), keywords: ['microsoft', 'outlook', '365', 'oauth', 'azure', 'client id', 'tenant', 'ms365', 'office'], tab: 'integrations', breadcrumb: tabLabel('integrations') },
     { label: t('admin.ai.title'), keywords: ['ai', 'artificial intelligence', 'chatgpt', 'ollama', 'llm', 'language model', 'summarize', 'draft', 'compose assistant', 'openai', 'local ai', 'inference', 'gpt'], tab: 'ai', adminOnly: true, breadcrumb: tabLabel('ai') },
+    { label: t('admin.plugins.title'), keywords: ['plugin', 'plugins', 'extension', 'extensions', 'add-on', 'addon', 'gtd', 'activate', 'enable feature', 'modules'], tab: 'plugins', breadcrumb: tabLabel('plugins') },
     { label: t('admin.categories.title'), keywords: ['categories', 'categorize', 'newsletter', 'promotion', 'social', 'automated', 'inbox tabs', 'sort emails', 'classify'], tab: 'categories', breadcrumb: tabLabel('categories') },
     { label: t('admin.categories.gtdReveal'), keywords: ['gtd', 'todo', 'getting things done', 'watch', 'delegated', 'someday', 'reference', 'next action', 'waiting', 'inbox zero', 'pet'], tab: 'categories', subtab: 'gtd', breadcrumb: `${tabLabel('categories')} › ${t('admin.categories.gtdReveal')}` },
     // Security
@@ -8351,6 +8297,7 @@ export default function AdminPanel() {
       {adminTab === 'accounts' && <AccountsTab />}
       {adminTab === 'rules' && <RulesAndBlockListTab initialSubTab={pendingSubTab} />}
       {adminTab === 'categories' && <CategoriesSection initialSubTab={pendingSubTab} />}
+      {adminTab === 'cleanup' && <MailboxCleanupTab />}
       {adminTab === 'appearance' && <AppearanceTab initialSubTab={pendingSubTab} />}
       {adminTab === 'integrations' && <IntegrationsTab />}
       {adminTab === 'users' && <UsersTab />}
@@ -8360,13 +8307,14 @@ export default function AdminPanel() {
       {adminTab === 'shortcuts' && !isMobile && <ShortcutsTab />}
       {adminTab === 'ai' && <AISection />}
       {adminTab === 'ai-actions' && <AiActionsTab />}
+      {adminTab === 'plugins' && <PluginsSection onNavigate={navigateTo} />}
       {adminTab === 'about' && <AboutTab />}
     </>
   );
 
   if (isMobile) {
     return (
-      <div style={{
+      <div className="admin-panel" style={{
         position: 'fixed', inset: 0, zIndex: 2000,
         background: 'var(--bg-secondary)',
         display: 'flex', flexDirection: 'column',
@@ -8411,6 +8359,7 @@ export default function AdminPanel() {
             {visibleTabs.map(tab => (
               <button
                 key={tab.id}
+                className={adminTab === tab.id && !searchResults ? 'admin-tab admin-tab-active' : 'admin-tab'}
                 onClick={() => handleTabClick(tab.id)}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 6,
@@ -8459,16 +8408,16 @@ export default function AdminPanel() {
         animation: 'backdrop-enter var(--motion-fast) var(--ease-standard) both',
       }}
     >
-      <div style={{
+      <div className="admin-panel admin-window" style={{
         background: 'var(--bg-secondary)', border: '1px solid var(--border)',
-        borderRadius: 16, width: '100%', maxWidth: 680,
+        borderRadius: 16, width: '100%', maxWidth: 740,
         height: '82vh', maxHeight: 700, display: 'flex', overflow: 'hidden',
         boxShadow: 'var(--shadow-modal)',
         animation: 'modal-enter var(--motion-normal) var(--ease-emphasized) both',
       }}>
         {/* Left sidebar */}
         <div style={{
-          width: 180, borderRight: '1px solid var(--border-subtle)',
+          width: 216, borderRight: '1px solid var(--border-subtle)',
           background: 'var(--bg-primary)', padding: '20px 10px',
           display: 'flex', flexDirection: 'column', flexShrink: 0,
         }}>
@@ -8476,6 +8425,12 @@ export default function AdminPanel() {
             {searchInput(true)}
           </div>
 
+          {/* Scrollable tab list — keeps the Close button pinned even when the tab list is taller
+              than the modal (e.g. once several plugins/beta tabs are present). */}
+          {/* overflowX hidden: overflowY:auto would otherwise promote overflow-x to auto too, so a
+              long label in any locale (e.g. German "Tastaturkürzel") would show a horizontal
+              scrollbar. Labels wrap instead of overflowing (see the tab buttons below). */}
+          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
           {TAB_GROUPS.map((group, gi) => {
             const groupTabs = visibleTabs.filter(tab => group.tabIds.includes(tab.id));
             if (groupTabs.length === 0) return null;
@@ -8483,7 +8438,7 @@ export default function AdminPanel() {
               <div key={group.id} style={{ marginBottom: gi < TAB_GROUPS.length - 1 ? 4 : 0 }}>
                 <div style={{
                   fontSize: 10, fontWeight: 700, color: 'var(--text-secondary)',
-                  letterSpacing: '0.07em', textTransform: 'uppercase',
+                  letterSpacing: '0.07em', textTransform: 'uppercase', overflowWrap: 'anywhere',
                   padding: gi === 0 ? '2px 10px 3px' : '10px 10px 3px',
                   borderTop: gi === 0 ? 'none' : '1px solid var(--border-subtle)',
                   marginTop: gi === 0 ? 0 : 4,
@@ -8495,6 +8450,7 @@ export default function AdminPanel() {
                   return (
                     <button
                       key={tab.id}
+                      className={isActive ? 'admin-tab admin-tab-active' : 'admin-tab'}
                       onClick={() => handleTabClick(tab.id)}
                       style={{
                         display: 'flex', alignItems: 'center', gap: 9,
@@ -8507,11 +8463,11 @@ export default function AdminPanel() {
                       onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--bg-tertiary)'; }}
                       onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
                     >
-                      <span style={{ color: isActive ? 'var(--accent)' : 'var(--text-tertiary)' }}>
+                      <span style={{ color: isActive ? 'var(--accent)' : 'var(--text-tertiary)', flexShrink: 0 }}>
                         {tab.icon}
                       </span>
-                      {t(tab.labelKey)}
-                      {tab.beta && <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', padding: '1px 4px', borderRadius: 3, background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)', marginLeft: 'auto' }}>BETA</span>}
+                      <span style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>{t(tab.labelKey)}</span>
+                      {tab.beta && <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', padding: '1px 4px', borderRadius: 3, background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)', flexShrink: 0 }}>BETA</span>}
                     </button>
                   );
                 })}
@@ -8537,17 +8493,17 @@ export default function AdminPanel() {
                 onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--bg-tertiary)'; }}
                 onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
               >
-                <span style={{ color: isActive ? 'var(--accent)' : 'var(--text-tertiary)' }}>
+                <span style={{ color: isActive ? 'var(--accent)' : 'var(--text-tertiary)', flexShrink: 0 }}>
                   {tab.icon}
                 </span>
-                {t(tab.labelKey)}
-                {tab.beta && <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', padding: '1px 4px', borderRadius: 3, background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)', marginLeft: 'auto' }}>BETA</span>}
+                <span style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>{t(tab.labelKey)}</span>
+                {tab.beta && <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.06em', padding: '1px 4px', borderRadius: 3, background: 'color-mix(in srgb, var(--accent) 15%, transparent)', color: 'var(--accent)', flexShrink: 0 }}>BETA</span>}
               </button>
             );
           })}
+          </div>
 
-          <div style={{ flex: 1 }} />
-
+          <div style={{ height: 1, background: 'var(--border-subtle)', margin: '6px 0' }} />
           <button
             onClick={() => setShowAdmin(false)}
             style={{

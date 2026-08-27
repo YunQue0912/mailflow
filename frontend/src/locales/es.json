@@ -191,6 +191,7 @@
     "selectToRead": "Selecciona un mensaje para leer",
     "noSubject": "(sin asunto)",
     "to": "Para:",
+    "via": "vía",
     "attachment_one": "{{count}} adjunto",
     "attachment_other": "{{count}} adjuntos",
     "loadingError": "No se puede cargar el cuerpo del mensaje",
@@ -417,12 +418,15 @@
     "renameFailed": "Error al renombrar",
     "deleteFailed": "Error al eliminar",
     "emptyFailed": "Error al vaciar",
+    "emptying": "Vaciando «{{name}}»…",
+    "emptied": "Carpeta vaciada",
     "backToAccounts": "Volver a cuentas",
     "updateAvailable": "Actualización disponible: v{{version}}"
   },
   "contextMenu": {
     "find": "Buscar",
     "open": "Abrir",
+    "openInNewWindow": "Abrir en ventana nueva",
     "markRead": "Marcar como leído",
     "markUnread": "Marcar como no leído",
     "star": "Destacar mensaje",
@@ -447,6 +451,7 @@
     "markAsHam": "Marcar como no Spam",
     "copySubject": "Copiar asunto",
     "copySender": "Copiar dirección del remitente",
+    "copyLink": "Copiar enlace",
     "viewHeaders": "Ver encabezados completos",
     "delete": "Eliminar",
     "headers": {
@@ -570,6 +575,9 @@
         "label": "Marcar Delegado",
         "description": "Clasificar el mensaje seleccionado como Delegado"
       },
+      "gtdUndo": {
+        "description": "Deshacer la última clasificación GTD"
+      },
       "toggleRightSidebar": {
         "label": "Alternar la barra lateral derecha",
         "description": "Ocultar o mostrar la barra lateral derecha"
@@ -608,9 +616,30 @@
     "errorProcess": "No se pudo procesar la imagen."
   },
   "admin": {
+    "cleanup": {
+      "title": "Limpieza del buzón",
+      "intro": "Encuentra el correo masivo que satura tu bandeja de entrada y despéjalo. Elige si archivarlo (se conserva y se puede buscar) o moverlo a la papelera (recuperable hasta que la vacíes).",
+      "account": "Cuenta",
+      "summary": "{{bulk}} de {{total}} mensajes de la bandeja son correo masivo ({{pct}}%).",
+      "tier1Title": "Principales remitentes masivos",
+      "tier1Desc": "Estos son los remitentes de boletines y marketing con mayor volumen en tu bandeja de entrada. Actuar sobre uno procesa todo el correo de ese remitente en la bandeja de entrada con la acción elegida.",
+      "noneFound": "No se encontraron remitentes masivos.",
+      "moveToTrash": "Mover a la Papelera",
+      "confirm": "¿Mover a la Papelera los {{count}} mensajes de {{sender}}? Se pueden recuperar de la Papelera hasta que la vacíes.",
+      "tier2Title": "Términos promocionales comunes",
+      "tier2Desc": "Busca estos términos para revisar y eliminar el resto tú mismo. Abarcan muchos remitentes, así que revisa los resultados antes de eliminar.",
+      "tier3Title": "Limpiar el resto",
+      "tier3Desc": "Para lo demás, busca por remitente o palabra clave, selecciona todo y elimina. Al eliminar, el correo va primero a la Papelera, así que puedes revisar antes de vaciarla.",
+      "action": "Acción de limpieza",
+      "actionArchive": "Archivar (recomendado)",
+      "archive": "Archivar",
+      "confirmArchive": "¿Archivar los {{count}} mensajes de {{sender}} en la bandeja de entrada? Permanecerán en tu carpeta de Archivo y se podrán seguir buscando.",
+      "noArchiveFolder": "Esta cuenta no tiene carpeta de archivo, así que solo está disponible Mover a la papelera."
+    },
     "title": "Ajustes",
     "close": "Cerrar",
     "tabs": {
+      "cleanup": "Limpieza",
       "accounts": "Cuentas",
       "rules": "Reglas",
       "appearance": "Apariencia",
@@ -630,7 +659,8 @@
       "groupAccountMail": "Cuenta y correo",
       "groupDisplay": "Visualización",
       "groupSecurityIntegrations": "Seguridad e integraciones",
-      "groupAdmin": "Administración"
+      "groupAdmin": "Administración",
+      "plugins": "Complementos"
     },
     "rules": {
       "title": "Reglas de bandeja de entrada",
@@ -1277,6 +1307,8 @@
       "adminGroupValue": "Valor del grupo de administrador",
       "adminGroupValuePh": "mailflow-admins",
       "adminGroupValueDesc": "El nombre del grupo que otorga acceso de administrador. Los usuarios de este grupo se convierten en administradores en cada inicio de sesión SSO; los usuarios que no están en este grupo pierden el acceso de administrador.",
+      "loginMatchClaim": "Asociar cuentas existentes por",
+      "loginMatchClaimDesc": "Reclamación (claim) de OIDC que se compara con el nombre de usuario de cada cuenta de MailFlow al vincular por primera vez un inicio de sesión SSO con una cuenta existente (modo de aprovisionamiento «solo iniciar sesión en cuentas existentes»). El valor predeterminado es email. Usa preferred_username, upn, etc. para proveedores de identidad cuyos nombres de usuario no son direcciones de correo, solo si tu proveedor garantiza que esa reclamación es única y no editable por el usuario.",
       "passwordLoginDisableMsg": "Los usuarios solo podrán iniciar sesión mediante SSO. Si tu proveedor SSO deja de estar disponible, se necesitará acceso directo a la base de datos para volver a habilitar el inicio de sesión con contraseña.",
       "passwordLoginDisableTitle": "¿Desactivar inicio de sesión con contraseña?",
       "passwordLoginDisabled": "El inicio de sesión con contraseña está desactivado",
@@ -1423,6 +1455,15 @@
       "autoLockNeedsPin": "Configura un PIN para activar el bloqueo automático",
       "autoLockOff": "Desactivado",
       "autoLockMin": "{{n}} min"
+    },
+    "plugins": {
+      "title": "Complementos",
+      "description": "Activa o desactiva funciones opcionales para tu cuenta. Al activar un complemento se añaden sus propios ajustes e interfaz.",
+      "activated": "Activado",
+      "deactivated": "No activado",
+      "empty": "No hay complementos disponibles en esta versión.",
+      "error": "No se pudo actualizar el complemento. Inténtalo de nuevo.",
+      "configureIn": "Configura las opciones en {{location}}"
     }
   },
   "blockList": {
@@ -1480,7 +1521,6 @@
     "carddavBadge": "Sincronizado desde CardDAV"
   },
   "todoist": {
-    "betaLabel": "Beta",
     "title": "Crear tarea en Todoist",
     "taskTitle": "Título de la tarea",
     "taskTitlePh": "¿Qué hay que hacer?",
@@ -1519,6 +1559,7 @@
     "removeFrom": "Quitar de {{state}}",
     "classified": "Etiqueta aplicada",
     "classifyFailed": "No se pudo aplicar la etiqueta",
+    "undoFailed": "No se pudo deshacer la etiqueta",
     "removed": "Etiqueta eliminada",
     "removeFailed": "No se pudo quitar la etiqueta",
     "done": "Marcar como hecho",
@@ -1531,5 +1572,22 @@
       "someday": "Algún día",
       "reference": "Referencia"
     }
+  },
+  "window": {
+    "minimize": "Minimizar",
+    "close": "Cerrar"
+  },
+  "diagnostics": {
+    "section": "Diagnóstico",
+    "blurb": "Un informe depurado que puedes compartir para ayudar a diagnosticar. No contiene direcciones de correo, nombres, contenido de mensajes ni datos secretos.",
+    "generateReport": "Generar informe de diagnóstico",
+    "title": "Informe de diagnóstico",
+    "includes": "Incluye: versiones de la aplicación, tu entorno, recuentos por cuenta y carpeta, categorías de errores de sincronización y estado del servidor. Los ID de cuenta y los nombres de carpetas personalizadas se reemplazan por hashes de un solo uso.",
+    "excludes": "Excluye: direcciones de correo, nombres, asuntos, contenido de mensajes, contraseñas y claves o tokens de API.",
+    "download": "Descargar JSON",
+    "copied": "Informe copiado",
+    "copyFailed": "Error al copiar",
+    "generating": "Generando informe…",
+    "error": "No se pudo generar el informe."
   }
 }

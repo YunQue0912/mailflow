@@ -191,6 +191,7 @@
     "selectToRead": "Select a message to read",
     "noSubject": "(no subject)",
     "to": "To:",
+    "via": "via",
     "attachment_one": "{{count}} attachment",
     "attachment_other": "{{count}} attachments",
     "loadingError": "Unable to load message body",
@@ -417,12 +418,15 @@
     "renameFailed": "Rename failed",
     "deleteFailed": "Delete failed",
     "emptyFailed": "Empty failed",
+    "emptying": "Emptying \"{{name}}\"…",
+    "emptied": "Folder emptied",
     "backToAccounts": "Back to accounts",
     "updateAvailable": "Update available: v{{version}}"
   },
   "contextMenu": {
     "find": "Find",
     "open": "Open",
+    "openInNewWindow": "Open in new window",
     "markRead": "Mark as read",
     "markUnread": "Mark as unread",
     "star": "Star message",
@@ -447,6 +451,7 @@
     "markAsHam": "Mark as Not Spam",
     "copySubject": "Copy subject",
     "copySender": "Copy sender's address",
+    "copyLink": "Copy link",
     "viewHeaders": "View full headers",
     "delete": "Delete",
     "headers": {
@@ -570,6 +575,9 @@
         "label": "Mark Delegated",
         "description": "Classify the selected message as Delegated"
       },
+      "gtdUndo": {
+        "description": "Undo the latest GTD classification"
+      },
       "toggleRightSidebar": {
         "label": "Toggle right sidebar",
         "description": "Hide or show the right sidebar"
@@ -608,9 +616,30 @@
     "errorProcess": "Could not process image."
   },
   "admin": {
+    "cleanup": {
+      "title": "Mailbox Cleanup",
+      "intro": "Find bulk mail cluttering your inbox and clear it out. Choose whether to archive it (kept and searchable) or move it to Trash (recoverable until you empty it).",
+      "account": "Account",
+      "summary": "{{bulk}} of {{total}} inbox messages are bulk mail ({{pct}}%).",
+      "tier1Title": "Top bulk senders",
+      "tier1Desc": "These are the highest-volume newsletter and marketing senders in your inbox. Acting on one processes all of that sender's inbox mail with your chosen action.",
+      "noneFound": "No bulk senders found.",
+      "moveToTrash": "Move to Trash",
+      "confirm": "Move all {{count}} inbox messages from {{sender}} to Trash? They can be recovered from Trash until you empty it.",
+      "tier2Title": "Common promotional terms",
+      "tier2Desc": "Search these terms to review and delete the rest yourself. They span many senders, so skim the results before deleting.",
+      "tier3Title": "Cleaning up the rest",
+      "tier3Desc": "For everything else, search by sender or keyword, select all, and delete. Deletes always move to Trash first, so you can review before emptying it.",
+      "action": "Cleanup action",
+      "actionArchive": "Archive (recommended)",
+      "archive": "Archive",
+      "confirmArchive": "Archive all {{count}} inbox messages from {{sender}}? They stay in your Archive folder and remain searchable.",
+      "noArchiveFolder": "This account has no archive folder, so only Move to Trash is available."
+    },
     "title": "Settings",
     "close": "Close",
     "tabs": {
+      "cleanup": "Cleanup",
       "accounts": "Accounts",
       "rules": "Rules",
       "appearance": "Appearance",
@@ -630,7 +659,8 @@
       "groupAccountMail": "Account & Mail",
       "groupDisplay": "Display",
       "groupSecurityIntegrations": "Security & Integrations",
-      "groupAdmin": "Administration"
+      "groupAdmin": "Administration",
+      "plugins": "Plugins"
     },
     "rules": {
       "title": "Inbox rules",
@@ -1274,6 +1304,8 @@
       "adminGroupValue": "Admin group value",
       "adminGroupValuePh": "mailflow-admins",
       "adminGroupValueDesc": "The group name that grants admin access. Users in this group become admins on every SSO login; users not in this group lose admin access.",
+      "loginMatchClaim": "Match existing accounts by",
+      "loginMatchClaimDesc": "OIDC claim matched against each MailFlow account’s username when an SSO login is first linked to an existing account (provisioning mode “login existing only”). Defaults to email. Use preferred_username, upn, etc. for identity providers where usernames are not email addresses — only if your provider guarantees the claim is unique and not user-editable.",
       "save": "Save",
       "editButton": "Edit",
       "deleteButton": "Delete",
@@ -1461,6 +1493,15 @@
       "autoLockNeedsPin": "Set a PIN to enable auto-lock",
       "autoLockOff": "Off",
       "autoLockMin": "{{n}} min"
+    },
+    "plugins": {
+      "title": "Plugins",
+      "description": "Turn optional features on or off for your account. Enabling a plugin adds its own settings and interface.",
+      "activated": "Activated",
+      "deactivated": "Not activated",
+      "empty": "No plugins are available in this build.",
+      "error": "Couldn't update the plugin. Please try again.",
+      "configureIn": "Configure options in {{location}}"
     }
   },
   "blockList": {
@@ -1518,7 +1559,6 @@
     "carddavBadge": "Synced from CardDAV"
   },
   "todoist": {
-    "betaLabel": "Beta",
     "title": "Create Todoist Task",
     "taskTitle": "Task title",
     "taskTitlePh": "What needs to be done?",
@@ -1557,6 +1597,7 @@
     "removeFrom": "Remove from {{state}}",
     "classified": "Label applied",
     "classifyFailed": "Couldn't apply label",
+    "undoFailed": "Couldn't undo label",
     "removed": "Label removed",
     "removeFailed": "Couldn't remove label",
     "done": "Mark done",
@@ -1569,5 +1610,22 @@
       "someday": "Someday",
       "reference": "Reference"
     }
+  },
+  "window": {
+    "minimize": "Minimize",
+    "close": "Close"
+  },
+  "diagnostics": {
+    "section": "Diagnostics",
+    "blurb": "A sanitized report you can share to help troubleshoot. It contains no email addresses, names, message content, or secrets.",
+    "generateReport": "Generate diagnostics report",
+    "title": "Diagnostics report",
+    "includes": "Includes: app versions, your environment, per-account and folder counts, sync error categories, and server health. Account IDs and custom folder names are replaced by one-time hashes.",
+    "excludes": "Excludes: email addresses, names, subjects, message content, passwords, and API keys or tokens.",
+    "download": "Download JSON",
+    "copied": "Report copied",
+    "copyFailed": "Copy failed",
+    "generating": "Generating report…",
+    "error": "Could not generate the report."
   }
 }
