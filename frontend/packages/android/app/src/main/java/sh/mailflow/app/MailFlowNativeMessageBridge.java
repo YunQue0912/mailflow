@@ -1,6 +1,7 @@
 package sh.mailflow.app;
 
 import android.content.Context;
+import android.util.Log;
 import android.webkit.WebView;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
@@ -10,6 +11,7 @@ import org.json.JSONObject;
 
 final class MailFlowNativeMessageBridge {
     private static final String BRIDGE_NAME = "MailFlowAndroid";
+    private static final String TAG = "MailFlowNativeBridge";
 
     private MailFlowNativeMessageBridge() {}
 
@@ -44,6 +46,7 @@ final class MailFlowNativeMessageBridge {
                         )
                     );
                 } catch (Exception error) {
+                    Log.e(TAG, "Native message bridge request failed", error);
                     response.put("error", "Native request failed");
                 }
                 replyProxy.postMessage(response.toString());

@@ -1421,8 +1421,6 @@
       "website": "Веб-сайт",
       "sourceCode": "Исходный код",
       "sponsor": "Поддержать разработку",
-      "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors",
       "updates": {
         "title": "Обновления приложения", "autoCheck": "Автоматически проверять обновления", "currentVersion": "Текущая версия", "latestVersion": "Последняя версия", "published": "Опубликовано", "size": "Размер загрузки", "notes": "Примечания к выпуску", "check": "Проверить обновления", "download": "Скачать обновление", "later": "Позже", "skip": "Пропустить эту версию", "cancel": "Отмена", "install": "Перезапустить и установить", "installAndroid": "Установить", "retry": "Повторить", "browser": "Скачать в браузере",
         "notificationAvailableTitle": "Доступно обновление", "notificationAvailableBody": "MailFlow {{version}} готов к загрузке.", "notificationReadyTitle": "Обновление готово", "notificationReadyBody": "MailFlow {{version}} готов к установке.", "notificationErrorTitle": "Не удалось проверить обновления", "notificationInstallErrorTitle": "Не удалось установить", "notificationInstallErrorBody": "Проверенное обновление не удалось установить.",

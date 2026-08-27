@@ -2,10 +2,46 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   callAndroidJavascriptInterface,
+  callAndroidMessageBridge,
   installCapacitorNativeBridge,
   pollAndroidUpdateState,
   subscribeNativePluginEvent,
 } from './capacitorNativeBridge.js';
+
+test('routes update calls through the origin-scoped Android message bridge', async () => {
+  const target = {
+    MailFlowAndroid: {
+      postMessage(payload) {
+        const request = JSON.parse(payload);
+        queueMicrotask(() => this.onmessage({
+          data: JSON.stringify({
+            id: request.id,
+            result: { started: true, method: request.method, verbose: request.args.verbose },
+          }),
+        }));
+      },
+    },
+  };
+
+  const result = await callAndroidMessageBridge(
+    target,
+    'checkForUpdates',
+    { verbose: true },
+    { started: false },
+  );
+
+  assert.deepEqual(result, {
+    available: true,
+    value: { started: true, method: 'checkForUpdates', verbose: true },
+  });
+});
+
+test('reports a missing Android message bridge so Capacitor can remain the fallback', async () => {
+  assert.deepEqual(
+    await callAndroidMessageBridge({}, 'getUpdateState', {}, { type: 'idle' }),
+    { available: false, value: { type: 'idle' } },
+  );
+});
 
 test('reads structured update state from the Android JavaScript interface', () => {
   const target = {
@@ -89,6 +125,27 @@ test('returns null when the direct Android bridge never leaves idle', async () =
   });
 
   assert.equal(result, null);
+});
+
+test('polls update state through the asynchronous Android message bridge', async () => {
+  const states = [
+    { type: 'checking', currentVersion: '2.9.0-custom.1' },
+    { type: 'available', currentVersion: '2.9.0-custom.1', version: '3.3.0-custom.2' },
+  ];
+  const observed = [];
+
+  const result = await pollAndroidUpdateState({}, {
+    readState: async () => states.shift() || states.at(-1),
+    onStatus: (status) => observed.push(status),
+    wait: async () => {},
+    maxAttempts: 3,
+  });
+
+  assert.deepEqual(observed, [
+    { type: 'checking', currentVersion: '2.9.0-custom.1' },
+    { type: 'available', currentVersion: '2.9.0-custom.1', version: '3.3.0-custom.2' },
+  ]);
+  assert.equal(result.type, 'available');
 });
 
 test('native action subscription is a safe no-op without a Capacitor plugin proxy', () => {

@@ -1421,8 +1421,6 @@
       "website": "Website",
       "sourceCode": "Source code",
       "sponsor": "Support development",
-      "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors",
       "updates": {
         "title": "App updates",
         "autoCheck": "Automatically check for app updates",

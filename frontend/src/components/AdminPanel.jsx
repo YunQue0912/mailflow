@@ -31,6 +31,12 @@ import { getEffectiveShortcuts, getGroupedActions, ACTION_DEFS, SPECIAL_KEY_LABE
 import NativeUpdatePanel from './NativeUpdatePanel.jsx';
 import { unifiedUnreadTotal } from '../utils/unifiedInbox.js';
 import { isValidForwardAddress } from '../utils/ruleActions.js';
+import {
+  CUSTOM_PROJECT_URL,
+  getDeploymentWebsiteUrl,
+  isPackagedMailFlow,
+  selectAboutVersion,
+} from '../utils/aboutInfo.js';
 
 // ─── Shared field component ───────────────────────────────────────────────────
 function Field({ label, required, children }) {
@@ -5599,6 +5605,8 @@ function SecurityPrivacyTab({ initialSubTab }) {
 function AboutTab() {
   const { t } = useTranslation();
   const [info, setInfo] = useState(null);
+  const packagedApp = isPackagedMailFlow(window);
+  const [installedVersion, setInstalledVersion] = useState('');
   const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   useEffect(() => {
@@ -5608,20 +5616,55 @@ function AboutTab() {
       .catch(() => setInfo({ version: '—', sha: '—' }));
   }, []);
 
+  useEffect(() => {
+    if (!packagedApp) return undefined;
+
+    let active = true;
+    let unsubscribe = null;
+    let attempts = 0;
+    const connect = () => {
+      const updates = window.mailflowNative?.updates;
+      if (!updates) return false;
+
+      Promise.resolve(updates.getState?.()).then((state) => {
+        if (active && state?.currentVersion) setInstalledVersion(state.currentVersion);
+      }).catch(() => {});
+      unsubscribe = updates.onStatus?.((state) => {
+        if (active && state?.currentVersion) setInstalledVersion(state.currentVersion);
+      });
+      return true;
+    };
+
+    const connected = connect();
+    const timer = connected ? null : window.setInterval(() => {
+      attempts += 1;
+      if (connect() || attempts >= 25) window.clearInterval(timer);
+    }, 200);
+
+    return () => {
+      active = false;
+      if (timer) window.clearInterval(timer);
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, [packagedApp]);
+
   const feSha = import.meta.env.VITE_BUILD_SHA || 'dev';
+  const displayedVersion = selectAboutVersion({
+    packaged: packagedApp,
+    installedVersion,
+    serverVersion: info?.version,
+  });
   const infoRows = [
-    [t('admin.about.version'),       info ? info.version : '…'],
+    [t('admin.about.version'),       displayedVersion],
     [t('admin.about.backendBuild'),  info ? info.sha     : '…'],
     [t('admin.about.frontendBuild'), feSha],
     [t('admin.about.license'),       'AGPL-3.0'],
   ];
   const generalRows = [
-    [t('admin.about.website'),    'https://mailflow.sh'],
-    [t('admin.about.sourceCode'), 'https://github.com/maathimself/mailflow'],
+    [t('admin.about.website'), getDeploymentWebsiteUrl(window.location)],
   ];
   const supportRows = [
-    [t('admin.about.kofi'),           'https://ko-fi.com/mailflow'],
-    [t('admin.about.githubSponsors'), 'https://github.com/sponsors/maathimself'],
+    [t('admin.about.sourceCode'), CUSTOM_PROJECT_URL],
   ];
 
   const rowStyle = (last) => ({

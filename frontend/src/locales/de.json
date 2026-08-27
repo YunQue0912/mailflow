@@ -1351,8 +1351,6 @@
       "website": "Website",
       "sourceCode": "Quellcode",
       "sponsor": "Entwicklung unterstützen",
-      "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors",
       "updates": {
         "title": "App-Updates", "autoCheck": "Automatisch nach App-Updates suchen", "currentVersion": "Aktuelle Version", "latestVersion": "Neueste Version", "published": "Veröffentlicht", "size": "Downloadgröße", "notes": "Versionshinweise", "check": "Nach Updates suchen", "download": "Update herunterladen", "later": "Später", "skip": "Diese Version überspringen", "cancel": "Abbrechen", "install": "Neu starten und installieren", "installAndroid": "Installieren", "retry": "Erneut versuchen", "browser": "Im Browser herunterladen",
         "notificationAvailableTitle": "App-Update verfügbar", "notificationAvailableBody": "MailFlow {{version}} kann heruntergeladen werden.", "notificationReadyTitle": "Update bereit", "notificationReadyBody": "MailFlow {{version}} kann installiert werden.", "notificationErrorTitle": "Update-Prüfung fehlgeschlagen", "notificationInstallErrorTitle": "Installation fehlgeschlagen", "notificationInstallErrorBody": "Das geprüfte Update konnte nicht installiert werden.",

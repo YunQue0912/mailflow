@@ -1421,8 +1421,6 @@
       "website": "Sitio web",
       "sourceCode": "Código fuente",
       "sponsor": "Apoyar el desarrollo",
-      "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors",
       "updates": {
         "title": "Actualizaciones de la aplicación", "autoCheck": "Buscar actualizaciones automáticamente", "currentVersion": "Versión actual", "latestVersion": "Última versión", "published": "Publicada", "size": "Tamaño de descarga", "notes": "Notas de la versión", "check": "Buscar actualizaciones", "download": "Descargar actualización", "later": "Más tarde", "skip": "Omitir esta versión", "cancel": "Cancelar", "install": "Reiniciar e instalar", "installAndroid": "Instalar", "retry": "Reintentar", "browser": "Descargar en el navegador",
         "notificationAvailableTitle": "Actualización disponible", "notificationAvailableBody": "MailFlow {{version}} está listo para descargar.", "notificationReadyTitle": "Actualización lista", "notificationReadyBody": "MailFlow {{version}} está listo para instalar.", "notificationErrorTitle": "Error al buscar actualizaciones", "notificationInstallErrorTitle": "Error de instalación", "notificationInstallErrorBody": "No se pudo instalar la actualización verificada.",

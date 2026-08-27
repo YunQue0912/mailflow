@@ -1421,8 +1421,6 @@
       "website": "官方网站",
       "sourceCode": "源代码",
       "sponsor": "支持开发",
-      "kofi": "Ko-fi",
-      "githubSponsors": "GitHub Sponsors",
       "updates": {
         "title": "应用更新", "autoCheck": "自动检查应用更新", "currentVersion": "当前版本", "latestVersion": "最新版本", "published": "发布日期", "size": "下载大小", "notes": "发布说明", "check": "检查更新", "download": "下载更新", "later": "稍后", "skip": "跳过此版本", "cancel": "取消", "install": "重启并安装", "installAndroid": "安装", "retry": "重试", "browser": "在浏览器中下载",
         "notificationAvailableTitle": "有可用更新", "notificationAvailableBody": "MailFlow {{version}} 可以下载。", "notificationReadyTitle": "更新已就绪", "notificationReadyBody": "MailFlow {{version}} 可以安装。", "notificationErrorTitle": "检查更新失败", "notificationInstallErrorTitle": "安装失败", "notificationInstallErrorBody": "无法安装已验证的更新。",

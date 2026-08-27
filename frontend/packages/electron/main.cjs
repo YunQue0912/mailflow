@@ -897,16 +897,16 @@ function helpMenuItems() {
   return [
     {
       label: 'Learn More',
-      click: () => shell.openExternal('https://mailflow.sh'),
+      click: () => shell.openExternal('https://github.com/YunQue0912/mailflow'),
     },
     { type: 'separator' },
     {
       label: 'Help',
-      click: () => shell.openExternal('https://mailflow.sh/docs'),
+      click: () => shell.openExternal('https://github.com/YunQue0912/mailflow#readme'),
     },
     {
       label: 'Report Issue',
-      click: () => shell.openExternal('https://github.com/maathimself/mailflow/issues'),
+      click: () => shell.openExternal('https://github.com/YunQue0912/mailflow/issues'),
     },
     { type: 'separator' },
     {

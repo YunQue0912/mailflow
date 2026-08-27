@@ -1,9 +1,9 @@
 {
   "name": "mailflow-frontend",
   "productName": "MailFlow",
-  "version": "3.3.0-custom.1",
+  "version": "3.3.0-custom.2",
   "description": "A self-hosted, unified webmail client.",
-  "homepage": "https://mailflow.sh",
+  "homepage": "https://github.com/YunQue0912/mailflow",
   "author": {
     "name": "maathimself",
     "email": "matthias@mailflow.sh"
@@ -12,7 +12,7 @@
   "main": "packages/electron/main.cjs",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/maathimself/mailflow.git"
+    "url": "git+https://github.com/YunQue0912/mailflow.git"
   },
   "keywords": [
     "Email",
@@ -23,7 +23,7 @@
   ],
   "license": "GPL-3.0",
   "bugs": {
-    "url": "https://github.com/maathimself/mailflow/issues"
+    "url": "https://github.com/YunQue0912/mailflow/issues"
   },
   "scripts": {
     "dev": "vite",

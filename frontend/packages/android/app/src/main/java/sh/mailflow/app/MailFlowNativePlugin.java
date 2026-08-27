@@ -690,22 +690,23 @@ public class MailFlowNativePlugin extends Plugin {
             + "var androidBridge=window.MailFlowAndroid;"
             + "var nativeRequests=window.__mailflowAndroidRequests=window.__mailflowAndroidRequests||{};"
             + "if(androidBridge&&typeof androidBridge.postMessage==='function'){androidBridge.onmessage=function(event){try{var response=JSON.parse(event.data||'{}');var resolve=nativeRequests[response.id];if(!resolve)return;delete nativeRequests[response.id];resolve(response.result||null);}catch(e){}};}"
-            + "var nativeCall=function(method,args,fallback){if(!androidBridge||typeof androidBridge.postMessage!=='function')return Promise.resolve(fallback||null);return new Promise(function(resolve){var id=String(Date.now())+Math.random();nativeRequests[id]=resolve;androidBridge.postMessage(JSON.stringify({id:id,method:method,args:args||{}}));});};"
+            + "var nativeCall=function(method,args,fallback){if(!androidBridge||typeof androidBridge.postMessage!=='function')return Promise.resolve(fallback||null);return new Promise(function(resolve){var id=String(Date.now())+Math.random();var timer=window.setTimeout(function(){delete nativeRequests[id];resolve(fallback||null);},5000);nativeRequests[id]=function(result){window.clearTimeout(timer);resolve(result);};try{androidBridge.postMessage(JSON.stringify({id:id,method:method,args:args||{}}));}catch(e){window.clearTimeout(timer);delete nativeRequests[id];resolve(fallback||null);}});};"
             + "var plugin=function(){return window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.MailFlowNative;};"
             + "var call=function(method,args,fallback){var p=plugin();if(!p||typeof p[method]!=='function')return Promise.resolve(fallback||null);return p[method](args||{}).catch(function(){return fallback||null;});};"
+            + "var nativeOrPlugin=function(method,args,fallback){return nativeCall(method,args,null).then(function(result){return result&&result.reason!=='unavailable'?result:call(method,args,fallback);});};"
             + "window.mailflowNative=window.mailflowNative||{};"
             + "window.mailflowNative.platform='android';"
             + "window.mailflowNative.attachments=window.mailflowNative.attachments||{};"
             + "window.mailflowNative.attachments.download=function(options){return call('downloadAttachment',options||{}, {started:false,reason:'unavailable'});};"
             + "window.mailflowNative.updates=window.mailflowNative.updates||{};"
-            + "window.mailflowNative.updates.getState=function(){return call(\'getUpdateState\',{}, {type:\'idle\'});};"
-            + "window.mailflowNative.updates.check=function(verbose){return call(\'checkForUpdates\',{verbose:!!verbose},{started:false});};"
-            + "window.mailflowNative.updates.download=function(){return call(\'downloadUpdate\',{}, {started:false,reason:\'unavailable\'});};"
-            + "window.mailflowNative.updates.cancel=function(){return call(\'cancelUpdateDownload\',{}, {cancelled:false});};"
-            + "window.mailflowNative.updates.installDownloaded=function(){return nativeCall(\'installDownloadedUpdate\',{},null).then(function(result){return result||call(\'installDownloadedUpdate\',{}, {installed:false,reason:\'unavailable\'});});};"
+            + "window.mailflowNative.updates.getState=function(){return nativeOrPlugin(\'getUpdateState\',{}, {type:\'idle\'});};"
+            + "window.mailflowNative.updates.check=function(verbose){return nativeOrPlugin(\'checkForUpdates\',{verbose:!!verbose},{started:false});};"
+            + "window.mailflowNative.updates.download=function(){return nativeOrPlugin(\'downloadUpdate\',{}, {started:false,reason:\'unavailable\'});};"
+            + "window.mailflowNative.updates.cancel=function(){return nativeOrPlugin(\'cancelUpdateDownload\',{}, {cancelled:false});};"
+            + "window.mailflowNative.updates.installDownloaded=function(){return nativeOrPlugin(\'installDownloadedUpdate\',{}, {installed:false,reason:\'unavailable\'});};"
 
             + "window.mailflowNative.updates.installAuto=window.mailflowNative.updates.installDownloaded;"
-            + "window.mailflowNative.updates.openDownload=function(){return call('openUpdateInBrowser',{}, {opened:false});};"
+            + "window.mailflowNative.updates.openDownload=function(){return nativeOrPlugin('openUpdateInBrowser',{}, {opened:false});};"
             + "window.mailflowNative.updates.onStatus=function(callback){if(typeof callback!=='function')return function(){};var handler=function(event){callback(event.detail);};window.addEventListener('mailflow:update-status',handler);return function(){window.removeEventListener('mailflow:update-status',handler);};};"
             + "window.mailflowNative.notifications=window.mailflowNative.notifications||{};"
             + "window.mailflowNative.notifications.showNewMail=function(notification){return nativeCall('showNewMail',notification||{},null).then(function(result){return result||call('showNewMail',notification||{});});};"
@@ -1695,8 +1696,37 @@ public class MailFlowNativePlugin extends Plugin {
             return instance.showUpdateReadyDialog();
         }
 
+        if (instance != null) {
+            if ("getUpdateState".equals(method)) {
+                return instance.currentUpdateState();
+            }
+            if ("checkForUpdates".equals(method)) {
+                return instance.beginUpdateCheck(args != null && args.optBoolean("verbose", false));
+            }
+            if ("downloadUpdate".equals(method)) {
+                return instance.beginUpdateDownload();
+            }
+            if ("cancelUpdateDownload".equals(method)) {
+                return instance.cancelUpdateDownloadResult();
+            }
+            if ("openUpdateInBrowser".equals(method)) {
+                return instance.openUpdateReleasePage();
+            }
+        }
+
         JSObject result = new JSObject();
-        result.put("installed", false);
+        if ("getUpdateState".equals(method)) {
+            result.put("type", "idle");
+            result.put("currentVersion", getInstalledVersion(context));
+        } else if ("cancelUpdateDownload".equals(method)) {
+            result.put("cancelled", false);
+        } else if ("openUpdateInBrowser".equals(method)) {
+            result.put("opened", false);
+        } else if ("installDownloadedUpdate".equals(method)) {
+            result.put("installed", false);
+        } else {
+            result.put("started", false);
+        }
         result.put("reason", "unavailable");
         return result;
 

@@ -4,7 +4,9 @@ let registerNativePlugin = null;
 let installPromise = null;
 let pluginUnavailable = false;
 let directUpdatePollGeneration = 0;
+let androidMessageRequestSequence = 0;
 const DIRECT_UPDATE_TERMINAL_STATES = new Set(['available', 'up-to-date', 'downloaded', 'error']);
+const ANDROID_MESSAGE_TIMEOUT_MS = 5000;
 
 function normalizeUpdateStatus(status) {
   if (!status?.data || typeof status.data !== 'object') return status;
@@ -26,17 +28,69 @@ export function callAndroidJavascriptInterface(target, method, args = [], fallba
   }
 }
 
+export function callAndroidMessageBridge(target, method, args = {}, fallback = null) {
+  const bridge = target?.MailFlowAndroid;
+  if (!bridge || typeof bridge.postMessage !== 'function') {
+    return Promise.resolve({ available: false, value: fallback });
+  }
+
+  const requests = target.__mailflowAndroidRequests = target.__mailflowAndroidRequests || {};
+  if (!target.__mailflowAndroidMessageHandlerInstalled) {
+    const previousHandler = typeof bridge.onmessage === 'function' ? bridge.onmessage : null;
+    bridge.onmessage = (event) => {
+      try {
+        const response = JSON.parse(event?.data || '{}');
+        const resolve = requests[response.id];
+        if (typeof resolve === 'function') {
+          delete requests[response.id];
+          resolve(response.error ? undefined : response.result);
+          return;
+        }
+      } catch {
+        // Preserve any bridge handler installed by the native compatibility layer.
+      }
+      previousHandler?.call(bridge, event);
+    };
+    target.__mailflowAndroidMessageHandlerInstalled = true;
+  }
+
+  return new Promise((resolve) => {
+    const id = `mailflow-${Date.now()}-${androidMessageRequestSequence += 1}`;
+    const timer = setTimeout(() => {
+      delete requests[id];
+      resolve({ available: true, value: fallback });
+    }, ANDROID_MESSAGE_TIMEOUT_MS);
+
+    requests[id] = (value) => {
+      clearTimeout(timer);
+      resolve({ available: true, value: value ?? fallback });
+    };
+
+    try {
+      bridge.postMessage(JSON.stringify({ id, method, args: args || {} }));
+    } catch {
+      clearTimeout(timer);
+      delete requests[id];
+      resolve({ available: true, value: fallback });
+    }
+  });
+}
+
 export async function pollAndroidUpdateState(target, {
   onStatus = () => {},
+  readState = null,
   wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   intervalMs = 250,
   maxAttempts = 120,
 } = {}) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const direct = callAndroidJavascriptInterface(target, 'getUpdateState', [], null);
-    if (!direct.available) return null;
+    const rawStatus = direct.available
+      ? direct.value
+      : (typeof readState === 'function' ? await readState() : null);
+    if (!direct.available && typeof readState !== 'function') return null;
 
-    const status = normalizeUpdateStatus(direct.value);
+    const status = normalizeUpdateStatus(rawStatus);
     if (status?.type) {
       onStatus(status);
       if (DIRECT_UPDATE_TERMINAL_STATES.has(status.type)) return status;
@@ -81,6 +135,9 @@ async function callNative(method, args, fallback = null) {
 async function callNativeUpdate(androidMethod, androidArgs, pluginMethod, pluginArgs, fallback = null) {
   const direct = callAndroidJavascriptInterface(window, androidMethod, androidArgs, fallback);
   if (direct.available && direct.value?.reason !== 'unavailable') return direct.value;
+
+  const message = await callAndroidMessageBridge(window, pluginMethod, pluginArgs, fallback);
+  if (message.available && message.value?.reason !== 'unavailable') return message.value;
   return callNative(pluginMethod, pluginArgs, fallback);
 }
 
@@ -182,6 +239,9 @@ export async function installCapacitorNativeBridge() {
           }
 
           const state = await pollAndroidUpdateState(window, {
+            readState: async () => normalizeUpdateStatus(await callNativeUpdate(
+              'getUpdateState', [], 'getUpdateState', undefined, { type: 'idle' },
+            )),
             onStatus: (status) => {
               if (pollGeneration === directUpdatePollGeneration) {
                 dispatchAndroidUpdateStatus(window, status);
