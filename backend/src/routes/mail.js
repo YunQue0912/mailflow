@@ -8,15 +8,25 @@ import { imapManager } from '../index.js';
 import { sanitizeEmail, stripEmailHead, hasRemoteImages, blockRemoteImages, rewriteEbayImageserUrls, rewriteAnchorHrefs } from '../services/emailSanitizer.js';
 import { snippetFromBody, decodeMimeWords, parseRawHeaders, buildHeadersFromMessage } from '../services/messageParser.js';
 import { resolveTrashFolder, resolveAllTrashPaths, resolveAllDraftsPaths, resolveArchiveFolder, isAllMailFolder, resolveSpamFolder, resolveAllSpamPaths, getDeleteStrategy, adjustFolderCounts, fanOutReadToSiblings, fanOutStarToSiblings, fanOutBulkReadToSiblings } from '../utils/mailUtils.js';
-import { emitGtdIfRelevant } from '../services/gtdSections.js';
+import { pluginRegistry } from '../plugins/registry.js';
 import { listMessages } from '../services/messageService.js';
+import { recordSyncSignal } from '../services/diagnosticsRing.js';
 import { resolveAccountScope } from '../services/unifiedInbox.js';
 import { validateHost } from '../services/hostValidation.js';
 import { safeFetch } from '../services/safeFetch.js';
-import { attachmentContentDisposition, sanitizeAttachmentFilename } from '../utils/contentDisposition.js';
+import { safeFilename, attachmentDisposition } from '../utils/contentDisposition.js';
 
 const router = Router();
 router.use(requireAuth);
+
+// Whether an account-scoped plugin that maintains label sibling rows (currently GTD) is active for
+// this account — the modern replacement for the former email_accounts.gtd_enabled gate on the
+// read/star sibling fan-out. Core stays plugin-agnostic: it asks the registry, never GTD directly.
+// Folds plugin activation in (strictly safer than the old raw column — a deactivated plugin no
+// longer triggers fan-out). The fan-out itself is still additionally gated on the message actually
+// having siblings, so a non-plugin account stays byte-identical to pre-GTD.
+const accountMaintainsLabelSiblings = (accountId) =>
+  pluginRegistry.hasActiveAsync('inboxIngest', { account: { id: accountId } });
 
 // Validate a folder name / path component: no control chars, max 255 chars.
 function isValidFolderName(name) {
@@ -48,6 +58,37 @@ async function runInBatches(items, concurrency, fn) {
   return results;
 }
 
+// Columns copied verbatim when a message row is relocated to a new folder/UID via the
+// DELETE + reinsert CTE used by the bulk trash / move / archive paths on UIDPLUS servers.
+// The destination uid comes from the UIDPLUS map (u.new_uid) and the destination folder is
+// always bound as $4; everything else is carried over from the deleted row (d.*).
+//
+// Excluded on purpose:
+//   - id, synced_at        -> use their column defaults (a fresh UUID and timestamp), which
+//                             preserves the historical "row gets a new id on move" behavior.
+//   - normalized_subject,
+//     search_vector,
+//     thread_key           -> GENERATED ALWAYS columns; Postgres computes them, and inserting
+//                             an explicit value (even NULL) errors.
+//
+// IMPORTANT: when a migration adds a data column to `messages`, add it to RELOCATE_COPY_COLS
+// or a relocate will silently reset it to its default. This list previously went stale and
+// dropped delivery_addresses (0037), plugin_annotations (0044) and sender_name/sender_email
+// (0050). A unit test (mail.relocate.test.js) guards the four that regression touched.
+const RELOCATE_COPY_COLS = [
+  'message_id', 'subject', 'from_name', 'from_email', 'to_addresses', 'cc_addresses',
+  'reply_to', 'in_reply_to', 'date', 'snippet', 'is_read', 'is_starred', 'has_attachments',
+  'flags', 'body_html', 'body_text', 'attachments', 'thread_references', 'thread_id', 'is_bulk',
+  'read_changed_at', 'star_changed_at', 'spam_score_sa', 'spam_score_ml', 'spam_verdict',
+  'spam_analyzed_at', 'spam_details', 'spam_user_override', 'category', 'list_unsubscribe',
+  'list_unsubscribe_post', 'unsubscribed_at', 'delivery_addresses', 'plugin_annotations',
+  'sender_name', 'sender_email',
+];
+// INSERT target list and the matching SELECT projection. account_id + the carried columns come
+// from the deleted row; uid is the UIDPLUS-mapped new uid; folder is the destination ($4).
+export const RELOCATE_INSERT_COLS = ['account_id', 'uid', 'folder', ...RELOCATE_COPY_COLS].join(', ');
+export const RELOCATE_SELECT_COLS = ['d.account_id', 'u.new_uid', '$4', ...RELOCATE_COPY_COLS.map(c => `d.${c}`)].join(', ');
+
 
 // Returns true if a snippet contains content that should never appear in plain-text
 // preview, indicating it was generated from unclean HTML and needs regeneration:
@@ -67,15 +108,15 @@ function snippetIsGarbled(s) {
   );
 }
 
-// Fire-and-forget GTD sections refresh after an ordinary mail mutation. Groups the acted
-// rows by account and asks emitGtdIfRelevant to broadcast gtd_sections_updated per
-// account whose messages still touch a designated GTD folder — either a live sibling
-// post-mutation, or one of the acted rows sitting in a GTD folder pre-mutation (covers
-// removing the last GTD-folder copy of a thread, which leaves no post-mutation sibling
-// to find). Rows are the pre-mutation message rows so their message_id and folder are
-// captured before a move/delete can drop them; a failed emit is logged, never surfaced,
-// so it can't turn a completed mutation into a 500.
-function emitGtdSectionsRefresh(rows, userId) {
+// Fire-and-forget notification to label plugins after an ordinary mail mutation. Groups the
+// acted rows by account and dispatches the generic `onMailMutation` hook per account; a label
+// plugin (GTD) decides whether the mutation touched one of its labelled threads and broadcasts
+// its own scoped refresh — either a live sibling post-mutation, or one of the acted rows sitting
+// in a label folder pre-mutation (covers removing the last label copy of a thread, which leaves
+// no post-mutation sibling to find). Rows are the pre-mutation message rows so their message_id
+// and folder are captured before a move/delete can drop them; the hook swallows per-plugin
+// errors, so a completed mutation is never turned into a 500.
+function notifyMailMutation(rows, userId) {
   const byAccount = new Map();
   for (const m of rows) {
     if (!m.message_id) continue;
@@ -85,8 +126,9 @@ function emitGtdSectionsRefresh(rows, userId) {
     if (m.folder) entry.folders.add(m.folder);
   }
   for (const [accountId, { mids, folders }] of byAccount) {
-    emitGtdIfRelevant(imapManager, accountId, userId, [...mids], [...folders])
-      .catch(err => console.warn('GTD sections refresh emit failed:', err.message));
+    pluginRegistry.runHook('onMailMutation', {
+      imapManager: imapManager.pluginFacade, accountId, userId, messageIds: [...mids], actedFolders: [...folders],
+    }).catch(err => console.warn('onMailMutation hook failed:', err.message));
   }
 }
 
@@ -117,6 +159,15 @@ router.get('/messages', async (req, res) => {
   if (resolvedAccountId && messages.length) {
     imapManager.prefetchFolderBodies(resolvedAccountId, messages.map(r => r.id))
       .catch(err => console.warn('Folder body prefetch error:', err.message));
+  }
+
+  // Phase 1 reliability instrumentation: count "ghost" rows served — a UID is known but
+  // its envelope hasn't been fetched, so the row renders as Unknown / (no subject). This is
+  // the visible #407 symptom; measuring it turns "sometimes there are ghost rows" into a rate.
+  if (resolvedAccountId && messages.length) {
+    const ghosts = messages.filter(m =>
+      !m.message_id && (!m.subject || m.subject === '(no subject)') && !m.snippet).length;
+    if (ghosts > 0) recordSyncSignal('ghost_rows_served', { accountId: resolvedAccountId, magnitude: ghosts });
   }
 
   res.json({ messages, total, ...(isThreaded ? { threaded: true } : {}) });
@@ -391,7 +442,7 @@ router.get('/messages/:id/body', async (req, res) => {
       responseHtml = blockRemoteImages(html);
       hasBlockedRemoteImages = true;
     }
-    return res.json({ html: responseHtml, text: message.body_text, attachments, hasBlockedRemoteImages });
+    return res.json({ html: responseHtml, text: message.body_text, attachments, hasBlockedRemoteImages, senderEmail: message.sender_email, senderName: message.sender_name });
   }
 
   // Fetch from IMAP — signal user activity so background jobs back off during this request.
@@ -430,7 +481,7 @@ router.get('/messages/:id/body', async (req, res) => {
       responseHtml = blockRemoteImages(safeHtml);
       hasBlockedRemoteImages = true;
     }
-    res.json({ html: responseHtml, text: safeText, attachments: attachments || [], hasBlockedRemoteImages });
+    res.json({ html: responseHtml, text: safeText, attachments: attachments || [], hasBlockedRemoteImages, senderEmail: message.sender_email, senderName: message.sender_name });
   } catch (err) {
     const msg = err.message || 'Unknown error';
     console.error('Body fetch error:', msg);
@@ -548,7 +599,7 @@ router.get('/messages/:id/attachments.zip', async (req, res) => {
     for (const att of eligible) {
       const buf = bufferMap.get(att.part);
       if (!buf) continue;
-      let name = sanitizeAttachmentFilename(att.filename);
+      let name = safeFilename(att.filename);
       if (usedNames.has(name)) {
         const n = usedNames.get(name) + 1;
         usedNames.set(name, n);
@@ -562,9 +613,9 @@ router.get('/messages/:id/attachments.zip', async (req, res) => {
 
     if (entries.length === 0) return res.status(404).json({ error: 'Could not fetch attachments' });
 
-    const zipName = sanitizeAttachmentFilename((message.subject || 'attachments').substring(0, 100)) + '-attachments.zip';
+    const zipName = safeFilename((message.subject || 'attachments').substring(0, 100)) + '-attachments.zip';
     res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', attachmentContentDisposition(zipName));
+    res.setHeader('Content-Disposition', attachmentDisposition(zipName));
 
     const archive = archiver('zip', { zlib: { level: 6 } });
     archive.on('error', err => {
@@ -625,7 +676,7 @@ router.get('/messages/:id/attachments/:part', async (req, res) => {
     if (!buffer) return res.status(404).json({ error: 'Could not fetch attachment' });
 
     res.setHeader('Content-Type', att.type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', attachmentContentDisposition(att.filename));
+    res.setHeader('Content-Disposition', attachmentDisposition(att.filename));
     res.setHeader('Content-Length', buffer.length);
     res.send(buffer);
   } catch (err) {
@@ -677,7 +728,7 @@ router.patch('/messages/:id/read', async (req, res) => {
   // fast path. The IMAP \Seen flag is written to the acted folder only (below): Gmail
   // propagates \Seen message-wide server-side, and per-copy writes to N folders would
   // multiply round-trips — an asymmetry accepted in the GTD design.
-  if (accountResult.rows[0]?.gtd_enabled && Number(message.sibling_count) > 1) {
+  if (Number(message.sibling_count) > 1 && await accountMaintainsLabelSiblings(message.account_id)) {
     await fanOutReadToSiblings(message.account_id, message.message_id, read);
   }
 
@@ -692,7 +743,7 @@ router.patch('/messages/:id/read', async (req, res) => {
   }
 
   // Refresh GTD section data if this message's thread carries a GTD label (its head shows read state).
-  emitGtdSectionsRefresh([message], req.session.userId);
+  notifyMailMutation([message], req.session.userId);
 
   res.json({ ok: true, is_read: read });
 });
@@ -728,7 +779,7 @@ router.patch('/messages/:id/star', async (req, res) => {
   // handler). Gated on gtd_enabled to keep a non-GTD account byte-identical to pre-GTD.
   // Stars don't affect folder unread counts, so no count adjustment. The IMAP \Flagged
   // write below stays on the acted folder only.
-  if (accountResult.rows[0]?.gtd_enabled && Number(message.sibling_count) > 1) {
+  if (Number(message.sibling_count) > 1 && await accountMaintainsLabelSiblings(message.account_id)) {
     await fanOutStarToSiblings(message.account_id, message.message_id, starred);
   }
 
@@ -742,7 +793,7 @@ router.patch('/messages/:id/star', async (req, res) => {
   }
 
   // Refresh GTD section data if this message's thread carries a GTD label (its head shows star state).
-  emitGtdSectionsRefresh([message], req.session.userId);
+  notifyMailMutation([message], req.session.userId);
   // Reflect the star change on the user's other sessions in place (no full refetch).
   if (!!message.is_starred !== !!starred) {
     imapManager.broadcast({ type: 'message_flags', accountId: message.account_id, changes: [{ id, is_starred: starred }] }, req.session.userId);
@@ -897,11 +948,48 @@ router.post('/folders/rename', async (req, res) => {
 
   try {
     await imapManager.renameFolder(check.rows[0], oldPath, newPath);
+    // IMAP RENAME moves the entire subtree server-side — mirror that in the DB.
+    // Updating only the exact path left every child folder (and its messages)
+    // under the old path: the next folder sync then upserted the renamed tree
+    // from LIST (a visible duplicate), while the per-folder message sync kept
+    // trying to open the stale old child paths forever.
+    const childPrefix = oldPath + delim;
+    // If a sync raced us and already inserted rows at the new paths, drop the
+    // stale old rows instead of colliding with the unique (account_id, path) /
+    // (account_id, uid, folder) constraints.
+    await query(`
+      DELETE FROM folders old
+      WHERE old.account_id = $1
+        AND (old.path = $2 OR substr(old.path, 1, length($3)) = $3)
+        AND EXISTS (
+          SELECT 1 FROM folders n
+          WHERE n.account_id = $1
+            AND n.path = $4 || substr(old.path, length($2) + 1)
+        )`, [accountId, oldPath, childPrefix, newPath]);
+    await query(`
+      UPDATE folders SET path = $4 || substr(path, length($2) + 1), updated_at = NOW()
+      WHERE account_id = $1
+        AND (path = $2 OR substr(path, 1, length($3)) = $3)`,
+      [accountId, oldPath, childPrefix, newPath]);
     await query(
-      'UPDATE folders SET path = $1, name = $2, updated_at = NOW() WHERE account_id = $3 AND path = $4',
-      [newPath, newName.trim(), accountId, oldPath]
+      'UPDATE folders SET name = $1, updated_at = NOW() WHERE account_id = $2 AND path = $3',
+      [newName.trim(), accountId, newPath]
     );
-    await query('UPDATE messages SET folder = $1 WHERE account_id = $2 AND folder = $3', [newPath, accountId, oldPath]);
+    await query(`
+      DELETE FROM messages old
+      WHERE old.account_id = $1
+        AND (old.folder = $2 OR substr(old.folder, 1, length($3)) = $3)
+        AND EXISTS (
+          SELECT 1 FROM messages n
+          WHERE n.account_id = $1
+            AND n.folder = $4 || substr(old.folder, length($2) + 1)
+            AND n.uid = old.uid
+        )`, [accountId, oldPath, childPrefix, newPath]);
+    await query(`
+      UPDATE messages SET folder = $4 || substr(folder, length($2) + 1)
+      WHERE account_id = $1
+        AND (folder = $2 OR substr(folder, 1, length($3)) = $3)`,
+      [accountId, oldPath, childPrefix, newPath]);
     res.json({ ok: true, newPath });
   } catch (err) {
     console.error('Rename folder error:', err);
@@ -909,27 +997,45 @@ router.post('/folders/rename', async (req, res) => {
   }
 });
 
-// Empty folder (delete all messages)
+// Guards against two overlapping empties of the same (account, folder) — a double-click or a
+// second device would otherwise start two background deletes over the same folder.
+const emptyInFlight = new Set();
+
+// Empty folder (delete all messages). Emptying a large folder is a slow IMAP operation (chunked
+// delete + expunge over the provider), so it runs in the BACKGROUND: the request returns 202
+// immediately and the outcome is reported over WebSocket (folder_emptied). This keeps the UI from
+// hanging on big folders. On failure the DB rows are left in place so the next sync reconciles.
 router.post('/folders/empty', async (req, res) => {
   const { accountId, path } = req.body;
   if (!accountId || !path) return res.status(400).json({ error: 'accountId and path required' });
   if (!isValidFolderName(path)) return res.status(400).json({ error: 'Invalid folder path' });
   const check = await query('SELECT * FROM email_accounts WHERE id = $1 AND user_id = $2', [accountId, req.session.userId]);
   if (!check.rows.length) return res.status(404).json({ error: 'Account not found' });
+  const account = check.rows[0];
 
-  try {
-    await imapManager.emptyFolder(check.rows[0], path);
-  } catch (err) {
-    console.error(`IMAP emptyFolder failed for ${path}:`, err.message);
-    return res.status(500).json({ error: 'Failed to empty folder on server' });
-  }
-  await query('DELETE FROM messages WHERE account_id = $1 AND folder = $2', [accountId, path]);
-  await query(
-    'UPDATE folders SET total_count = 0, unread_count = 0 WHERE account_id = $1 AND path = $2',
-    [accountId, path]
-  );
-  imapManager.broadcast({ type: 'sync_complete', accountId }, check.rows[0].user_id);
-  res.json({ ok: true });
+  const inflightKey = `${accountId}:${path}`;
+  if (emptyInFlight.has(inflightKey)) return res.status(409).json({ error: 'This folder is already being emptied' });
+  emptyInFlight.add(inflightKey);
+
+  res.status(202).json({ ok: true, started: true });
+
+  (async () => {
+    try {
+      await imapManager.emptyFolder(account, path);
+      await query('DELETE FROM messages WHERE account_id = $1 AND folder = $2', [accountId, path]);
+      await query(
+        'UPDATE folders SET total_count = 0, unread_count = 0 WHERE account_id = $1 AND path = $2',
+        [accountId, path]
+      );
+      imapManager.broadcast({ type: 'folder_emptied', accountId, folder: path, ok: true }, account.user_id);
+      imapManager.broadcast({ type: 'sync_complete', accountId }, account.user_id);
+    } catch (err) {
+      console.error(`Async emptyFolder failed for ${path}:`, err.message);
+      imapManager.broadcast({ type: 'folder_emptied', accountId, folder: path, ok: false }, account.user_id);
+    } finally {
+      emptyInFlight.delete(inflightKey);
+    }
+  })();
 });
 
 // Bulk mark read/unread
@@ -950,7 +1056,7 @@ router.post('/messages/bulk-read', async (req, res) => {
 
   try {
     const result = await query(
-      `SELECT m.id, m.uid, m.folder, m.is_read, m.account_id, m.message_id, a.gtd_enabled FROM messages m
+      `SELECT m.id, m.uid, m.folder, m.is_read, m.account_id, m.message_id FROM messages m
        JOIN email_accounts a ON m.account_id = a.id
        WHERE m.id = ANY($2::uuid[]) AND a.user_id = $1`,
       [req.session.userId, ids]
@@ -991,7 +1097,12 @@ router.post('/messages/bulk-read', async (req, res) => {
     // acted message's own state changed. That asymmetry is acceptable: nothing else in this
     // path can push a sibling out of sync with its head, and the label-folder tick already
     // self-heals any divergence on the next read.
-    const gtdUpdatedIds = toUpdate.filter(m => m.gtd_enabled).map(m => m.id);
+    const acctIds = [...new Set(toUpdate.map(m => m.account_id))];
+    const gtdAccts = new Set();
+    await Promise.all(acctIds.map(async (aid) => {
+      if (await accountMaintainsLabelSiblings(aid)) gtdAccts.add(aid);
+    }));
+    const gtdUpdatedIds = toUpdate.filter(m => gtdAccts.has(m.account_id)).map(m => m.id);
     if (gtdUpdatedIds.length) await fanOutBulkReadToSiblings(gtdUpdatedIds, read);
     // Reflect the bulk read/unread change on the user's other sessions in place (no full refetch).
     imapManager.broadcast({ type: 'message_flags', changes: toUpdate.map(m => ({ id: m.id, is_read: read })) }, req.session.userId);
@@ -1020,7 +1131,7 @@ router.post('/messages/bulk-read', async (req, res) => {
     }
 
     // Refresh GTD section data for any updated thread that carries a GTD label.
-    emitGtdSectionsRefresh(toUpdate, req.session.userId);
+    notifyMailMutation(toUpdate, req.session.userId);
 
     res.json({ ok: true, updated: toUpdate.map(m => m.id) });
   } catch (err) {
@@ -1145,25 +1256,8 @@ router.post('/messages/bulk-delete', async (req, res) => {
           uid_map(src_id, new_uid) AS (
             SELECT * FROM unnest($2::uuid[], $3::bigint[])
           )
-          INSERT INTO messages (
-            account_id, uid, folder, message_id, subject,
-            from_name, from_email, to_addresses, cc_addresses,
-            reply_to, in_reply_to, date, snippet, is_read, is_starred,
-            has_attachments, flags, body_html, body_text, attachments,
-            thread_references, thread_id, is_bulk,
-            read_changed_at, star_changed_at, spam_score_sa, spam_score_ml,
-            spam_verdict, spam_analyzed_at, spam_details, spam_user_override,
-            category, list_unsubscribe, list_unsubscribe_post, unsubscribed_at
-          )
-          SELECT
-            d.account_id, u.new_uid, $4, d.message_id, d.subject,
-            d.from_name, d.from_email, d.to_addresses, d.cc_addresses,
-            d.reply_to, d.in_reply_to, d.date, d.snippet, d.is_read, d.is_starred,
-            d.has_attachments, d.flags, d.body_html, d.body_text, d.attachments,
-            d.thread_references, d.thread_id, d.is_bulk,
-            d.read_changed_at, d.star_changed_at, d.spam_score_sa, d.spam_score_ml,
-            d.spam_verdict, d.spam_analyzed_at, d.spam_details, d.spam_user_override,
-            d.category, d.list_unsubscribe, d.list_unsubscribe_post, d.unsubscribed_at
+          INSERT INTO messages (${RELOCATE_INSERT_COLS})
+          SELECT ${RELOCATE_SELECT_COLS}
           FROM deleted d
           JOIN uid_map u ON d.id = u.src_id
           ON CONFLICT (account_id, uid, folder) DO NOTHING
@@ -1227,7 +1321,7 @@ router.post('/messages/bulk-delete', async (req, res) => {
     }
 
     // Refresh GTD section data for any deleted thread that still carries a GTD label sibling.
-    emitGtdSectionsRefresh(owned, req.session.userId);
+    notifyMailMutation(owned, req.session.userId);
 
     res.json({ ok: true, deleted: allSucceeded });
   } catch (err) {
@@ -1236,6 +1330,82 @@ router.post('/messages/bulk-delete', async (req, res) => {
   } finally {
     for (const g of moveGuards) imapManager._unguardMoveUid(g.accountId, g.folder, g.uid);
   }
+});
+
+// ── Mailbox cleanup (bloat analysis + per-sender preview) ──────────────────────
+// Both routes are READ-ONLY and strictly scoped to the caller's own account. Nothing here
+// deletes: the actual cleanup is performed by the client feeding the returned ids to the
+// existing /messages/bulk-delete (move-to-Trash) endpoint in <=500 batches.
+
+// Analyze an INBOX for "bloat": how much is bulk mail, the top bulk senders (Tier 1 cleanup
+// targets, exact from_email addresses), and promo-keyword buckets (Tier 2 guidance).
+router.get('/mailbox-usage', async (req, res) => {
+  const { accountId } = req.query;
+  if (!accountId || !UUID_RE.test(accountId)) return res.status(400).json({ error: 'valid accountId required' });
+  const acct = await query('SELECT id, folder_mappings FROM email_accounts WHERE id = $1 AND user_id = $2', [accountId, req.session.userId]);
+  if (!acct.rows.length) return res.status(404).json({ error: 'Account not found' });
+  // Whether Archive is a usable cleanup action for this account (#403): the client
+  // offers Archive vs Trash and needs to know if an archive folder can be resolved.
+  const archiveFolder = await resolveArchiveFolder(accountId, acct.rows[0].folder_mappings);
+
+  const summary = await query(
+    `SELECT count(*)::int AS inbox_total, count(*) FILTER (WHERE is_bulk)::int AS bulk_total
+     FROM messages WHERE account_id = $1 AND folder = 'INBOX'`,
+    [accountId]
+  );
+  // Group senders case-insensitively so a sender that uses mixed-case addresses
+  // (Promo@x vs promo@x) is one row whose count matches the delete — cleanup-preview
+  // matches lower(from_email), so a case-sensitive count here would understate what
+  // clicking the row actually trashes. min(from_email) is a real observed casing for
+  // display; the delete lower-matches it and so still captures every case variant.
+  const senders = await query(
+    `SELECT min(from_email) AS from_email, max(from_name) AS from_name, count(*)::int AS count
+     FROM messages
+     WHERE account_id = $1 AND folder = 'INBOX' AND is_bulk
+       AND from_email IS NOT NULL AND from_email <> ''
+     GROUP BY lower(from_email) ORDER BY count DESC, lower(min(from_email)) LIMIT 25`,
+    [accountId]
+  );
+
+  // Tier 2 promo keyword buckets (fixed set), counted over INBOX in one pass. Informational only.
+  const KEYWORDS = ['% off', 'deal', 'sale', 'newsletter', 'coupon', 'webinar', 'last chance'];
+  const filters = KEYWORDS
+    .map((_, i) => `count(*) FILTER (WHERE subject ILIKE $${i + 2} OR coalesce(snippet,'') ILIKE $${i + 2})::int AS k${i}`)
+    .join(', ');
+  const kw = await query(
+    `SELECT ${filters} FROM messages WHERE account_id = $1 AND folder = 'INBOX'`,
+    [accountId, ...KEYWORDS.map(k => `%${k}%`)]
+  );
+
+  res.json({
+    accountId,
+    inboxTotal: summary.rows[0].inbox_total,
+    bulkTotal: summary.rows[0].bulk_total,
+    archiveAvailable: Boolean(archiveFolder),
+    tier1Senders: senders.rows.map(r => ({ fromEmail: r.from_email, fromName: r.from_name || '', count: r.count })),
+    tier2Keywords: KEYWORDS.map((k, i) => ({ keyword: k, count: kw.rows[0][`k${i}`] })),
+  });
+});
+
+// Return the INBOX message ids for ONE specific sender, so the client can move exactly those to
+// Trash via /messages/bulk-delete. Read-only; strictly scoped to the caller's account, INBOX, and
+// an EXACT (case-insensitive) from_email match — never a wildcard, never another folder. Scoped to
+// is_bulk so it trashes exactly the bulk messages the sender list counted (mailbox-usage counts
+// bulk-only): a non-bulk message from that sender (a receipt, a personal note) is never surprise-
+// trashed. Idempotent: once those messages are trashed, a re-run returns an empty set.
+router.get('/cleanup-preview', async (req, res) => {
+  const { accountId, fromEmail } = req.query;
+  if (!accountId || !UUID_RE.test(accountId)) return res.status(400).json({ error: 'valid accountId required' });
+  if (!fromEmail || typeof fromEmail !== 'string' || !fromEmail.trim()) return res.status(400).json({ error: 'fromEmail required' });
+  const acct = await query('SELECT id FROM email_accounts WHERE id = $1 AND user_id = $2', [accountId, req.session.userId]);
+  if (!acct.rows.length) return res.status(404).json({ error: 'Account not found' });
+
+  const rows = await query(
+    `SELECT id FROM messages
+     WHERE account_id = $1 AND folder = 'INBOX' AND is_bulk AND lower(from_email) = lower($2)`,
+    [accountId, fromEmail.trim()]
+  );
+  res.json({ accountId, fromEmail: fromEmail.trim(), count: rows.rows.length, ids: rows.rows.map(r => r.id) });
 });
 
 // Bulk move to folder
@@ -1334,25 +1504,8 @@ router.post('/messages/bulk-move', async (req, res) => {
         uid_map(src_id, new_uid) AS (
           SELECT * FROM unnest($2::uuid[], $3::bigint[])
         )
-        INSERT INTO messages (
-          account_id, uid, folder, message_id, subject,
-          from_name, from_email, to_addresses, cc_addresses,
-          reply_to, in_reply_to, date, snippet, is_read, is_starred,
-          has_attachments, flags, body_html, body_text, attachments,
-          thread_references, thread_id, is_bulk,
-          read_changed_at, star_changed_at, spam_score_sa, spam_score_ml,
-          spam_verdict, spam_analyzed_at, spam_details, spam_user_override,
-          category, list_unsubscribe, list_unsubscribe_post, unsubscribed_at
-        )
-        SELECT
-          d.account_id, u.new_uid, $4, d.message_id, d.subject,
-          d.from_name, d.from_email, d.to_addresses, d.cc_addresses,
-          d.reply_to, d.in_reply_to, d.date, d.snippet, d.is_read, d.is_starred,
-          d.has_attachments, d.flags, d.body_html, d.body_text, d.attachments,
-          d.thread_references, d.thread_id, d.is_bulk,
-          d.read_changed_at, d.star_changed_at, d.spam_score_sa, d.spam_score_ml,
-          d.spam_verdict, d.spam_analyzed_at, d.spam_details, d.spam_user_override,
-          d.category, d.list_unsubscribe, d.list_unsubscribe_post, d.unsubscribed_at
+        INSERT INTO messages (${RELOCATE_INSERT_COLS})
+        SELECT ${RELOCATE_SELECT_COLS}
         FROM deleted d
         JOIN uid_map u ON d.id = u.src_id
         ON CONFLICT (account_id, uid, folder) DO NOTHING
@@ -1386,7 +1539,7 @@ router.post('/messages/bulk-move', async (req, res) => {
     }
 
     // Refresh GTD section data for any moved thread that still carries a GTD label sibling.
-    emitGtdSectionsRefresh(owned, req.session.userId);
+    notifyMailMutation(owned, req.session.userId);
 
     res.json({ ok: true, moved: movedIds });
   } catch (err) {
@@ -1492,25 +1645,8 @@ router.post('/messages/bulk-archive', async (req, res) => {
         uid_map(src_id, new_uid) AS (
           SELECT * FROM unnest($2::uuid[], $3::bigint[])
         )
-        INSERT INTO messages (
-          account_id, uid, folder, message_id, subject,
-          from_name, from_email, to_addresses, cc_addresses,
-          reply_to, in_reply_to, date, snippet, is_read, is_starred,
-          has_attachments, flags, body_html, body_text, attachments,
-          thread_references, thread_id, is_bulk,
-          read_changed_at, star_changed_at, spam_score_sa, spam_score_ml,
-          spam_verdict, spam_analyzed_at, spam_details, spam_user_override,
-          category, list_unsubscribe, list_unsubscribe_post, unsubscribed_at
-        )
-        SELECT
-          d.account_id, u.new_uid, $4, d.message_id, d.subject,
-          d.from_name, d.from_email, d.to_addresses, d.cc_addresses,
-          d.reply_to, d.in_reply_to, d.date, d.snippet, d.is_read, d.is_starred,
-          d.has_attachments, d.flags, d.body_html, d.body_text, d.attachments,
-          d.thread_references, d.thread_id, d.is_bulk,
-          d.read_changed_at, d.star_changed_at, d.spam_score_sa, d.spam_score_ml,
-          d.spam_verdict, d.spam_analyzed_at, d.spam_details, d.spam_user_override,
-          d.category, d.list_unsubscribe, d.list_unsubscribe_post, d.unsubscribed_at
+        INSERT INTO messages (${RELOCATE_INSERT_COLS})
+        SELECT ${RELOCATE_SELECT_COLS}
         FROM deleted d
         JOIN uid_map u ON d.id = u.src_id
         ON CONFLICT (account_id, uid, folder) DO NOTHING
@@ -1570,7 +1706,7 @@ router.post('/messages/bulk-archive', async (req, res) => {
     }
 
     // Refresh GTD section data for any archived thread that still carries a GTD label sibling.
-    emitGtdSectionsRefresh(owned, req.session.userId);
+    notifyMailMutation(owned, req.session.userId);
 
     res.json({ ok: true, archived: archivedIds.map(a => a.id), noArchiveFolder });
   } catch (err) {
@@ -1755,7 +1891,7 @@ router.post('/messages/:id/snooze', async (req, res) => {
   }
 
   // Refresh GTD section data if the snoozed conversation carries a GTD label (its in_inbox flips).
-  emitGtdSectionsRefresh(convo, req.session.userId);
+  notifyMailMutation(convo, req.session.userId);
 
   res.json({ ok: true });
 });
@@ -1845,7 +1981,7 @@ router.delete('/messages/:id', async (req, res) => {
   imapManager.broadcast({ type: 'folder_updated', folder: message.folder, accountId: message.account_id }, req.session.userId);
   // Refresh GTD section data if this thread still carries a GTD label sibling (same staleness the
   // bulk-delete route addresses, reached via the single-message delete button).
-  emitGtdSectionsRefresh([message], req.session.userId);
+  notifyMailMutation([message], req.session.userId);
   res.json({ ok: true });
 });
 
@@ -1930,12 +2066,15 @@ async function moveForSpamLabel(messageId, userId, destinationFolder, label) {
   adjustFolderCounts(account.id, message.folder, -1, -wasUnread);
   adjustFolderCounts(account.id, destinationFolder, 1, wasUnread);
 
-  // Training log: capture the decision for future model training.
+  // Training log: capture the decision for future model training. Record the UID that now
+  // lives in the destination folder: on a UIDPLUS move the row was re-keyed to newUid above,
+  // so message.uid (the pre-move source UID) would no longer match the messages row. Non-UIDPLUS
+  // servers keep the source UID at the destination, so newUid is null there and we fall back to it.
   await query(
     `INSERT INTO spam_training_log
        (user_id, account_id, message_id_header, message_uid, folder, label, source)
      VALUES ($1, $2, $3, $4, $5, $6, 'manual')`,
-    [userId, account.id, message.message_id, message.uid, destinationFolder, label]
+    [userId, account.id, message.message_id, newUid ?? message.uid, destinationFolder, label]
   );
 
   // If folder_mappings.spam is not yet configured, learn from the discovered folder.
@@ -1955,7 +2094,7 @@ async function moveForSpamLabel(messageId, userId, destinationFolder, label) {
   // Refresh GTD section data if the (un)spammed message's thread carries a GTD label. Covers both
   // /spam and /ham, which share this mover. The already-in-folder no-op path above returns
   // early without a move, so GTD section data is untouched there.
-  emitGtdSectionsRefresh([message], userId);
+  notifyMailMutation([message], userId);
 
   return { ok: true, status: 200, body: { ok: true, folder: destinationFolder, newUid: newUid || null } };
 }

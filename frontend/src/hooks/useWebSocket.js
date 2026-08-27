@@ -5,9 +5,10 @@ import { api } from '../utils/api.js';
 import { installCapacitorNativeBridge } from '../utils/capacitorNativeBridge.js';
 import { playNotificationSound } from '../utils/notificationSounds.js';
 import { pendingMarkReadMap } from '../utils/pendingReads.js';
-import { gtdActiveForContext } from '../utils/gtd.js';
 import { updateFaviconBadge } from '../themes.js';
+import { dispatchPluginWsMessage, dispatchPluginReconnect } from '../plugins/events.js';
 import { accountAffectsUnifiedInbox } from '../utils/unifiedInbox.js';
+import { recordDiagEvent } from '../utils/diagEvents.js';
 
 // Compute the correct favicon count given unread counts and the currently
 // selected account. Reads selectedAccountId from the store directly so this
@@ -30,6 +31,7 @@ function _faviconCount(counts) {
 // (current optimistic + pending size). If the server count is already lower,
 // the DB has applied those reads and subtracting again would double-count.
 function _applyServerCounts(counts) {
+  const _before = useStore.getState().unreadCounts.total;
   if (pendingMarkReadMap.size > 0) {
     const state = useStore.getState();
     const current = state.unreadCounts;
@@ -51,6 +53,7 @@ function _applyServerCounts(counts) {
   } else {
     useStore.setState({ unreadCounts: counts });
   }
+  recordDiagEvent({ category: 'unread', cause: 'server_counts', beforeTotal: _before, afterTotal: useStore.getState().unreadCounts.total });
 }
 
 async function _forwardNativeNewMailNotification(notification) {
@@ -121,16 +124,15 @@ export function useWebSocket() {
       ws._pingInterval = pingInterval;
       // On reconnect, catch up on any messages that arrived during the outage
       if (wasReconnect) {
+        recordDiagEvent({ category: 'ws', type: 'reconnect' });
         window.dispatchEvent(new CustomEvent('mailflow:refresh'));
         api.getUnreadCounts().then(counts => {
           useStore.setState({ unreadCounts: counts });
         }).catch(() => {});
-        // Rail sections can drift during the outage — gtd_sections_updated events
-        // fired while the socket was down are lost, not buffered. Refetch them the
-        // same way we refresh messages/unread, but only for GTD users so a non-GTD
-        // context adds no extra traffic on every reconnect.
-        const { accounts, selectedAccountId, scheduleGtdSectionsFetch } = useStore.getState();
-        if (gtdActiveForContext(accounts, selectedAccountId)) scheduleGtdSectionsFetch();
+        // A plugin's rail/derived data can drift during the outage — events fired while the socket
+        // was down are lost, not buffered. Let each activated plugin resync (GTD refetches its
+        // sections). Core stays plugin-agnostic.
+        dispatchPluginReconnect();
       }
     };
 
@@ -170,6 +172,10 @@ export function useWebSocket() {
         const alertMessages = data.alertMessages ?? messages;
         const alertCount = data.alertCount ?? count;
         const isInbox = !folder || folder === 'INBOX';
+
+        // Note: no raw folder name here — a custom folder name would be identifying,
+        // and the scrub net only catches emails/IPs/tokens. isInbox is the safe signal.
+        recordDiagEvent({ category: 'event', type: 'new_messages', accountId, isInbox, count, alertCount });
 
         if (messages && messages.length > 0) {
           // In-app notifications and sounds are inbox-only — non-inbox folder syncs
@@ -233,6 +239,7 @@ export function useWebSocket() {
           : counts.total;
         const newCounts = { total, byAccount };
         useStore.setState({ unreadCounts: newCounts });
+        recordDiagEvent({ category: 'unread', cause: 'exists_hint', accountId, delta, beforeTotal: counts.total, afterTotal: total });
         // Update favicon immediately — do not wait for React's render cycle.
         // With a pre-cached base this is synchronous (no image load round-trip).
         updateFaviconBadge(_faviconCount(newCounts));
@@ -324,6 +331,20 @@ export function useWebSocket() {
         break;
       }
 
+      case 'folder_emptied': {
+        // Background empty finished (see mail.js /folders/empty). Toast the outcome and refresh
+        // the view and counts either way — on failure the messages are still on the server and
+        // should reappear.
+        addNotification({ title: data.ok ? t('sidebar.emptied') : t('sidebar.emptyFailed') });
+        window.dispatchEvent(new CustomEvent('mailflow:refresh'));
+        window.dispatchEvent(new CustomEvent('mailflow:sync_done'));
+        api.getUnreadCounts().then(_applyServerCounts).catch(() => {});
+        if (data.accountId && useStore.getState().folders[data.accountId]) {
+          api.getFolders(data.accountId).then(f => setFolders(data.accountId, f)).catch(() => {});
+        }
+        break;
+      }
+
       case 'snooze_wakeup': {
         window.dispatchEvent(new CustomEvent('mailflow:refresh'));
         api.getUnreadCounts().then(counts => {
@@ -339,22 +360,6 @@ export function useWebSocket() {
         window.dispatchEvent(new CustomEvent('mailflow:refresh'));
         window.dispatchEvent(new CustomEvent('mailflow:sync_done'));
         api.getUnreadCounts().then(_applyServerCounts).catch(() => {});
-        break;
-      }
-
-      case 'gtd_sections_updated': {
-        // GTD label folders changed (tick, classify copy/remove, or a transition
-        // strip). Refetch the rail/tab sections — NOT gated on selectedFolder
-        // (label folders never become the selected folder), debounced in the
-        // store since this can fire several times per tick. Only refetch when the
-        // event's account is in the current rail scope.
-        const store = useStore.getState();
-        if (
-          (store.selectedAccountId === null && accountAffectsUnifiedInbox(store.accounts, data.accountId)) ||
-          store.selectedAccountId === data.accountId
-        ) {
-          store.scheduleGtdSectionsFetch();
-        }
         break;
       }
 
@@ -379,6 +384,11 @@ export function useWebSocket() {
         }
         break;
       }
+
+      default:
+        // A message type core doesn't handle — hand it to any activated plugin that registered for
+        // it (e.g. GTD's 'gtd_sections_updated'). No-op when nothing is registered.
+        dispatchPluginWsMessage(data);
     }
   }, [addNotification, updateAccount, setFolders, setBackfillProgress, t]);
 

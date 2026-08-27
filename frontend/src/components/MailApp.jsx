@@ -12,12 +12,12 @@ import { buildKeyMap, buildModKeyMap, getEffectiveShortcuts, getGroupedActions, 
 import Sidebar from './Sidebar.jsx';
 import MessageList from './MessageList.jsx';
 import ReadingPane from './ReadingPane.jsx';
-import GtdSidebarContent from './GtdSidebarContent.jsx';
 import NotificationToasts from './NotificationToasts.jsx';
 import CommandPalette from './CommandPalette.jsx';
-import { gtdActiveForContext } from '../utils/gtd.js';
+import { usePluginSlot, PluginRuntime } from '../plugins/PluginSlot.jsx';
 
 const ContactsPage = lazy(() => import('./ContactsPage.jsx'));
+const WindowLayer  = lazy(() => import('./WindowLayer.jsx'));
 
 const ComposeModal = lazy(() => import('./ComposeModal.jsx'));
 const AdminPanel   = lazy(() => import('./AdminPanel.jsx'));
@@ -69,7 +69,7 @@ export default function MailApp() {
     sidebarWidth, setSidebarWidth, setIsSidebarResizing,
     showContacts, setTodoistConnected,
     accounts, rightSidebarWidth, setRightSidebarWidth, isRightSidebarResizing, setIsRightSidebarResizing,
-    fetchGtdSections, rightSidebarHidden, toggleRightSidebarHidden,
+    rightSidebarHidden, toggleRightSidebarHidden,
   } = useStore();
   const syncInterval = useStore(s => s.syncInterval);
   const autoLockMinutes = useStore(s => s.autoLockMinutes);
@@ -98,19 +98,10 @@ export default function MailApp() {
     };
   }, [autoLockMinutes, lockScreen]);
 
-  // Single owner of the GTD sections fetch: reload whenever the context (unified
-  // vs a single account) changes and GTD is active there. Both the rail and the
-  // tab list read the resulting store slice; live updates arrive via WS.
-  const gtdActive = gtdActiveForContext(accounts, selectedAccountId);
-  // Also key on the set of GTD-enabled accounts so enabling a second account refetches
-  // the unified sections — gtdActive alone stays true and wouldn't retrigger when it
-  // flips from one enabled account to two.
-  const gtdEnabledKey = accounts.filter(a => a.gtd_enabled).map(a => a.id).sort().join(',');
-  useEffect(() => {
-    if (gtdActive) fetchGtdSections();
-  }, [gtdActive, selectedAccountId, gtdEnabledKey, fetchGtdSections]);
-
   const scale = fontSize / 100;
+  const hasNativeBridge = Boolean(
+    window.mailflowNative || window.MailFlowAndroid || window.Capacitor?.isNativePlatform?.()
+  );
   const [vpSize, setVpSize] = useState({ w: window.innerWidth, h: window.innerHeight });
   useEffect(() => {
     const update = () => setVpSize({ w: window.innerWidth, h: window.innerHeight });
@@ -198,12 +189,12 @@ export default function MailApp() {
   // live shortcut map via the existing helpers — no new plumbing. '' when unbound.
   const rightSidebarToggleParsed = parseModKey(getEffectiveShortcuts(shortcuts).toggleRightSidebar);
   const rightSidebarToggleHint = rightSidebarToggleParsed ? `${modLabel(rightSidebarToggleParsed.mod)}${rightSidebarToggleParsed.bare}` : '';
-  // The right sidebar renders when a feature supplies content. GTD is the
-  // current (only) provider; the layout/shortcut infrastructure below is
-  // feature-agnostic and keys off the seam, not the feature.
-  const rightSidebarContent = gtdActive
-    ? <GtdSidebarContent onCollapse={toggleRightSidebarHidden} toggleHint={rightSidebarToggleHint} />
-    : null;
+  // The right sidebar renders when a plugin supplies content for the 'right-sidebar' slot. Core is
+  // plugin-agnostic here — it places the seam; a plugin (currently GTD) fills it. The layout/shortcut
+  // infrastructure below keys off whether any content exists, not off any specific feature.
+  const rightSidebarCtx = { accounts, selectedAccountId, onCollapse: toggleRightSidebarHidden, toggleHint: rightSidebarToggleHint };
+  const rightSidebarProviders = usePluginSlot('right-sidebar', rightSidebarCtx);
+  const rightSidebarContent = rightSidebarProviders.length ? rightSidebarProviders[0].render(rightSidebarCtx) : null;
   const rightSidebarApplicable = !isMobile && currentLayout.direction === 'row' && rightSidebarContent != null;
 
   const handleListResizeMouseDown = (e) => {
@@ -870,8 +861,11 @@ export default function MailApp() {
 
       <Suspense fallback={lazyFallback}>{composing && <ComposeModal />}</Suspense>
       <Suspense fallback={lazyFallback}>{showAdmin && <AdminPanel />}</Suspense>
-      <Suspense fallback={null}><ElectronNotificationBridge /></Suspense>
+      {/* Detached message windows (#219) — desktop only. */}
+      {!isMobile && <Suspense fallback={null}><WindowLayer /></Suspense>}
+      <Suspense fallback={null}>{hasNativeBridge && <ElectronNotificationBridge />}</Suspense>
       <NotificationToasts />
+      <PluginRuntime />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
 
       {/* Keyboard shortcut help overlay — toggled by the '?' key */}

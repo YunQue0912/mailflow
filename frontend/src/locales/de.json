@@ -191,6 +191,7 @@
     "selectToRead": "Nachricht auswählen zum Lesen",
     "noSubject": "(kein Betreff)",
     "to": "An:",
+    "via": "über",
     "attachment_one": "{{count}} Anhang",
     "attachment_other": "{{count}} Anhänge",
     "loadingError": "Nachrichteninhalt konnte nicht geladen werden",
@@ -417,12 +418,15 @@
     "renameFailed": "Umbenennen fehlgeschlagen",
     "deleteFailed": "Löschen fehlgeschlagen",
     "emptyFailed": "Leeren fehlgeschlagen",
+    "emptying": "„{{name}}” wird geleert…",
+    "emptied": "Ordner geleert",
     "backToAccounts": "Zurück zu Konten",
     "updateAvailable": "Update verfügbar: v{{version}}"
   },
   "contextMenu": {
     "find": "Suchen",
     "open": "Öffnen",
+    "openInNewWindow": "In neuem Fenster öffnen",
     "markRead": "Als gelesen markieren",
     "markUnread": "Als ungelesen markieren",
     "star": "Nachricht markieren",
@@ -442,6 +446,7 @@
     },
     "copySubject": "Betreff kopieren",
     "copySender": "Absenderadresse kopieren",
+    "copyLink": "Link kopieren",
     "viewHeaders": "Vollständige Kopfzeilen anzeigen",
     "delete": "Löschen",
     "headers": {
@@ -570,6 +575,9 @@
         "label": "Als Delegiert markieren",
         "description": "Die ausgewählte Nachricht als Delegiert einordnen"
       },
+      "gtdUndo": {
+        "description": "Letzte GTD-Einordnung rückgängig machen"
+      },
       "toggleRightSidebar": {
         "label": "Rechte Seitenleiste umschalten",
         "description": "Rechte Seitenleiste aus- oder einblenden"
@@ -608,9 +616,30 @@
     "errorProcess": "Bild konnte nicht verarbeitet werden."
   },
   "admin": {
+    "cleanup": {
+      "title": "Postfach aufräumen",
+      "intro": "Finde Massen-Mails, die deinen Posteingang überfüllen, und räume auf. Wähle, ob du sie archivierst (bleiben erhalten und durchsuchbar) oder in den Papierkorb verschiebst (wiederherstellbar, bis du ihn leerst).",
+      "account": "Konto",
+      "summary": "{{bulk}} von {{total}} Posteingangs-Nachrichten sind Massen-E-Mails ({{pct}}%).",
+      "tier1Title": "Größte Massenabsender",
+      "tier1Desc": "Das sind die Newsletter- und Marketing-Absender mit dem höchsten Volumen in deinem Posteingang. Wird einer bearbeitet, wird die gesamte Posteingangs-Mail dieses Absenders mit der gewählten Aktion verarbeitet.",
+      "noneFound": "Keine Massenabsender gefunden.",
+      "moveToTrash": "In den Papierkorb",
+      "confirm": "Alle {{count}} Posteingangs-Nachrichten von {{sender}} in den Papierkorb verschieben? Sie lassen sich aus dem Papierkorb wiederherstellen, bis Sie ihn leeren.",
+      "tier2Title": "Häufige Werbebegriffe",
+      "tier2Desc": "Suchen Sie nach diesen Begriffen, um den Rest selbst zu prüfen und zu löschen. Sie betreffen viele Absender, überfliegen Sie die Ergebnisse also vor dem Löschen.",
+      "tier3Title": "Den Rest aufräumen",
+      "tier3Desc": "Für alles Übrige nach Absender oder Stichwort suchen, alle auswählen und löschen. Löschungen wandern zuerst in den Papierkorb, Sie können also prüfen, bevor Sie ihn leeren.",
+      "action": "Aufräum-Aktion",
+      "actionArchive": "Archivieren (empfohlen)",
+      "archive": "Archivieren",
+      "confirmArchive": "Alle {{count}} Posteingangs-Nachrichten von {{sender}} archivieren? Sie bleiben in deinem Archiv-Ordner und weiterhin durchsuchbar.",
+      "noArchiveFolder": "Dieses Konto hat keinen Archiv-Ordner, daher ist nur In den Papierkorb verschieben verfügbar."
+    },
     "title": "Einstellungen",
     "close": "Schließen",
     "tabs": {
+      "cleanup": "Aufräumen",
       "accounts": "Konten",
       "appearance": "Darstellung",
       "notifications": "Benachrichtigungen",
@@ -630,7 +659,8 @@
       "groupAccountMail": "Konto und Mail",
       "groupDisplay": "Anzeige",
       "groupSecurityIntegrations": "Sicherheit und Integrationen",
-      "groupAdmin": "Administration"
+      "groupAdmin": "Administration",
+      "plugins": "Plugins"
     },
     "accounts": {
       "title": "E-Mail-Konten",
@@ -1215,7 +1245,9 @@
       "adminGroupClaimDesc": "Name des JWT-Claims, der die Gruppen des Benutzers enthält (z. B. groups). Leer lassen, um gruppenbasierte Admin-Zuweisung zu deaktivieren.",
       "adminGroupValue": "Admin-Gruppenwert",
       "adminGroupValuePh": "mailflow-admins",
-      "adminGroupValueDesc": "Der Gruppenname, der Admin-Zugriff gewährt. Benutzer in dieser Gruppe werden bei jeder SSO-Anmeldung zu Admins; Benutzer, die nicht in dieser Gruppe sind, verlieren den Admin-Zugriff."
+      "adminGroupValueDesc": "Der Gruppenname, der Admin-Zugriff gewährt. Benutzer in dieser Gruppe werden bei jeder SSO-Anmeldung zu Admins; Benutzer, die nicht in dieser Gruppe sind, verlieren den Admin-Zugriff.",
+      "loginMatchClaim": "Bestehende Konten zuordnen über",
+      "loginMatchClaimDesc": "OIDC-Claim, der mit dem Benutzernamen jedes MailFlow-Kontos abgeglichen wird, wenn eine SSO-Anmeldung erstmals mit einem bestehenden Konto verknüpft wird (Bereitstellungsmodus „Nur bei bestehenden Konten anmelden“). Standard ist email. Verwenden Sie preferred_username, upn usw. für Identitätsanbieter, deren Benutzernamen keine E-Mail-Adressen sind – nur wenn Ihr Anbieter garantiert, dass der Claim eindeutig und nicht vom Benutzer änderbar ist."
     },
     "integrations": {
       "title": "Integrationen",
@@ -1423,6 +1455,15 @@
       "autoLockNeedsPin": "Lege eine PIN fest, um die automatische Sperre zu aktivieren",
       "autoLockOff": "Aus",
       "autoLockMin": "{{n}} Min."
+    },
+    "plugins": {
+      "title": "Plugins",
+      "description": "Aktivieren oder deaktivieren Sie optionale Funktionen für Ihr Konto. Ein aktiviertes Plugin fügt eigene Einstellungen und Oberflächen hinzu.",
+      "activated": "Aktiviert",
+      "deactivated": "Nicht aktiviert",
+      "empty": "In dieser Version sind keine Plugins verfügbar.",
+      "error": "Das Plugin konnte nicht aktualisiert werden. Bitte versuchen Sie es erneut.",
+      "configureIn": "Optionen in {{location}} konfigurieren"
     }
   },
   "blockList": {
@@ -1480,7 +1521,6 @@
     "carddavBadge": "Von CardDAV synchronisiert"
   },
   "todoist": {
-    "betaLabel": "Beta",
     "title": "Todoist-Aufgabe erstellen",
     "taskTitle": "Aufgabentitel",
     "taskTitlePh": "Was muss erledigt werden?",
@@ -1519,6 +1559,7 @@
     "removeFrom": "Aus {{state}} entfernen",
     "classified": "Label angewendet",
     "classifyFailed": "Label konnte nicht angewendet werden",
+    "undoFailed": "Label konnte nicht rückgängig gemacht werden",
     "removed": "Label entfernt",
     "removeFailed": "Label konnte nicht entfernt werden",
     "done": "Als erledigt markieren",
@@ -1531,5 +1572,22 @@
       "someday": "Irgendwann",
       "reference": "Referenz"
     }
+  },
+  "window": {
+    "minimize": "Minimieren",
+    "close": "Schließen"
+  },
+  "diagnostics": {
+    "section": "Diagnose",
+    "blurb": "Ein bereinigter Bericht, den du zur Fehlersuche teilen kannst. Er enthält keine E-Mail-Adressen, Namen, Nachrichteninhalte oder geheimen Daten.",
+    "generateReport": "Diagnosebericht erstellen",
+    "title": "Diagnosebericht",
+    "includes": "Enthält: App-Versionen, deine Umgebung, Anzahl pro Konto und Ordner, Kategorien von Synchronisierungsfehlern und Serverstatus. Konto-IDs und benutzerdefinierte Ordnernamen werden durch einmalige Hashes ersetzt.",
+    "excludes": "Ausgeschlossen: E-Mail-Adressen, Namen, Betreffzeilen, Nachrichteninhalte, Passwörter sowie API-Schlüssel oder -Tokens.",
+    "download": "JSON herunterladen",
+    "copied": "Bericht kopiert",
+    "copyFailed": "Kopieren fehlgeschlagen",
+    "generating": "Bericht wird erstellt…",
+    "error": "Bericht konnte nicht erstellt werden."
   }
 }

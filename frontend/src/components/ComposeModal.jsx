@@ -777,7 +777,12 @@ export default function ComposeModal() {
       if (draftUid != null && draftFolder != null && draftAccountId) {
         api.deleteDraft(draftAccountId, draftUid, draftFolder).catch(() => {});
       }
-      const sentFolder = accounts.find(a => a.id === accountId)?.folder_mappings?.sent || 'Sent';
+      // Prefer the Sent folder the backend actually resolved to; fall back to the account's
+      // mapping only if the response didn't carry one. Avoids navigating "View" to a stale
+      // mapping (e.g. a non-selectable "[Gmail]" parent) that the send path bypassed (#386).
+      const sentFolder = sendResult?.sentFolder
+        || accounts.find(a => a.id === accountId)?.folder_mappings?.sent
+        || 'Sent';
       // The message was delivered; sentCopySaved:false means it couldn't be saved to the
       // account's Sent folder — tell the user so they know their record is incomplete.
       const sentCopyFailed = sendResult?.sentCopySaved === false;
@@ -1608,6 +1613,7 @@ export default function ComposeModal() {
       )}
     <div
       ref={composeWindowRef}
+      className="compose-window"
       onKeyDown={handleKeyDown}
       style={maximized ? {
         position: 'fixed', top: 28, left: 28, right: 28, bottom: 28,
@@ -1789,7 +1795,7 @@ export default function ComposeModal() {
             getSuggestions={getSuggestions}
           />
           {(!showCc || !showBcc) && (
-            <div style={{ display: 'flex', flexShrink: 0 }}>
+            <div className="compose-ccbcc-quickadd" style={{ display: 'flex', flexShrink: 0 }}>
               {!showCc && (
                 <button onClick={() => setShowCc(true)} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: 11, padding: '9px 0 4px 6px' }}>
                   {t('compose.cc')}
