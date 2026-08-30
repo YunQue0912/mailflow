@@ -24,7 +24,6 @@ MailFlow is dual-licensed:
 
 If you contribute code, please read the [Contributor License Agreement](CLA.md). By submitting a pull request you agree to its terms.
 
-
 ## Features
 
 - **Unified inbox** — all accounts merged in one view, sorted by date
@@ -114,6 +113,11 @@ configurable per account, and accounts with GTD off behave exactly as before.
 
 There are three ways to run MailFlow. The pre-built image method is recommended for most users.
 
+> **YunQue production server:** `/opt/mailflow` uses a server-specific Compose file behind the
+> independent Edge Gateway. Do not replace it with any generic Compose example from this README.
+> Follow [`contrib/EDGE_GATEWAY_PRODUCTION.md`](contrib/EDGE_GATEWAY_PRODUCTION.md) and use the
+> installed `mailflow-update` command for that deployment.
+
 ---
 
 ## Option A — Pre-built images (recommended)
@@ -135,12 +139,12 @@ curl -o .env               https://raw.githubusercontent.com/maathimself/mailflo
 
 Edit `.env` — the required fields are:
 
-| Variable | Description |
-|---|---|
-| `APP_URL` | Full URL, e.g. `https://mail.example.com` |
-| `SESSION_SECRET` | `openssl rand -hex 32` |
-| `DB_PASSWORD` | `openssl rand -hex 16` |
-| `ENCRYPTION_KEY` | `openssl rand -hex 32` |
+| Variable         | Description                               |
+| ---------------- | ----------------------------------------- |
+| `APP_URL`        | Full URL, e.g. `https://mail.example.com` |
+| `SESSION_SECRET` | `openssl rand -hex 32`                    |
+| `DB_PASSWORD`    | `openssl rand -hex 16`                    |
+| `ENCRYPTION_KEY` | `openssl rand -hex 32`                    |
 
 ### 3. Start
 
@@ -152,10 +156,10 @@ MailFlow will be available on port 443 (HTTPS, self-signed certificate) and port
 
 **Ports are configurable in `.env`:**
 
-| Variable | Default | Description |
-|---|---|---|
-| `APP_PORT` | `443` | HTTPS port |
-| `APP_HTTP_PORT` | `80` | HTTP port |
+| Variable        | Default | Description |
+| --------------- | ------- | ----------- |
+| `APP_PORT`      | `443`   | HTTPS port  |
+| `APP_HTTP_PORT` | `80`    | HTTP port   |
 
 **Optional — automatic HTTPS via Let's Encrypt:** set `DOMAIN` and `ACME_EMAIL` in `.env`, download the HTTPS overlay, then restart:
 
@@ -211,12 +215,12 @@ cp .env.example .env
 
 Edit `.env` — the required fields are:
 
-| Variable | Description |
-|---|---|
-| `APP_URL` | Full URL, e.g. `https://mail.example.com` |
-| `SESSION_SECRET` | `openssl rand -hex 32` |
-| `DB_PASSWORD` | `openssl rand -hex 16` |
-| `ENCRYPTION_KEY` | `openssl rand -hex 32` |
+| Variable         | Description                               |
+| ---------------- | ----------------------------------------- |
+| `APP_URL`        | Full URL, e.g. `https://mail.example.com` |
+| `SESSION_SECRET` | `openssl rand -hex 32`                    |
+| `DB_PASSWORD`    | `openssl rand -hex 16`                    |
+| `ENCRYPTION_KEY` | `openssl rand -hex 32`                    |
 
 ### 3. Build and start
 
@@ -262,6 +266,7 @@ No container runtime required. The steps below use Ubuntu/Debian; adapt package 
 ### 1. Install system dependencies
 
 **Ubuntu / Debian:**
+
 ```bash
 # Node.js 22 via NodeSource
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
@@ -269,6 +274,7 @@ sudo apt-get install -y nodejs postgresql redis-server nginx
 ```
 
 **macOS (Homebrew):**
+
 ```bash
 brew install node@22 postgresql@16 redis nginx
 brew services start postgresql@16
@@ -299,16 +305,16 @@ cp .env.example .env
 
 Edit `.env`. In addition to the required secrets, set these for a native install:
 
-| Variable | Value |
-|---|---|
-| `APP_URL` | Full URL, e.g. `https://mail.example.com` |
-| `SESSION_SECRET` | `openssl rand -hex 32` |
-| `DB_HOST` | `localhost` |
-| `DB_PORT` | `5432` — override for a Postgres server on a non-standard port |
-| `DB_NAME` | `mailflow` |
-| `DB_USER` | `mailflow` |
-| `DB_PASSWORD` | password you set in step 2 |
-| `REDIS_URL` | `redis://localhost:6379` — or `redis+unix:///path/to/redis.sock` for a Unix socket |
+| Variable         | Value                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| `APP_URL`        | Full URL, e.g. `https://mail.example.com`                                          |
+| `SESSION_SECRET` | `openssl rand -hex 32`                                                             |
+| `DB_HOST`        | `localhost`                                                                        |
+| `DB_PORT`        | `5432` — override for a Postgres server on a non-standard port                     |
+| `DB_NAME`        | `mailflow`                                                                         |
+| `DB_USER`        | `mailflow`                                                                         |
+| `DB_PASSWORD`    | password you set in step 2                                                         |
+| `REDIS_URL`      | `redis://localhost:6379` — or `redis+unix:///path/to/redis.sock` for a Unix socket |
 
 For Docker installs, the bundled Postgres/Redis work out of the box. To point at **external** database or cache servers (any host/port), or to store data on a host **bind mount** (e.g. an Unraid appdata share with `PUID`/`PGID`), see the "Database & Redis" and "Storage & permissions" sections of [`.env.example`](.env.example).
 | `ENCRYPTION_KEY` | `openssl rand -hex 32` |
@@ -418,26 +424,26 @@ Gmail requires an **App Password** (not your normal password):
 3. Create a new App Password — name it "MailFlow"
 4. Use the 16-character password in the MailFlow account form
 
-| Setting | Value |
-|---|---|
-| IMAP Host | `imap.gmail.com` |
-| IMAP Port | `993` |
-| SMTP Host | `smtp.gmail.com` |
-| SMTP Port | `587` |
-| Username | your Gmail address |
+| Setting   | Value              |
+| --------- | ------------------ |
+| IMAP Host | `imap.gmail.com`   |
+| IMAP Port | `993`              |
+| SMTP Host | `smtp.gmail.com`   |
+| SMTP Port | `587`              |
+| Username  | your Gmail address |
 
 ### iCloud / Apple Mail
 
 1. Go to [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords
 2. Generate a password — name it "MailFlow"
 
-| Setting | Value |
-|---|---|
-| IMAP Host | `imap.mail.me.com` |
-| IMAP Port | `993` |
-| SMTP Host | `smtp.mail.me.com` |
-| SMTP Port | `587` |
-| Username | your full iCloud email (`you@icloud.com`) |
+| Setting   | Value                                     |
+| --------- | ----------------------------------------- |
+| IMAP Host | `imap.mail.me.com`                        |
+| IMAP Port | `993`                                     |
+| SMTP Host | `smtp.mail.me.com`                        |
+| SMTP Port | `587`                                     |
+| Username  | your full iCloud email (`you@icloud.com`) |
 
 ### Microsoft 365 / Outlook (OAuth2)
 
@@ -498,6 +504,10 @@ Any standard IMAP/SMTP server works. Use port 993 for IMAP (TLS) and
 ---
 
 ## Management
+
+The commands below apply to generic installations. On the YunQue production server, do not run
+`docker compose down -v`, do not publish MailFlow frontend ports, and do not replace the
+server-specific Compose file; follow the production note linked above.
 
 ```bash
 # View all logs
@@ -616,6 +626,7 @@ MailFlow is free and open source. If it's useful to you, consider supporting dev
 ### GitHub Sponsors
 
 <!-- SPONSORS-START -->
+
 _No sponsors yet — be the first!_
 <!-- SPONSORS-END -->
 

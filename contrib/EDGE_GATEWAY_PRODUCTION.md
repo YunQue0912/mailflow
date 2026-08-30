@@ -5,6 +5,16 @@
 本说明只适用于当前 `/opt/mailflow` 生产 Compose。仓库通用 `docker-compose.yml`、GHCR 快速安装
 Compose 和 Caddy 部署保持通用，不得直接覆盖服务器专用文件。
 
+## 当前状态
+
+2026-08-30 已完成稳定态切换和清理：
+
+- `mailflow-frontend` 运行时只连接 `mailflow_internal` 与 `edge_mailflow`；
+- frontend 不发布宿主机端口，公网访问只经过独立 Edge Gateway；
+- 服务器发布只使用 `/opt/mailflow/docker-compose.yml`，不再需要额外 Compose 文件；
+- `/usr/local/sbin/mailflow-update` 已安装稳定态网络契约检查；
+- ProjectFlow 内部网络、旧入口容器和迁移配置均不再作为 MailFlow 回退路径。
+
 生产基线：
 
 - frontend 镜像使用已批准的精确 `X.Y.Z-custom.N` 版本。
