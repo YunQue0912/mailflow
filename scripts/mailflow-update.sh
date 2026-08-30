@@ -39,7 +39,7 @@ version="${1#v}"
   die "Version must match X.Y.Z-custom.N (without a mutable tag such as latest)."
 }
 
-for command in awk curl docker sha256sum; do
+for command in awk curl docker python3 sha256sum; do
   command -v "$command" >/dev/null 2>&1 || die "Required command is missing: $command"
 done
 docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required.'
@@ -47,6 +47,24 @@ docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required.'
 cd "$MAILFLOW_DIR" || die "Deployment directory does not exist: $MAILFLOW_DIR"
 [[ -f docker-compose.yml ]] || die "Missing $MAILFLOW_DIR/docker-compose.yml"
 [[ -f .env ]] || die "Missing $MAILFLOW_DIR/.env"
+
+compose_config="$(docker compose config --format json)" || {
+  die 'Production Compose configuration is invalid.'
+}
+printf '%s' "$compose_config" | python3 -c '
+import json
+import sys
+
+config = json.load(sys.stdin)
+frontend_networks = config["services"]["frontend"]["networks"]
+if set(frontend_networks) != {"mailflow", "edge_mailflow"}:
+    raise SystemExit("frontend must connect only to mailflow and edge_mailflow")
+if "mailflow-ingress" not in frontend_networks["edge_mailflow"].get("aliases", []):
+    raise SystemExit("edge_mailflow must define alias mailflow-ingress")
+edge_network = config["networks"]["edge_mailflow"]
+if edge_network.get("name") != "edge_mailflow" or not edge_network.get("external"):
+    raise SystemExit("edge_mailflow must be the external edge_mailflow network")
+' || die 'Production Compose does not satisfy the stable Edge network contract.'
 
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$MAILFLOW_DIR/.mailflow-update.lock"
