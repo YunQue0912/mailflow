@@ -17,6 +17,9 @@ import {
   shouldFallbackToSingleMessagePane,
 } from '../utils/conversation.js';
 import { useConversation } from '../hooks/useConversation.js';
+import { resolveThreadMessages } from '../utils/threadActions.js';
+import { folderMatchesQuery } from '../utils/folderDisplay.js';
+import FolderPathLabel from './FolderPathLabel.jsx';
 import {
   conversationActionIds,
   conversationSpamTargets,
@@ -90,8 +93,20 @@ export default function ConversationPane({ message, threadId, refreshKey }) {
     previousMessagesRef.current = messages;
   }, [messages]);
 
+  const resolveActionMessages = useCallback(() => resolveThreadMessages({
+    message,
+    isThreadRow: true,
+    fetchThread: () => api.getThread(threadId),
+  }), [message, threadId]);
+
   const setConversationRead = useCallback(async read => {
-    const currentMessages = messagesRef.current;
+    let currentMessages;
+    try {
+      currentMessages = await resolveActionMessages();
+    } catch (requestError) {
+      addNotification({ type: 'error', title: t('common.error', { message: requestError.message || t('message.loadingError') }) });
+      return;
+    }
     const targets = conversationReadTargets(currentMessages, read);
     const ids = targets.map(item => item.id);
     if (ids.length === 0) return;
@@ -135,7 +150,7 @@ export default function ConversationPane({ message, threadId, refreshKey }) {
       updateMessage(message?.id, previousParentReadState);
       addNotification({ type: 'error', title: t('common.error', { message: requestError.message || t('message.loadingError') }) });
     }
-  }, [addNotification, adjustCategoryCount, decrementUnread, incrementUnread, message?.id, message?.is_read, message?.unread_count, selectedAccountId, selectedFolder, t, updateMessage]);
+  }, [addNotification, adjustCategoryCount, decrementUnread, incrementUnread, message?.id, message?.is_read, message?.unread_count, resolveActionMessages, selectedAccountId, selectedFolder, t, updateMessage]);
 
   const membershipKey = useMemo(() => conversationMembershipKey(messages), [messages]);
 
@@ -218,10 +233,12 @@ export default function ConversationPane({ message, threadId, refreshKey }) {
   const archiveConversation = useCallback(async () => {
     if (!actionIds.length || actionBusy) return;
     setActionBusy('archive');
+    let ids = actionIds;
     try {
-      const result = await api.bulkArchive(actionIds);
+      ids = conversationActionIds(await resolveActionMessages());
+      const result = await api.bulkArchive(ids);
       const succeeded = new Set(result.archived || []);
-      const failed = actionIds.length - succeeded.size;
+      const failed = ids.length - succeeded.size;
       addNotification(failed ? {
         type: 'error',
         title: result.noArchiveFolder?.length ? t('messageList.bulkArchived.noFolderTitle') : t('messageList.bulkArchived.failTitle'),
@@ -229,29 +246,31 @@ export default function ConversationPane({ message, threadId, refreshKey }) {
       } : { title: t('messageList.bulkArchived.title', { count: succeeded.size }), body: t('messageList.bulkArchived.body') });
       if (succeeded.size) await refreshAndClose();
     } catch (requestError) {
-      addNotification({ type: 'error', title: t('messageList.bulkArchived.failTitle'), body: requestError.message || t('messageList.bulkArchived.failBody', { count: actionIds.length }) });
+      addNotification({ type: 'error', title: t('messageList.bulkArchived.failTitle'), body: requestError.message || t('messageList.bulkArchived.failBody', { count: ids.length }) });
     } finally {
       setActionBusy(null);
     }
-  }, [actionBusy, actionIds, addNotification, refreshAndClose, t]);
+  }, [actionBusy, actionIds, addNotification, refreshAndClose, resolveActionMessages, t]);
 
   const deleteConversation = useCallback(async () => {
     if (!actionIds.length || actionBusy) return;
     setActionBusy('delete');
+    let ids = actionIds;
     try {
-      const result = await api.bulkDelete(actionIds);
+      ids = conversationActionIds(await resolveActionMessages());
+      const result = await api.bulkDelete(ids);
       const succeeded = new Set(result.deleted || []);
-      const failed = actionIds.length - succeeded.size;
+      const failed = ids.length - succeeded.size;
       addNotification(failed ? {
         type: 'error', title: t('messageList.bulkDeleted.failTitle'), body: t('messageList.bulkDeleted.failBody', { count: failed }),
       } : { title: t('messageList.bulkDeleted.title', { count: succeeded.size }), body: t('messageList.bulkDeleted.body') });
       if (succeeded.size) await refreshAndClose();
     } catch (requestError) {
-      addNotification({ type: 'error', title: t('messageList.bulkDeleted.failTitle'), body: requestError.message || t('messageList.bulkDeleted.failBody', { count: actionIds.length }) });
+      addNotification({ type: 'error', title: t('messageList.bulkDeleted.failTitle'), body: requestError.message || t('messageList.bulkDeleted.failBody', { count: ids.length }) });
     } finally {
       setActionBusy(null);
     }
-  }, [actionBusy, actionIds, addNotification, refreshAndClose, t]);
+  }, [actionBusy, actionIds, addNotification, refreshAndClose, resolveActionMessages, t]);
 
   const openMovePicker = useCallback(async () => {
     if (showMovePicker) {
@@ -281,26 +300,29 @@ export default function ConversationPane({ message, threadId, refreshKey }) {
     if (!folder || actionBusy) return;
     setShowMovePicker(false);
     setActionBusy('move');
-    const groups = Object.values(groupConversationMessagesByAccount(messages));
     try {
+      const currentMessages = await resolveActionMessages();
+      const groups = Object.values(groupConversationMessagesByAccount(currentMessages));
       const results = await Promise.allSettled(groups.map(group => api.bulkMove(group.map(item => item.id), folder)));
       const succeeded = new Set(results.flatMap(result => result.status === 'fulfilled' ? (result.value.moved || []) : []));
-      const failed = actionIds.length - succeeded.size;
+      const failed = conversationActionIds(currentMessages).length - succeeded.size;
       addNotification(failed ? {
         type: 'error', title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failed }),
       } : { title: t('messageList.bulkMoved.title', { count: succeeded.size }), body: folder });
       if (succeeded.size) await refreshAndClose();
+    } catch (requestError) {
+      addNotification({ type: 'error', title: t('messageList.bulkMoved.failTitle'), body: requestError.message });
     } finally {
       setActionBusy(null);
     }
-  }, [actionBusy, actionIds.length, addNotification, messages, refreshAndClose, t]);
+  }, [actionBusy, addNotification, refreshAndClose, resolveActionMessages, t]);
 
   const spamConversation = useCallback(async () => {
     if (actionBusy) return;
-    const targets = conversationSpamTargets(messages, accounts);
-    if (!targets.length) return;
     setActionBusy('spam');
     try {
+      const targets = conversationSpamTargets(await resolveActionMessages(), accounts);
+      if (!targets.length) return;
       const results = await Promise.allSettled(targets.map(item => api.markSpam(item.id)));
       const succeeded = results.filter(result => result.status === 'fulfilled').length;
       const failed = targets.length - succeeded;
@@ -308,10 +330,12 @@ export default function ConversationPane({ message, threadId, refreshKey }) {
         type: 'error', title: t('spam.failTitle'), body: t('spam.failBodyBulk', { count: failed }),
       } : { title: t('spam.movedToSpamBulk', { count: succeeded }) });
       if (succeeded) await refreshAndClose();
+    } catch (requestError) {
+      addNotification({ type: 'error', title: t('spam.failTitle'), body: requestError.message });
     } finally {
       setActionBusy(null);
     }
-  }, [accounts, actionBusy, addNotification, messages, refreshAndClose, t]);
+  }, [accounts, actionBusy, addNotification, refreshAndClose, resolveActionMessages, t]);
 
   const snoozeConversation = useCallback(async until => {
     const target = newestSnoozeTarget(messages);
@@ -353,7 +377,7 @@ export default function ConversationPane({ message, threadId, refreshKey }) {
               {!moveFoldersLoading && moveFolders.length > 0 && <div style={{ padding: 6, borderBottom: '1px solid var(--border-subtle)' }}><input autoFocus value={moveSearch} onChange={event => setMoveSearch(event.target.value)} placeholder={t('contextMenu.folders.search')} style={{ width: '100%', boxSizing: 'border-box', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} /></div>}
               {moveFoldersLoading ? <div style={{ padding: 14, color: 'var(--text-tertiary)', fontSize: 12 }}>{t('contextMenu.folders.loading')}</div>
                 : moveFolders.length === 0 ? <div style={{ padding: 14, color: 'var(--text-tertiary)', fontSize: 12 }}>{t('contextMenu.folders.empty')}</div>
-                  : moveFolders.filter(folder => (folder.name || folder.path).toLowerCase().includes(moveSearch.trim().toLowerCase())).map(folder => <button type="button" key={folder.path} onClick={() => moveConversation(folder.path)} style={{ width: '100%', border: 'none', background: 'transparent', color: 'var(--text-primary)', padding: '8px 11px', textAlign: 'left', cursor: 'pointer', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{folder.name || folder.path}</button>)}
+                  : moveFolders.filter(folder => folderMatchesQuery(folder, moveSearch)).map(folder => <button type="button" key={folder.path} onClick={() => moveConversation(folder.path)} title={folder.path} style={{ display: 'flex', width: '100%', border: 'none', background: 'transparent', color: 'var(--text-primary)', padding: '8px 11px', textAlign: 'left', cursor: 'pointer', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><FolderPathLabel folder={folder} /></button>)}
             </div>
           </>}
         </div>

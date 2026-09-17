@@ -6,6 +6,9 @@ import { PluginSlot } from '../plugins/PluginSlot.jsx';
 import { newAiAction, AI_ACTION_LIMITS } from '../aiActions.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { api } from '../utils/api.js';
+import { spamApi } from '../utils/spamApi.js';
+import { copyToClipboard } from '../utils/clipboard.js';
+import { isValidFromValue } from '../utils/defaultSender.js';
 import {
   AI_ACCOUNT_PROVIDER_OPTIONS,
   AI_CONNECTION_METHOD_ACCOUNT,
@@ -29,7 +32,6 @@ import SignatureEditor from './SignatureEditor.jsx';
 import DiagnosticsReportModal from './DiagnosticsReportModal.jsx';
 import { getEffectiveShortcuts, getGroupedActions, ACTION_DEFS, SPECIAL_KEY_LABELS, parseModKey, modLabel } from '../utils/defaultShortcuts.js';
 import NativeUpdatePanel from './NativeUpdatePanel.jsx';
-import { unifiedUnreadTotal } from '../utils/unifiedInbox.js';
 import { isValidForwardAddress } from '../utils/ruleActions.js';
 import {
   CUSTOM_PROJECT_URL,
@@ -37,6 +39,8 @@ import {
   isPackagedMailFlow,
   selectAboutVersion,
 } from '../utils/aboutInfo.js';
+import { folderParentLabel } from '../utils/folderDisplay.js';
+import SpamSettings from './SpamSettings.jsx';
 
 // ─── Shared field component ───────────────────────────────────────────────────
 function Field({ label, required, children }) {
@@ -89,10 +93,15 @@ function AccountForm({ initial, onSave, onCancel }) {
     imap_host: '', imap_port: 993, imap_skip_tls_verify: false,
     smtp_host: '', smtp_port: 587, smtp_tls: 'STARTTLS',
     smtp_auth_user: '', smtp_auth_pass: '',
-    auth_user: '', auth_pass: '', categorization_enabled: false,
+    auth_user: '', auth_pass: '', categorization_enabled: false, antispam_enabled: false,
+    trusted_authserv_id: '',
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  // Detected Authentication-Results authserv-ids for this account (setup helper
+  // for the trusted-authserv-id field). Fetched only for an existing account
+  // with antispam on, since that is when the backend classifies and records them.
+  const [detectedAuthservIds, setDetectedAuthservIds] = useState(null);
   const [showPass, setShowPass] = useState(false);
   const [showSmtpPass, setShowSmtpPass] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState(null);
@@ -107,6 +116,21 @@ function AccountForm({ initial, onSave, onCancel }) {
       }))
       .catch(() => {});
   }, []);
+
+  // Setup helper: which authserv-ids this account's mail actually carries. The
+  // backend records them when it classifies, so the hint is only meaningful for
+  // an existing account with antispam on (and it fills in as mail arrives).
+  useEffect(() => {
+    if (!isEdit || !form.antispam_enabled) {
+      setDetectedAuthservIds(null);
+      return undefined;
+    }
+    let cancelled = false;
+    spamApi.getAuthservIds(initial.id)
+      .then(d => { if (!cancelled) setDetectedAuthservIds(d); })
+      .catch(() => { if (!cancelled) setDetectedAuthservIds(null); });
+    return () => { cancelled = true; };
+  }, [isEdit, form.antispam_enabled, initial?.id]);
 
   const set = (key, val) => setForm(f => ({ ...f, [key]: val }));
 
@@ -416,6 +440,89 @@ function AccountForm({ initial, onSave, onCancel }) {
               </div>
             </div>
           </div>
+
+          <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+            {t('admin.accounts.antispamSection')}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+            <button
+              type="button"
+              onClick={() => set('antispam_enabled', !form.antispam_enabled)}
+              style={{
+                width: 36, height: 20, borderRadius: 10, border: 'none',
+                cursor: 'pointer', padding: 0,
+                background: form.antispam_enabled ? 'var(--accent)' : TOGGLE_OFF_BACKGROUND,
+                position: 'relative', transition: 'background 0.2s', flexShrink: 0, marginTop: 1,
+              }}
+            >
+              <span style={{
+                position: 'absolute', top: 2,
+                left: form.antispam_enabled ? 18 : 2,
+                width: 16, height: 16,
+                borderRadius: '50%', background: 'white', transition: 'left 0.2s',
+              }} />
+            </button>
+            <div>
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{t('admin.accounts.antispamEnabled')}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>
+                {t('admin.accounts.antispamEnabledDesc')}
+              </div>
+            </div>
+          </div>
+
+          {/* Trusted Authentication-Results authserv-id: only headers written by
+              this id are honored; empty means "trust none" (the auth signal is
+              then ignored rather than trusted blindly). */}
+          {form.antispam_enabled && (
+            <div style={{ marginTop: 14 }}>
+              <Field label={t('admin.accounts.trustedAuthservLabel')}>
+                <input
+                  value={form.trusted_authserv_id || ''}
+                  onChange={e => set('trusted_authserv_id', e.target.value)}
+                  placeholder={t('admin.accounts.trustedAuthservPlaceholder')}
+                  style={inputStyle}
+                />
+              </Field>
+              <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: -8, lineHeight: 1.5 }}>
+                {t('admin.accounts.trustedAuthservDesc')}
+              </div>
+
+              {detectedAuthservIds && detectedAuthservIds.analyzed > 0 && detectedAuthservIds.detected.length > 0 && (
+                <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-secondary)' }}>
+                  <div>{t('admin.accounts.trustedAuthservDetected')}</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                    {detectedAuthservIds.detected.map(d => (
+                      <button
+                        key={d.id}
+                        type="button"
+                        onClick={() => set('trusted_authserv_id', d.id)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 6,
+                          padding: '4px 10px', borderRadius: 14, fontSize: 11,
+                          border: '1px solid var(--border)', background: 'var(--bg-secondary)',
+                          color: 'var(--text-secondary)', cursor: 'pointer',
+                        }}
+                      >
+                        <span style={{ fontFamily: 'monospace' }}>{d.id}</span>
+                        <span style={{ color: 'var(--text-tertiary)' }}>
+                          {d.count}/{detectedAuthservIds.analyzed}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ marginTop: 8, color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+                    {t('admin.accounts.trustedAuthservWarn')}
+                  </div>
+                </div>
+              )}
+              {detectedAuthservIds && (detectedAuthservIds.analyzed === 0 || detectedAuthservIds.detected.length === 0) && (
+                <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+                  {t('admin.accounts.trustedAuthservDetectedNone')}
+                </div>
+              )}
+            </div>
+          )}
         </>
       )}
 
@@ -454,7 +561,7 @@ function AccountForm({ initial, onSave, onCancel }) {
 // ─── Accounts Tab ─────────────────────────────────────────────────────────────
 function AccountsTab() {
   const { t } = useTranslation();
-  const { accounts, setAccounts, updateAccount, unreadCounts, setUnreadCounts, addNotification, backfillProgress } = useStore();
+  const { accounts, setAccounts, updateAccount, setUnreadCounts, addNotification, backfillProgress } = useStore();
   const [subview, setSubview] = useState('list'); // 'list' | 'add' | 'edit' | 'folders' | 'aliases'
   const [editTarget, setEditTarget] = useState(null);
   const [folderMappings, setFolderMappings] = useState({});
@@ -477,7 +584,7 @@ function AccountsTab() {
   };
 
   const handleEdit = async (form) => {
-    const updates = { name: form.name, sender_name: form.sender_name || null, color: form.color, imap_host: form.imap_host, imap_port: form.imap_port, imap_skip_tls_verify: !!form.imap_skip_tls_verify, smtp_host: form.smtp_host, smtp_port: form.smtp_port, smtp_tls: form.smtp_tls, signature: form.signature || null, categorization_enabled: !!form.categorization_enabled, include_in_unified_inbox: form.include_in_unified_inbox !== false };
+    const updates = { name: form.name, sender_name: form.sender_name || null, color: form.color, imap_host: form.imap_host, imap_port: form.imap_port, imap_skip_tls_verify: !!form.imap_skip_tls_verify, smtp_host: form.smtp_host, smtp_port: form.smtp_port, smtp_tls: form.smtp_tls, signature: form.signature || null, categorization_enabled: !!form.categorization_enabled, antispam_enabled: !!form.antispam_enabled, trusted_authserv_id: (form.trusted_authserv_id || '').trim() || null, include_in_unified_inbox: form.include_in_unified_inbox !== false };
     if (form.auth_pass) updates.auth_pass = form.auth_pass;
     if (form.auth_user) updates.auth_user = form.auth_user;
     // Separate SMTP credentials (optional). A username sends both (a blank password on
@@ -490,14 +597,7 @@ function AccountsTab() {
       updates.smtp_auth_pass = null;
     }
     const updated = await api.updateAccount(editTarget.id, updates);
-    const nextAccounts = accounts.map(account => account.id === editTarget.id
-      ? { ...account, ...updated }
-      : account);
     updateAccount(editTarget.id, updated);
-    setUnreadCounts({
-      total: unifiedUnreadTotal(unreadCounts.byAccount, nextAccounts),
-      byAccount: unreadCounts.byAccount,
-    });
     api.getUnreadCounts().then(setUnreadCounts).catch(console.error);
     setSubview('list');
     setEditTarget(null);
@@ -1525,7 +1625,7 @@ function SwipeActionIcon({ action, size = 17 }) {
 function LayoutsTab() {
   const { t } = useTranslation();
   const isMobile = useMobile();
-  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, conversationMode, setConversationMode, plaintextEmail, setPlaintextEmail, hoverQuickActions, setHoverQuickActions, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, replyDefault, setReplyDefault, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, senderFavicons, senderFaviconsSaving, setSenderFavicons, showMessagePreviews, setShowMessagePreviews } = useStore();
+  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, conversationMode, setConversationMode, plaintextEmail, setPlaintextEmail, hoverQuickActions, setHoverQuickActions, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, replyDefault, setReplyDefault, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, senderFavicons, senderFaviconsSaving, setSenderFavicons, showMessagePreviews, setShowMessagePreviews, accounts, defaultSender, setDefaultSender } = useStore();
   const [senderFaviconsError, setSenderFaviconsError] = useState('');
 
   // "Set MailFlow as your default email app": registerProtocolHandler is the
@@ -2043,6 +2143,40 @@ function LayoutsTab() {
         </div>
       </div>
 
+      {/* Default sender (#417) */}
+      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
+          {t('admin.messageList.defaultSender')}
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 10 }}>
+          {t('admin.messageList.defaultSenderDesc')}
+        </div>
+        <select
+          // A default can outlive the account or alias it names. Showing '' rather than an
+          // unmatched value keeps the control honest: it reflects what the composer will
+          // actually do, which is fall back to last-used.
+          value={isValidFromValue(defaultSender, accounts) ? defaultSender : ''}
+          onChange={e => setDefaultSender(e.target.value)}
+          style={{
+            width: '100%', maxWidth: 420, padding: '8px 10px', borderRadius: 8,
+            background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
+            color: 'var(--text-primary)', fontSize: 12, cursor: 'pointer', outline: 'none',
+          }}
+        >
+          <option value="">{t('admin.messageList.defaultSenderLastUsed')}</option>
+          {accounts.map(acc => [
+            <option key={acc.id} value={`account:${acc.id}`}>
+              {acc.sender_name ? `${acc.sender_name} <${acc.email_address}>` : acc.email_address}
+            </option>,
+            ...(acc.aliases || []).map(al => (
+              <option key={al.id} value={`alias:${al.id}:${acc.id}`}>
+                {`\u00a0\u00a0${al.name ? `${al.name} <${al.email}>` : al.email}`}
+              </option>
+            )),
+          ])}
+        </select>
+      </div>
+
       {/* Default reply action */}
       <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
         <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
@@ -2314,9 +2448,16 @@ function IntegrationsTab() {
   // Non-admins can't read the full config (admin-only), but need to know whether
   // Microsoft OAuth is configured so the connect buttons enable. (#315)
   const [msStatus, setMsStatus] = useState(null); // { configured } for non-admins
+  // Admins read config from the DB, but a provider can equally be configured via
+  // plain .env vars, which never appear in integration_config. Fetch the capability
+  // status for admins too so an env-only setup still enables the connect buttons.
+  const [googleStatus, setGoogleStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [msForm, setMsForm] = useState({ clientId: '', clientSecret: '', tenantId: '', redirectUri: '' });
   const [msExpanded, setMsExpanded] = useState(false);
+  const [googleForm, setGoogleForm] = useState({ clientId: '', clientSecret: '', redirectUri: '' });
+  const [googleExpanded, setGoogleExpanded] = useState(false);
+  const [connectingGoogle, setConnectingGoogle] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [connectingMs, setConnectingMs] = useState(false);
@@ -2347,25 +2488,30 @@ function IntegrationsTab() {
             });
             setMsExpanded(true);
           }
-        })
-        .catch(console.error)
-        .finally(() => setLoading(false));
-      // Admins configure Microsoft OAuth via the DB form OR via env vars; the env-only case has no
-      // DB row, so also read the env-aware capability status (#359), otherwise the connect button
-      // stays wrongly disabled for admins while non-admins on the same instance can connect.
-      api.getIntegrationsStatus()
-        .then(data => setMsStatus(data.microsoft || null))
-        .catch(console.error);
-    } else {
-      // Non-admins can only read the capability status, not the config itself.
-      api.getIntegrationsStatus()
-        .then(data => {
-          setMsStatus(data.microsoft || null);
-          if (data.microsoft?.configured) setMsExpanded(true);
+          if (data.google) {
+            setGoogleForm({
+              clientId: data.google.clientId || '',
+              clientSecret: data.google.clientSecret || '',
+              redirectUri: data.google.redirectUri || '',
+            });
+            setGoogleExpanded(true);
+          }
         })
         .catch(console.error)
         .finally(() => setLoading(false));
     }
+
+    // Capability status is cheap and non-sensitive, so fetch it for everyone.
+    // Admins need it to detect providers configured via .env rather than the UI.
+    api.getIntegrationsStatus()
+      .then(data => {
+        setMsStatus(data.microsoft || null);
+        setGoogleStatus(data.google || null);
+        if (data.microsoft?.configured) setMsExpanded(true);
+        if (data.google?.configured) setGoogleExpanded(true);
+      })
+      .catch(console.error)
+      .finally(() => { if (!isAdmin) setLoading(false); });
 
     api.todoist.status()
       .then(({ connected }) => {
@@ -2388,9 +2534,15 @@ function IntegrationsTab() {
         // getIntegrations is admin-only; non-admins already have the capability status.
         if (isAdmin) api.getIntegrations().then(setConfigs).catch(console.error);
         api.getAccounts().then(setAccounts).catch(console.error);
+      } else if (e.data?.type === 'oauth_success' && e.data?.provider === 'google') {
+        setSaveMsg(t('admin.integrations.google.connectedNote'));
+        setConnectingGoogle(false);
+        if (isAdmin) api.getIntegrations().then(setConfigs).catch(console.error);
+        api.getAccounts().then(setAccounts).catch(console.error);
       } else if (e.data?.type === 'oauth_error') {
         setSaveMsg('Error: ' + e.data.error);
         setConnectingMs(false);
+        setConnectingGoogle(false);
       }
     };
     window.addEventListener('message', handleMessage);
@@ -2474,6 +2626,41 @@ function IntegrationsTab() {
     setTimeout(() => setConnectingMs(false), 5000);
   };
 
+  const handleSaveGoogle = async () => {
+    if (!googleForm.clientId || !googleForm.clientSecret) {
+      setSaveMsg('Client ID and Client Secret are required');
+      return;
+    }
+    setSaving(true);
+    setSaveMsg('');
+    try {
+      await api.saveIntegration('google', googleForm);
+      setConfigs(prev => ({
+        ...prev,
+        google: { clientId: googleForm.clientId, redirectUri: googleForm.redirectUri },
+      }));
+      setGoogleStatus({ configured: true });
+      setSaveMsg(t('admin.integrations.google.savedNote'));
+    } catch (err) {
+      setSaveMsg('Error: ' + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleConnectGoogle = () => {
+    setConnectingGoogle(true);
+    // Real anchor click rather than window.open — see handleConnectMs.
+    const a = document.createElement('a');
+    a.href = '/oauth/google';
+    a.target = '_blank';
+    a.rel = 'opener';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => setConnectingGoogle(false), 5000);
+  };
+
   const handleTdConnect = async () => {
     const trimmed = tdToken.trim();
     if (!trimmed) return;
@@ -2505,9 +2692,11 @@ function IntegrationsTab() {
     }
   };
 
-  // Configured if the admin has a saved DB config OR the server has env-var config (#359);
-  // non-admins only ever have the env-aware capability status.
-  const msConfigured = (isAdmin ? configs.microsoft?.clientId : null) || msStatus?.configured;
+  // A provider counts as configured if it's in the DB config (UI-managed) OR the
+  // server reports it configured from .env. Checking only the former left the
+  // connect button disabled on env-only installs.
+  const msConfigured = (isAdmin && configs.microsoft?.clientId) || msStatus?.configured;
+  const googleConfigured = (isAdmin && configs.google?.clientId) || googleStatus?.configured;
 
   const subTabStyle = (key) => ({
     padding: '7px 14px',
@@ -2543,6 +2732,183 @@ function IntegrationsTab() {
           {loading && <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{t('admin.integrations.loading')}</div>}
           {!loading && (
             <div>
+              {/* Google / Gmail */}
+          <div style={{
+            border: '1px solid var(--border-subtle)', borderRadius: 12,
+            overflow: 'hidden', marginBottom: 12,
+          }}>
+            <div
+              onClick={() => setGoogleExpanded(!googleExpanded)}
+              style={{
+                padding: '14px 16px', display: 'flex', alignItems: 'center',
+                gap: 12, cursor: 'pointer', background: 'var(--bg-tertiary)',
+                transition: 'background 0.1s',
+              }}
+              onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
+              onMouseLeave={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2">
+                <rect x="2" y="4" width="20" height="16" rx="2"/>
+                <polyline points="2 7 12 14 22 7"/>
+              </svg>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
+                    {t('admin.integrations.google.title')}
+                  </span>
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>
+                  {t('admin.integrations.google.description')}
+                </div>
+              </div>
+              {googleConfigured ? (
+                <span style={{
+                  fontSize: 11, padding: '3px 8px', borderRadius: 20,
+                  background: 'rgba(52,168,83,0.12)', color: 'var(--green)',
+                  border: '1px solid rgba(52,168,83,0.25)',
+                }}>
+                  {t('admin.integrations.google.configured')}
+                </span>
+              ) : (
+                <span style={{
+                  fontSize: 11, padding: '3px 8px', borderRadius: 20,
+                  background: 'var(--bg-elevated)', color: 'var(--text-tertiary)',
+                  border: '1px solid var(--border)',
+                }}>
+                  {t('admin.integrations.google.notConfigured')}
+                </span>
+              )}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                stroke="var(--text-tertiary)" strokeWidth="2"
+                style={{ transform: googleExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
+            </div>
+
+            {googleExpanded && (
+              <div style={{ padding: '16px', borderTop: '1px solid var(--border-subtle)' }}>
+                {isAdmin && (<>
+                <div style={{
+                  padding: '12px 14px', borderRadius: 8, marginBottom: 16,
+                  background: 'rgba(124,106,247,0.06)',
+                  border: '1px solid rgba(124,106,247,0.15)',
+                  fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7,
+                }}>
+                  <div style={{ fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>
+                    {t('admin.integrations.google.setupTitle')}
+                  </div>
+                  <ol style={{ margin: 0, paddingLeft: 18 }}>
+                    <li>{t('admin.integrations.google.step1')}</li>
+                    <li>{t('admin.integrations.google.step2')}</li>
+                    <li>{t('admin.integrations.google.step3')}</li>
+                    <li>{t('admin.integrations.google.step4')}</li>
+                  </ol>
+                  <div style={{ marginTop: 8, color: 'var(--text-tertiary)' }}>
+                    {t('admin.integrations.google.scopeNote')}
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+                  <Field label={t('admin.integrations.google.clientId')} required>
+                    <input value={googleForm.clientId} onChange={e => setGoogleForm(f => ({ ...f, clientId: e.target.value }))}
+                      placeholder={t('admin.integrations.google.clientIdPh')}
+                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
+                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+                  </Field>
+                  <Field label={t('admin.integrations.google.clientSecret')} required>
+                    <input type="password" value={googleForm.clientSecret} onChange={e => setGoogleForm(f => ({ ...f, clientSecret: e.target.value }))}
+                      placeholder={t('admin.integrations.google.clientSecretPh')}
+                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
+                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+                  </Field>
+                </div>
+
+                <div style={{ marginBottom: 14 }}>
+                  <Field label={t('admin.integrations.google.redirectUri')} required>
+                    <input value={googleForm.redirectUri} onChange={e => setGoogleForm(f => ({ ...f, redirectUri: e.target.value }))}
+                      placeholder={`${window.location.protocol}//${window.location.host}/oauth/google/callback`}
+                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
+                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>
+                      {t('admin.integrations.google.redirectUriNote', { uri: `${window.location.protocol}//${window.location.host}/oauth/google/callback` })}
+                    </div>
+                  </Field>
+                </div>
+                </>)}
+
+                {!isAdmin && (
+                  <div style={{
+                    padding: '12px 14px', borderRadius: 8, marginBottom: 16,
+                    background: 'rgba(124,106,247,0.06)',
+                    border: '1px solid rgba(124,106,247,0.15)',
+                    fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6,
+                  }}>
+                    {googleConfigured
+                      ? t('admin.integrations.google.userNoteConfigured')
+                      : t('admin.integrations.google.userNoteNotConfigured')}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {isAdmin && (
+                    <button onClick={handleSaveGoogle} disabled={saving} style={{
+                      padding: '9px 16px', background: 'var(--bg-elevated)',
+                      border: '1px solid var(--border)', borderRadius: 8,
+                      color: 'var(--text-primary)', cursor: saving ? 'not-allowed' : 'pointer',
+                      fontSize: 13, fontWeight: 500, opacity: saving ? 0.7 : 1,
+                    }}>
+                      {saving ? t('common.saving') : t('admin.integrations.google.save')}
+                    </button>
+                  )}
+
+                  <button
+                    onClick={handleConnectGoogle}
+                    disabled={!googleConfigured || connectingGoogle}
+                    title={!googleConfigured ? t('admin.integrations.google.save') : ''}
+                    style={{
+                      padding: '9px 16px', background: googleConfigured ? 'var(--accent)' : 'var(--bg-elevated)',
+                      border: `1px solid ${googleConfigured ? 'var(--accent)' : 'var(--border)'}`,
+                      borderRadius: 8, color: googleConfigured ? 'white' : 'var(--text-tertiary)',
+                      cursor: googleConfigured && !connectingGoogle ? 'pointer' : 'not-allowed',
+                      fontSize: 13, fontWeight: 500,
+                      opacity: !googleConfigured || connectingGoogle ? 0.6 : 1,
+                      display: 'flex', alignItems: 'center', gap: 6,
+                    }}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="2" y="4" width="20" height="16" rx="2"/>
+                      <polyline points="2 7 12 14 22 7"/>
+                    </svg>
+                    {connectingGoogle ? t('admin.integrations.google.redirecting') : t('admin.integrations.google.connect')}
+                  </button>
+
+                  {isAdmin && configs.google?.clientId && (
+                    <button onClick={async () => {
+                      await api.deleteIntegration('google');
+                      setConfigs(c => { const n = {...c}; delete n.google; return n; });
+                      setGoogleForm({ clientId: '', clientSecret: '', redirectUri: '' });
+                      setGoogleStatus({ configured: false });
+                      setSaveMsg('');
+                    }} style={{
+                      padding: '9px 12px', background: 'transparent',
+                      border: '1px solid transparent', borderRadius: 8,
+                      color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: 13,
+                      marginLeft: 'auto',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.color = 'var(--red)'; e.currentTarget.style.borderColor = 'rgba(248,113,113,0.3)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-tertiary)'; e.currentTarget.style.borderColor = 'transparent'; }}
+                    >
+                      {t('admin.integrations.google.remove')}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
               {/* Microsoft 365 */}
           <div style={{
             border: '1px solid var(--border-subtle)', borderRadius: 12,
@@ -3130,18 +3496,23 @@ function SSOTab() {
   const [error, setError] = useState('');
   const [confirmDialog, setConfirmDialog] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
+  const [uriCopyFailedId, setUriCopyFailedId] = useState(null);
   const [templateNote, setTemplateNote] = useState('');
   const [internalAuthDisabled, setInternalAuthDisabled] = useState(false);
   const [internalAuthSaving, setInternalAuthSaving] = useState(false);
   const [internalAuthError, setInternalAuthError] = useState('');
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
+    // A failed load must never render as an empty list. Reporting only to console.error
+    // made a broken fetch indistinguishable from "no providers configured", which can
+    // hide a live SSO provider from the admin who believes it is gone.
     const fetchProviders = api.admin.oidc.getProviders()
       .then(d => setProviders(d.providers))
-      .catch(console.error);
+      .catch(err => setLoadError(err.message));
     const fetchSettings = api.admin.getSettings()
       .then(d => setInternalAuthDisabled(d.settings.internal_auth_disabled === 'true'))
-      .catch(console.error);
+      .catch(err => setLoadError(err.message));
     Promise.all([fetchProviders, fetchSettings]).finally(() => setLoading(false));
   }, []);
 
@@ -3244,12 +3615,12 @@ function SSOTab() {
     });
   };
 
-  const copyRedirectUri = (slug, id) => {
+  const copyRedirectUri = async (slug, id) => {
     const uri = `${window.location.origin}/auth/oidc/${slug}/callback`;
-    navigator.clipboard.writeText(uri).then(() => {
-      setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 2000);
-    });
+    const { ok } = await copyToClipboard(uri);
+    setCopiedId(ok ? id : null);
+    setUriCopyFailedId(ok ? null : id);
+    setTimeout(() => { setCopiedId(null); setUriCopyFailedId(null); }, 2000);
   };
 
   if (loading) return <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{t('common.loading')}</div>;
@@ -3313,7 +3684,15 @@ function SSOTab() {
 
       <div style={{ height: 1, background: 'var(--border-subtle)', marginBottom: 20 }} />
 
-      {providers.length === 0 && !editing && (
+      {loadError && (
+        <div style={{
+          padding: '12px 14px', marginBottom: 16, borderRadius: 8,
+          background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.3)',
+          color: 'var(--red)', fontSize: 13,
+        }}>{t('common.error', { message: loadError })}</div>
+      )}
+
+      {!loadError && providers.length === 0 && !editing && (
         <div style={{
           padding: '24px', borderRadius: 8, border: '1px dashed var(--border)',
           textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13, marginBottom: 16,
@@ -3356,7 +3735,9 @@ function SSOTab() {
                       fontSize: 10, padding: '2px 7px', cursor: 'pointer', flexShrink: 0,
                     }}
                   >
-                    {copiedId === p.id ? t('admin.sso.copiedUri') : t('admin.sso.copyUri')}
+                    {copiedId === p.id ? t('admin.sso.copiedUri')
+                      : uriCopyFailedId === p.id ? t('common.copyFailed')
+                        : t('admin.sso.copyUri')}
                   </button>
                 </div>
               </div>
@@ -3817,7 +4198,8 @@ function AISection() {
 
   const handleCopyCode = async () => {
     try {
-      await navigator.clipboard.writeText(deviceState.userCode);
+      const { ok } = await copyToClipboard(deviceState.userCode);
+      if (!ok) throw new Error('copy failed');
       setCopied(true);
     } catch {
       setMsg({ type: 'error', text: t('admin.ai.copyFailed') });
@@ -4639,6 +5021,7 @@ function UsersAndInvitesPanel() {
   const [inviteMsg, setInviteMsg] = useState(null); // { type: 'ok'|'error', text, url? }
   const [loading, setLoading] = useState(true);
   const [copiedId, setCopiedId] = useState(null);
+  const [copyFailedId, setCopyFailedId] = useState(null);
   const [confirmDialog, setConfirmDialog] = useState(null);
 
   useEffect(() => {
@@ -4746,11 +5129,11 @@ function UsersAndInvitesPanel() {
     setInvites(inv => inv.filter(i => i.id !== id));
   };
 
-  const copyInviteUrl = (url, id) => {
-    navigator.clipboard.writeText(url).then(() => {
-      setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 2000);
-    });
+  const copyInviteUrl = async (url, id) => {
+    const { ok } = await copyToClipboard(url);
+    setCopiedId(ok ? id : null);
+    setCopyFailedId(ok ? null : id);
+    setTimeout(() => { setCopiedId(null); setCopyFailedId(null); }, 2000);
   };
 
   if (loading) {
@@ -4959,14 +5342,16 @@ function UsersAndInvitesPanel() {
                 {inviteMsg.url}
               </code>
               <button
-                onClick={() => navigator.clipboard.writeText(inviteMsg.url)}
+                onClick={() => copyInviteUrl(inviteMsg.url, 'new')}
                 style={{
                   padding: '4px 10px', borderRadius: 6, fontSize: 11,
                   background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
                   color: 'var(--text-secondary)', cursor: 'pointer', flexShrink: 0,
                 }}
               >
-                {t('common.copy')}
+                {copiedId === 'new' ? t('admin.users.inviteCopied')
+                  : copyFailedId === 'new' ? t('common.copyFailed')
+                    : t('common.copy')}
               </button>
             </div>
           )}
@@ -5007,7 +5392,9 @@ function UsersAndInvitesPanel() {
                       cursor: 'pointer', flexShrink: 0, transition: 'all 0.15s',
                     }}
                   >
-                    {copiedId === inv.id ? t('admin.users.inviteCopied') : t('admin.users.inviteCopy')}
+                    {copiedId === inv.id ? t('admin.users.inviteCopied')
+                      : copyFailedId === inv.id ? t('common.copyFailed')
+                        : t('admin.users.inviteCopy')}
                   </button>
                   <IconBtn onClick={() => handleRevokeInvite(inv.id)} title={t('admin.users.inviteRevoke')} danger>
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -5434,7 +5821,34 @@ function NotificationsTab() {
 // ─── Shared confirm overlay (replaces window.confirm everywhere) ──────────────
 function ConfirmOverlay({ dialog, onClose }) {
   const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  // Clear transient state whenever a different dialog is opened, so a previous
+  // failure never leaks into the next confirmation.
+  useEffect(() => { setBusy(false); setError(''); }, [dialog]);
+
   if (!dialog) return null;
+
+  // Await the action rather than firing it into the void. This previously closed the
+  // overlay and then called onConfirm() unawaited with no catch, so a rejected request
+  // left no trace at all: the dialog was already gone and the rejection was unhandled.
+  // Every destructive action here (delete account, delete alias, delete user, disable
+  // a user's 2FA, delete an SSO provider, unlink an identity) therefore looked like it
+  // had succeeded while the server had refused it. Keep the dialog open on failure so
+  // the error is shown where the user is already looking; close only on success.
+  const runConfirm = async () => {
+    setError('');
+    setBusy(true);
+    try {
+      await dialog.onConfirm();
+      onClose();
+    } catch (err) {
+      setError(err?.message || String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 9100,
@@ -5443,7 +5857,7 @@ function ConfirmOverlay({ dialog, onClose }) {
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       padding: 24,
       animation: 'backdrop-enter var(--motion-fast) var(--ease-standard) both',
-    }} onClick={onClose}>
+    }} onClick={busy ? undefined : onClose}>
       <div style={{
         background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
         borderRadius: 12, padding: '24px 24px 20px', maxWidth: 360, width: '100%',
@@ -5456,15 +5870,24 @@ function ConfirmOverlay({ dialog, onClose }) {
         <p style={{ margin: '0 0 20px', fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
           {dialog.message}
         </p>
+        {error && (
+          <div style={{
+            marginBottom: 14, padding: '8px 10px',
+            background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.3)',
+            borderRadius: 7, color: 'var(--red)', fontSize: 12,
+          }}>{t('common.error', { message: error })}</div>
+        )}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-          <button onClick={onClose} className="btn-press" style={{
+          <button onClick={onClose} disabled={busy} className="btn-press" style={{
             padding: '7px 16px', borderRadius: 7, border: '1px solid var(--border-subtle)',
-            background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 13,
+            background: 'transparent', color: 'var(--text-secondary)',
+            cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.5 : 1, fontSize: 13,
           }}>{t('common.cancel')}</button>
-          <button onClick={() => { onClose(); dialog.onConfirm(); }} className="btn-press" style={{
+          <button onClick={runConfirm} disabled={busy} className="btn-press" style={{
             padding: '7px 16px', borderRadius: 7, border: 'none',
-            background: '#dc2626', color: 'white', cursor: 'pointer', fontSize: 13, fontWeight: 500,
-          }}>{dialog.confirmLabel || t('common.delete')}</button>
+            background: '#dc2626', color: 'white',
+            cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.7 : 1, fontSize: 13, fontWeight: 500,
+          }}>{busy ? t('common.loading') : (dialog.confirmLabel || t('common.delete'))}</button>
         </div>
       </div>
     </div>
@@ -5759,18 +6182,26 @@ function RulesTab() {
     setRunResult(null);
     setRunError('');
     try {
-      const result = await api.runRules();
-      setRunResult(result);
-      // Rules may have moved messages between folders; tell the message list to re-run
-      // any active search and refresh the folder view so affected messages leave stale
-      // results (a search snapshot does not otherwise update on its own). Fixes #223.
-      window.dispatchEvent(new Event('mailflow:rules-ran'));
-    } catch {
-      setRunError(t('admin.rules.runError'));
-    } finally {
+      // 202: the sweep runs in the background. The rules_run_complete WebSocket event
+      // (useWebSocket.js) toasts the result, refreshes the views, and reaches this panel
+      // via the mailflow:rules-run-complete window event below.
+      await api.runRules();
+    } catch (err) {
+      setRunError(err.message || t('admin.rules.runError'));
       setRunningRules(false);
     }
   }
+
+  useEffect(() => {
+    const onRunComplete = (event) => {
+      const detail = event.detail || {};
+      if (detail.ok === false) setRunError(t('admin.rules.runError'));
+      else setRunResult({ processed: detail.processed, matched: detail.matched });
+      setRunningRules(false);
+    };
+    window.addEventListener('mailflow:rules-run-complete', onRunComplete);
+    return () => window.removeEventListener('mailflow:rules-run-complete', onRunComplete);
+  }, [t]);
 
   useEffect(() => {
     api.getRules()
@@ -5986,7 +6417,10 @@ function RulesTab() {
     const acts = Array.isArray(rule.actions) ? rule.actions : [];
     if (!acts.length) return '—';
     const labels = { mark_read: t('admin.rules.actionMarkRead'), star: t('admin.rules.actionStar'), forward: t('admin.rules.actionForward'), archive: t('admin.rules.actionArchive'), delete: t('admin.rules.actionDelete'), move: t('admin.rules.actionMove') };
-    return acts.map(a => labels[a.type] || a.type).join(', ');
+    // Show the move destination so same-named rules are tellable apart at a glance.
+    return acts.map(a => a.type === 'move' && a.value
+      ? `${labels.move} → ${a.value}`
+      : (labels[a.type] || a.type)).join(', ');
   }
 
   const FIELDS = [
@@ -6191,11 +6625,24 @@ function RulesTab() {
                         style={{ ...inputStyle, marginTop: 6, marginLeft: 22 }}
                         value={moveVal}
                         onChange={e => setActionValue('move', e.target.value)}
+                        // The closed control clips long paths; surface the full
+                        // selected path as a tooltip. (A native <option> cannot
+                        // host the pickers' two-tone/hover-scroll label.)
+                        title={moveVal || undefined}
                       >
                         <option value="">{t('admin.rules.actionMoveSelectFolder')}</option>
-                        {movableFolders.map(f => (
-                          <option key={f.path} value={f.path}>{f.name || f.path}</option>
-                        ))}
+                        {movableFolders.map(f => {
+                          // Same ancestor-path display as the move pickers, so
+                          // same-named folders under different parents are
+                          // distinguishable when choosing a rule destination.
+                          const parent = folderParentLabel(f);
+                          const name = f.name || f.path;
+                          return (
+                            <option key={f.path} value={f.path}>
+                              {parent ? `${parent} / ${name}` : name}
+                            </option>
+                          );
+                        })}
                       </select>
                     );
                   }
@@ -6281,6 +6728,11 @@ function RulesTab() {
         </div>
       </div>
 
+      {runningRules && (
+        <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
+          {t('admin.rules.runStarted')}
+        </div>
+      )}
       {runResult && (
         <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
           {t('admin.rules.runResult', { matched: runResult.matched, processed: runResult.processed })}
@@ -6664,7 +7116,7 @@ function MailboxCleanupTab() {
 }
 
 const TAB_GROUPS = [
-  { id: 'account-mail', labelKey: 'admin.tabs.groupAccountMail', tabIds: ['accounts', 'notifications', 'rules', 'categories', 'cleanup'] },
+  { id: 'account-mail', labelKey: 'admin.tabs.groupAccountMail', tabIds: ['accounts', 'notifications', 'rules', 'categories', 'cleanup', 'antispam'] },
   { id: 'display', labelKey: 'admin.tabs.groupDisplay', tabIds: ['appearance', 'shortcuts'] },
   { id: 'security-integrations', labelKey: 'admin.tabs.groupSecurityIntegrations', tabIds: ['security', 'integrations', 'ai', 'ai-actions', 'plugins'] },
   { id: 'admin', labelKey: 'admin.tabs.groupAdmin', tabIds: ['users', 'sso'] },
@@ -6691,6 +7143,10 @@ const TABS = [
   {
     id: 'cleanup', labelKey: 'admin.tabs.cleanup', beta: true,
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M19 3l-6 6"/><path d="M14 4l6 6"/><path d="M11 8l-7 7c-1 1-1 3 0 4s3 1 4 0l7-7"/><path d="M6 20l-3-3"/></svg>,
+  },
+  {
+    id: 'antispam', labelKey: 'admin.tabs.antispam',
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z"/><path d="M19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14z"/><path d="M5 15l.6 1.8L7.5 17l-1.9.7L5 19.5l-.6-1.8L2.5 17l1.9-.7L5 15z"/></svg>,
   },
   // Display
   {
@@ -8338,6 +8794,7 @@ export default function AdminPanel() {
   const tabContent = (
     <>
       {adminTab === 'accounts' && <AccountsTab />}
+      {adminTab === 'antispam' && <SpamSettings />}
       {adminTab === 'rules' && <RulesAndBlockListTab initialSubTab={pendingSubTab} />}
       {adminTab === 'categories' && <CategoriesSection initialSubTab={pendingSubTab} />}
       {adminTab === 'cleanup' && <MailboxCleanupTab />}
