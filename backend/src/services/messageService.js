@@ -98,7 +98,8 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
         FROM messages m
         WHERE ${where}
         GROUP BY m.thread_key
-        ORDER BY MAX(m.date) DESC
+        -- thread_key breaks exact date ties so paging is stable (see the flat query).
+        ORDER BY MAX(m.date) DESC, m.thread_key
         LIMIT $${p + 1} OFFSET $${p + 2}
       ),
       deduped AS MATERIALIZED (
@@ -110,6 +111,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
                m.date, m.snippet, m.is_read, m.is_starred,
                m.has_attachments, m.account_id, m.category,
                m.list_unsubscribe, m.list_unsubscribe_post, m.delivery_addresses,
+               m.spam_verdict, m.spam_user_override, m.spam_score_ml,
                a.name  AS account_name,
                a.email_address AS account_email,
                a.color AS account_color,
@@ -146,7 +148,10 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
                FIRST_VALUE(d.from_name)          OVER (PARTITION BY d.thread_id ORDER BY d.date ASC) AS thread_from_name,
                FIRST_VALUE(d.from_email)         OVER (PARTITION BY d.thread_id ORDER BY d.date ASC) AS thread_from_email,
                FIRST_VALUE(d.has_contact_photo)  OVER (PARTITION BY d.thread_id ORDER BY d.date ASC) AS thread_has_contact_photo,
-               ROW_NUMBER() OVER (PARTITION BY d.thread_id ORDER BY d.date DESC) AS rn
+               -- Representative for the thread row. On an exact date tie prefer the UNREAD
+               -- copy (is_read ASC puts false first), so a thread holding unread mail never
+               -- renders as its already-read duplicate; d.id keeps the choice deterministic.
+               ROW_NUMBER() OVER (PARTITION BY d.thread_id ORDER BY d.date DESC, d.is_read ASC, d.id) AS rn
         FROM deduped d
         LEFT JOIN thread_totals tt ON tt.thread_id = d.thread_id
       )
@@ -156,11 +161,12 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
              date, snippet, is_starred, is_read, has_attachments, account_id,
              account_name, account_email, account_color,
              category, list_unsubscribe, list_unsubscribe_post, delivery_addresses,
+             spam_verdict, spam_user_override, spam_score_ml,
              message_count, unread_count,
              thread_has_contact_photo AS has_contact_photo
       FROM ranked
       WHERE rn = 1
-      ORDER BY date DESC
+      ORDER BY date DESC, id
     `, [...filterValues, threadAccountParam, safeLimit, safeOffset]);
 
     const threadCountResult = await query(`
@@ -187,6 +193,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
            m.date, m.snippet, m.is_read, m.is_starred,
            m.has_attachments, m.account_id, m.category,
            m.list_unsubscribe, m.list_unsubscribe_post, m.delivery_addresses,
+           m.spam_verdict, m.spam_user_override, m.spam_score_ml,
            a.name as account_name, a.email_address as account_email, a.color as account_color,
            (co.id IS NOT NULL) AS has_contact_photo
     FROM messages m
@@ -195,7 +202,10 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
                           AND co.primary_email = lower(m.from_email)
                           AND co.photo_data IS NOT NULL
     WHERE ${where}
-    ORDER BY m.date DESC
+    -- m.id breaks exact date ties. Without it the sort is unspecified, so LIMIT/OFFSET
+    -- paging could show a row twice or skip it entirely, and the client-side duplicate
+    -- collapse would receive the two copies of a message in an arbitrary order.
+    ORDER BY m.date DESC, m.id
     LIMIT $${limitParam} OFFSET $${offsetParam}
   `, values);
 

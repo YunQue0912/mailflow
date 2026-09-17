@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { copyToClipboard } from '../utils/clipboard.js';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
 import { getContextMenuPolicy, resolveContextMenuMessage } from '../utils/contextMenuPolicy.js';
 import { usePluginCollected } from '../plugins/PluginSlot.jsx';
 import MessageHeaderModal from './MessageHeaderModal.jsx';
+import FolderPathLabel from './FolderPathLabel.jsx';
+import { folderMatchesQuery } from '../utils/folderDisplay.js';
 import { useUiScale, descale } from '../hooks/useUiScale.js';
 import { useMobile } from '../hooks/useMobile.js';
 
@@ -282,12 +285,12 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
         {
           label: t('contextMenu.copySubject'),
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>,
-          action: () => { navigator.clipboard.writeText(message.subject || ''); onAction('copy'); },
+          action: () => { copyToClipboard(message.subject || ''); onAction('copy'); },
         },
         {
           label: t('contextMenu.copySender'),
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
-          action: () => { navigator.clipboard.writeText(message.from_email || ''); onAction('copy'); },
+          action: () => { copyToClipboard(message.from_email || ''); onAction('copy'); },
         },
         {
           // Durable permalink to this email: keyed on the stable Message-ID header (falls back to
@@ -297,7 +300,7 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>,
           action: () => {
             const ref = message.message_id || message.id;
-            if (ref) navigator.clipboard.writeText(`${window.location.origin}/?m=${encodeURIComponent(ref)}`);
+            if (ref) copyToClipboard(`${window.location.origin}/?m=${encodeURIComponent(ref)}`);
             onAction('copy');
           },
         },
@@ -629,7 +632,7 @@ export default function ContextMenu({ x, y, message, onClose, onAction, defaultM
                 const searchQuery = folderSearch.trim().toLowerCase();
                 if (searchQuery) {
                   const filtered = (moveFolders || [])
-                    .filter(f => f.path !== message.folder && f.name.toLowerCase().includes(searchQuery));
+                    .filter(f => f.path !== message.folder && folderMatchesQuery(f, searchQuery));
                   return filtered.length === 0 ? (
                     <div style={{ padding: '12px 14px', color: 'var(--text-tertiary)', fontSize: 12 }}>
                       {t('contextMenu.folders.empty')}
@@ -799,9 +802,7 @@ function FolderMenuItem({ folder, onClick }) {
       }}
     >
       <span style={{ flexShrink: 0, color: 'var(--text-tertiary)', display: 'flex' }}>{icon}</span>
-      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {folder.name || folder.path}
-      </span>
+      <FolderPathLabel folder={folder} />
     </div>
   );
 }

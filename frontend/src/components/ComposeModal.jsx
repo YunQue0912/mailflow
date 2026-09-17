@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, forwardRef } from 'react';
+import { shouldAutosave, isAutosaveDue } from '../utils/draftAutosave.js';
 import { useTranslation } from 'react-i18next';
 import DOMPurify from 'dompurify';
 import { useStore } from '../store/index.js';
@@ -16,6 +17,9 @@ import { Table } from '@tiptap/extension-table';
 import { TableRow } from '@tiptap/extension-table-row';
 import { TableHeader } from '@tiptap/extension-table-header';
 import { TableCell } from '@tiptap/extension-table-cell';
+import { ComposerLink } from '../utils/editorLink.js';
+import { copyToClipboard } from '../utils/clipboard.js';
+import { resolveInitialFrom } from '../utils/defaultSender.js';
 
 // Resize an image blob/file to max maxW pixels wide, preserving aspect ratio.
 // Returns a Promise<string> of a base64 data URL.
@@ -235,18 +239,17 @@ export default function ComposeModal() {
     if (composeData?.quotedBody !== undefined) setQuotedBody(composeData.quotedBody);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps -- form initialisation runs once on mount; re-running on composeData changes would reset user edits
 
-  const initialFromValue = () => {
-    if (composeData?.aliasId && composeData?.accountId) {
-      return `alias:${composeData.aliasId}:${composeData.accountId}`;
-    }
-    const lastUsedId = localStorage.getItem('mailflow_last_from_account');
-    const acctId = composeData?.accountId
-      || useStore.getState().selectedAccountId
-      || (lastUsedId && accounts.find(a => a.id === lastUsedId) ? lastUsedId : null)
-      || accounts[0]?.id
-      || '';
-    return acctId ? `account:${acctId}` : '';
-  };
+  // Precedence lives in resolveInitialFrom, which is unit tested. The rung that matters
+  // here is the configured default sender: in the unified inbox there is no selected
+  // account, so without it the composer falls through to whichever account was last sent
+  // from and drifts silently (#417).
+  const initialFromValue = () => resolveInitialFrom({
+    composeData,
+    selectedAccountId: useStore.getState().selectedAccountId,
+    defaultSender: useStore.getState().defaultSender,
+    lastUsedAccountId: localStorage.getItem('mailflow_last_from_account'),
+    accounts,
+  });
   const [fromValue, setFromValue] = useState(initialFromValue);
 
   const resolveFrom = (val) => {
@@ -322,11 +325,20 @@ export default function ComposeModal() {
   const signatureInitializedRef = useRef(false);
   const prevFromValueRef = useRef(fromValue);
 
+  // Edit/save timestamps driving the autosave rule. Refs, not state: they are written from the
+  // editor's onUpdate on every keystroke and must never cause a render. Both are seeded at mount
+  // so a freshly opened composer is not treated as idle-since-forever or unsaved-since-epoch.
+  const lastEditAtRef = useRef(Date.now());
+  const lastSaveAtRef = useRef(Date.now());
+
   const editor = useEditor({
     extensions: [
+      // Link comes from ComposerLink instead of StarterKit's bundled copy so the mark can
+      // be made non-inclusive. See editorLink.js for why (#415).
       StarterKit.configure({
-        link: { openOnClick: false },
+        link: false,
       }),
+      ComposerLink,
       TextStyle,
       TiptapColor,
       FontFamily,
@@ -341,6 +353,9 @@ export default function ComposeModal() {
       Placeholder.configure({ placeholder: t('compose.bodyPh') }),
     ],
     content: composeData?.body || '',
+    // Records edit time in a ref only. Deliberately does not touch state: this fires on every
+    // transaction, and re-rendering the composer per keystroke would be a real regression.
+    onUpdate: () => { lastEditAtRef.current = Date.now(); },
     autofocus: (isReply || isForward) && !plaintextEmail ? 'start' : false,
     immediatelyRender: false,
     editorProps: {
@@ -595,6 +610,17 @@ export default function ComposeModal() {
       prevFromValueRef.current = fromValue;
       signatureInitializedRef.current = false;
     }
+    // A reopened draft supplies the signature it was saved with ('' meaning "already in the
+    // body, render none"). Honour it for the first initialisation only, so switching the From
+    // identity afterwards still swaps in that account's signature. See utils/draftSignature.js.
+    if (!signatureInitializedRef.current && !fromValueChanged && composeData?.signature !== undefined) {
+      signatureInitializedRef.current = true;
+      const draftSig = DOMPurify.sanitize(composeData.signature);
+      if (signatureRef.current) signatureRef.current.innerHTML = draftSig;
+      signatureContentRef.current = draftSig;
+      setPlainSig(stripHtml(composeData.signature));
+      return;
+    }
     if (!signatureInitializedRef.current && fromSignature != null) {
       signatureInitializedRef.current = true;
       const sanitized = DOMPurify.sanitize(fromSignature);
@@ -605,7 +631,7 @@ export default function ComposeModal() {
       signatureContentRef.current = '';
       setPlainSig('');
     }
-  }, [fromValue, fromSignature]);
+  }, [fromValue, fromSignature, composeData?.signature]);
 
   // Initialise quoted HTML contentEditable once on mount (ref-based to avoid React cursor conflicts)
   useEffect(() => {
@@ -827,7 +853,7 @@ export default function ComposeModal() {
     );
   };
 
-  const doSaveDraft = async ({ closeAfter = false } = {}) => {
+  const doSaveDraft = async ({ closeAfter = false, silent = false } = {}) => {
     const { accountId, aliasId } = resolveFrom(fromValue);
     if (!accountId) return;
     setSavingDraft(true);
@@ -881,7 +907,8 @@ export default function ComposeModal() {
         initialCcRef.current = normalizeTo([...ccChips, ...(pendingCc ? [pendingCc] : [])]);
         initialBccRef.current = normalizeTo([...bccChips, ...(pendingBcc ? [pendingBcc] : [])]);
         savedAttachmentCountRef.current = attachments.length + fwdAttachments.length;
-        addNotification({ title: t('compose.draftSaved'), body: subject || t('common.noSubject') });
+        // Autosave passes silent: a toast every interval would be noise, not information.
+        if (!silent) addNotification({ title: t('compose.draftSaved'), body: subject || t('common.noSubject') });
       }
     } catch (err) {
       console.error('Save draft failed:', err.message);
@@ -889,6 +916,108 @@ export default function ComposeModal() {
       setSavingDraft(false);
     }
   };
+
+  // ── Draft safety net (#413) ──────────────────────────────────────────────────────────
+  // Compose state is component-local and the modal is mounted conditionally, so a refresh
+  // drops everything typed. The close path is already guarded by isDirty() and the discard
+  // sheet; refresh and navigation simply were not covered.
+  //
+  // An interval is used rather than a state-keyed debounce because the rich-text editor has
+  // no onUpdate handler, so typing in the body never changes React state and could not drive
+  // one. Reading through a ref is still correct: isDirty() reads the body live off the editor
+  // instance and the rest from refs, so a closure captured at the last render sees current
+  // content. Recipients and subject are ordinary state, so they re-render and refresh the ref.
+  const autosaveRef = useRef(null);
+  // Synchronous in-flight flag. savingDraft is React state and only refreshes after commit,
+  // so on its own it leaves a window where a manual save and a timer tick could both append.
+  const autosaveInFlightRef = useRef(false);
+  // Updated after commit rather than during render, so a render React discards can never
+  // leave a stale snapshot behind for the timer to act on.
+  useEffect(() => {
+    autosaveRef.current = { isDirty, doSaveDraft, sending, savingDraft, fromValue, resolveFrom,
+      dialogOpen: showCloseDialog || showDiscardSheet || showAttachWarnForDraft };
+  });
+
+  // Every edit outside the rich-text editor (subject, recipients, attachments, the plaintext
+  // body) goes through state, so a render marks the edit time. Skips the mount render so an
+  // untouched composer is not immediately considered "just edited".
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    if (!mountedRef.current) { mountedRef.current = true; return; }
+    lastEditAtRef.current = Date.now();
+  }, [subject, toChips, ccChips, bccChips, toInput, ccInput, bccInput, body, htmlSource,
+      attachments, fwdAttachments, plaintextEmail, htmlMode]);
+
+  // Single save path shared by the timer and the tab-hidden handler, so the guards can never
+  // drift apart between the two triggers.
+  const runAutosave = useCallback(async () => {
+    try {
+      const s = autosaveRef.current;
+      if (!s) return;
+      const ok = shouldAutosave({
+        dirty: s.isDirty(),
+        hasAccount: Boolean(s.resolveFrom(s.fromValue).accountId),
+        sending: s.sending,
+        savingDraft: s.savingDraft,
+        inFlight: autosaveInFlightRef.current,
+        dialogOpen: s.dialogOpen,
+      });
+      if (!ok) return;
+      autosaveInFlightRef.current = true;
+      try {
+        // Deliberately doSaveDraft rather than handleSaveDraft: the latter raises the
+        // attachment dialog, which must never appear unprompted. Attachments are not carried
+        // by drafts either way, and preserving the text still beats losing everything.
+        await s.doSaveDraft({ silent: true });
+        lastSaveAtRef.current = Date.now();
+      } finally {
+        autosaveInFlightRef.current = false;
+      }
+    } catch (err) {
+      // Runs on a timer and on tab-hide, so an unguarded throw would recur. Skip and retry.
+      console.error('Draft autosave failed:', err?.message || err);
+    }
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!isAutosaveDue({
+        now: Date.now(),
+        lastEditAt: lastEditAtRef.current,
+        lastSaveAt: lastSaveAtRef.current,
+        idleMs: AUTOSAVE_IDLE_MS,
+        minGapMs: AUTOSAVE_MIN_GAP_MS,
+        maxMs: AUTOSAVE_MAX_MS,
+      })) return;
+      runAutosave();
+    }, AUTOSAVE_TICK_MS);
+    return () => clearInterval(id);
+  }, [runAutosave]);
+
+  // Save when the tab is hidden. This is where the risk actually appears: people switch away
+  // and only then refresh or close, so it catches the common case at the moment it matters
+  // rather than on a clock. Not a substitute for the timer, since a hidden tab may be frozen
+  // before the request completes, and it deliberately ignores the idle rule.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState !== 'hidden') return;
+      runAutosave();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [runAutosave]);
+
+  // Ask the browser to confirm before a refresh or navigation discards unsaved changes.
+  // Modern browsers ignore custom text, so this only opts into the native prompt.
+  useEffect(() => {
+    const onBeforeUnload = (e) => {
+      if (!autosaveRef.current?.isDirty()) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
 
   const handleSaveDraft = (closeAfter = false) => {
     if ((attachments.length > 0 || fwdAttachments.length > 0) && !showAttachWarnForDraft) {
@@ -2245,6 +2374,19 @@ const FontSize = Extension.create({
 
 const DEFAULT_FONT_SIZE = '14px';
 
+// How often an unsaved compose is written back to the Drafts folder. Long enough that a
+// normal editing session costs only a handful of IMAP appends, short enough that a refresh
+// loses at most this much typing. doSaveDraft replaces the existing draft via existingUid,
+// so repeated saves update one message rather than filling Drafts with copies.
+// Autosave cadence. The timer only decides *whether* to save; isAutosaveDue owns the rule.
+// A save costs two IMAP round trips (APPEND the new draft, delete the previous uid) and
+// re-uploads the whole body, so saving during active typing is the expensive case. Saving
+// shortly after typing stops gives a far smaller loss window for fewer writes than polling.
+const AUTOSAVE_TICK_MS = 5000;   // how often the rule is evaluated
+const AUTOSAVE_IDLE_MS = 5000;   // save this long after the last edit
+const AUTOSAVE_MIN_GAP_MS = 15000; // floor: never save more often than this
+const AUTOSAVE_MAX_MS = 30000;   // never leave a dirty compose unsaved longer than this
+
 const FONT_SIZES = [
   { label: '10', value: '10px' },
   { label: '11', value: '11px' },
@@ -3024,7 +3166,7 @@ function ChipInput({ chips, onChipsChange, value, onChange, placeholder, autoFoc
     const m = (chip || '').match(/<([^>]+)>/);
     return (m ? m[1] : chip || '').trim();
   };
-  const copyText = (text) => { navigator.clipboard?.writeText(text).catch(() => {}); };
+  const copyText = (text) => { copyToClipboard(text); };
 
   // Load a chip back into the input for editing, preserving any half-typed text.
   const startEdit = (i) => {

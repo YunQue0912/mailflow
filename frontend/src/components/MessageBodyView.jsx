@@ -5,6 +5,8 @@ import { api } from '../utils/api.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { fetchMessageBodyWithRetry } from '../utils/messageBody.js';
 import { downloadAttachmentFile } from '../utils/attachmentDownload.js';
+import { classifyAttachmentRisk } from '../utils/attachmentRisk.js';
+import { measureContentHeight, createHeightController, forceEagerImages } from '../utils/emailFrameHeight.js';
 
 const USE_DIV_RENDER = import.meta.env.VITE_EMAIL_DIV_RENDER === 'true';
 
@@ -86,6 +88,7 @@ const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = t
   const [retryKey, setRetryKey] = useState(0);
   const [downloadingPart, setDownloadingPart] = useState(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
+  const [riskArmed, setRiskArmed] = useState(null);
   const [savingAllow, setSavingAllow] = useState(false);
   const iframeRef = useRef(null);
   const resizeObserverRef = useRef(null);
@@ -118,6 +121,7 @@ const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = t
   }), []);
 
   const messageId = message?.id;
+  useEffect(() => { setRiskArmed(null); }, [messageId]);
   const prepared = useMemo(() => {
     if (!USE_DIV_RENDER || !body?.html) return null;
     return prepareEmailHtml(body.html, String(messageId ?? 'preview'));
@@ -201,32 +205,35 @@ const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = t
     const iframe = iframeRef.current;
     if (!iframe || !body?.html) return;
     let animationFrame;
-    let lastHeight = 0;
+    let pollFrame = null;
+    let initialisedDocument = null;
+    const heights = createHeightController();
     let contextMenuDocument = null;
     let contextMenuHandler = null;
+    let clickDocument = null;
+    let clickHandler = null;
 
     const setHeight = () => {
       const doc = iframe.contentDocument;
       if (!doc) return;
-      const html = doc.documentElement;
       const emailBody = doc.body;
-      const height = Math.max(
-        html?.scrollHeight || 0,
-        html?.offsetHeight || 0,
-        emailBody?.scrollHeight || 0,
-        emailBody?.offsetHeight || 0,
-      );
-      const scaledHeight = Math.round(height * emailScaleRef.current);
-      if (scaledHeight > lastHeight) {
-        lastHeight = scaledHeight;
-        iframe.style.height = `${scaledHeight}px`;
-      }
+      const wrapper = doc.getElementById('mf-scale-wrapper');
+      const height = measureContentHeight({
+        wrapperOffsetHeight: wrapper?.offsetHeight,
+        wrapperOffsetTop: wrapper?.offsetTop,
+        bodyScrollHeight: emailBody?.scrollHeight,
+        bodyOffsetHeight: emailBody?.offsetHeight,
+      });
+      const next = heights.next(height, emailScaleRef.current);
+      if (next !== null) iframe.style.height = `${next}px`;
     };
 
     const onLoaded = () => {
-      emailScaleRef.current = 1;
       const doc = iframe.contentDocument;
-      if (!doc) return;
+      if (!doc?.getElementById('mf-scale-wrapper') || doc === initialisedDocument) return;
+      initialisedDocument = doc;
+      emailScaleRef.current = 1;
+      forceEagerImages(doc);
       const emailBody = doc.body;
       const html = doc.documentElement;
       for (const element of [emailBody, html]) {
@@ -270,17 +277,21 @@ const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = t
       };
 
       expandScrollContainers();
-      lastHeight = 0;
+      heights.reset();
       setHeight();
       animationFrame = requestAnimationFrame(setHeight);
-      doc.addEventListener('click', event => {
+      clickDocument?.removeEventListener('click', clickHandler);
+      clickHandler = event => {
         const anchor = event.target.closest('a[href]');
         if (!anchor) return;
         event.preventDefault();
         let href = anchor.getAttribute('href') || '';
         if (href.startsWith('//')) href = `https:${href}`;
         if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) window.open(href, '_blank', 'noopener,noreferrer');
-      });
+      };
+      clickDocument = doc;
+      doc.addEventListener('click', clickHandler);
+      contextMenuDocument?.removeEventListener('contextmenu', contextMenuHandler);
       if (onContextMenu) {
         contextMenuHandler = event => {
           event.preventDefault();
@@ -302,20 +313,30 @@ const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = t
       });
       const root = doc.body || doc.documentElement;
       if (window.ResizeObserver && root) {
+        resizeObserverRef.current?.disconnect();
         resizeObserverRef.current = new ResizeObserver(() => requestAnimationFrame(setHeight));
         resizeObserverRef.current.observe(root);
       }
     };
 
-    iframe.addEventListener('load', onLoaded, { once: true });
-    if (iframe.contentDocument?.readyState === 'complete') onLoaded();
+    iframe.addEventListener('load', onLoaded);
+    let pollFrames = 0;
+    const pollUntilParsed = () => {
+      pollFrame = null;
+      onLoaded();
+      if (initialisedDocument || pollFrames++ >= 300) return;
+      pollFrame = requestAnimationFrame(pollUntilParsed);
+    };
+    pollUntilParsed();
     return () => {
       cancelAnimationFrame(animationFrame);
+      if (pollFrame) cancelAnimationFrame(pollFrame);
       resizeObserverRef.current?.disconnect();
       resizeObserverRef.current = null;
       if (contextMenuDocument && contextMenuHandler) {
         contextMenuDocument.removeEventListener('contextmenu', contextMenuHandler);
       }
+      clickDocument?.removeEventListener('click', clickHandler);
       iframe.removeEventListener('load', onLoaded);
       emailScaleRef.current = 1;
     };
@@ -491,13 +512,28 @@ const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = t
             {attachments.length > 1 && <button type="button" onClick={downloadAllAttachments} disabled={downloadingAll} style={{ padding: 0, border: 'none', background: 'transparent', fontSize: 12, color: 'var(--accent)', cursor: downloadingAll ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}><span aria-hidden="true">↓</span>{downloadingAll ? t('message.downloading') : t('message.downloadAll')}</button>}
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-            {attachments.map((attachment, index) => (
-              <button key={`${attachment.part}-${index}`} onClick={() => downloadAttachment(attachment)} disabled={downloadingPart === attachment.part} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-secondary)', border: '1px solid var(--border)', cursor: downloadingPart === attachment.part ? 'wait' : 'pointer', color: 'var(--text-primary)', maxWidth: 240 }}>
+            {attachments.map((attachment, index) => {
+              const risk = classifyAttachmentRisk(attachment.filename, attachment.type);
+              const risky = risk.level === 'block' || risk.level === 'warn';
+              const riskColor = risk.level === 'block' ? 'var(--red)' : risk.level === 'warn' ? 'var(--amber)' : 'var(--text-tertiary)';
+              const armed = riskArmed === attachment.part;
+              return (
+              <button key={`${attachment.part}-${index}`} onClick={() => {
+                if (risky && !armed) { setRiskArmed(attachment.part); return; }
+                setRiskArmed(null);
+                downloadAttachment(attachment);
+              }} disabled={downloadingPart === attachment.part} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-secondary)', border: `1px solid ${risky ? riskColor : 'var(--border)'}`, cursor: downloadingPart === attachment.part ? 'wait' : 'pointer', color: 'var(--text-primary)', maxWidth: 240 }}>
                 <span style={{ display: 'flex', flexShrink: 0, color: 'var(--text-secondary)' }}><FileIcon type={attachment.type}/></span>
-                <span style={{ minWidth: 0, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{attachment.filename}</span><span style={{ display: 'block', fontSize: 10, color: 'var(--text-tertiary)', marginTop: 1 }}>{downloadingPart === attachment.part ? t('message.downloading') : formatBytes(attachment.size)}</span></span>
+                <span style={{ minWidth: 0, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{attachment.filename}</span><span style={{ display: 'block', fontSize: 10, color: 'var(--text-tertiary)', marginTop: 1 }}>{downloadingPart === attachment.part ? t('message.downloading') : formatBytes(attachment.size)}</span>
+                  {risk.level !== 'ok' && <span style={{ display: 'block', fontSize: 11, color: riskColor, fontWeight: risk.level === 'block' ? 600 : 400, whiteSpace: 'normal' }}>
+                    {risk.doubleExt ? t('message.attachmentRisk.doubleExt', { ext: risk.doubleExt }) : t(`message.attachmentRisk.${risk.level}`, { ext: risk.ext })}
+                    {armed && ` — ${t('message.attachmentRisk.confirm')}`}
+                  </span>}
+                </span>
                 <span aria-hidden="true" style={{ color: 'var(--text-tertiary)' }}>↓</span>
               </button>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

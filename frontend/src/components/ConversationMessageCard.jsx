@@ -3,10 +3,14 @@ import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
 import { formatDate } from '../utils/formatDate.js';
-import { BUILTIN_SUMMARIZE } from '../aiActions.js';
+import { BUILTIN_SUMMARIZE, summarizePromptForLocale } from '../aiActions.js';
+import { getResults, saveResult, removeResult } from '../aiResults.js';
+import { aiRuns } from '../utils/aiRunRegistry.js';
 import { resolveConversationMessageDisclosure } from '../utils/conversation.js';
 import MessageBodyView from './MessageBodyView.jsx';
 import MessageHeaderModal from './MessageHeaderModal.jsx';
+import SpamBadge from './SpamBadge.jsx';
+import SpamExplainModal from './SpamExplainModal.jsx';
 
 function addresses(raw) {
   try {
@@ -18,10 +22,11 @@ function addresses(raw) {
 }
 
 export default function ConversationMessageCard({ message, expanded, onToggle, onReply, onForward }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { updateMessage, addNotification, aiActions } = useStore();
   const [body, setBody] = useState(null);
   const [showHeaderModal, setShowHeaderModal] = useState(false);
+  const [showSpamExplain, setShowSpamExplain] = useState(false);
   const [starBusy, setStarBusy] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [unsubscribeStatus, setUnsubscribeStatus] = useState(null);
@@ -29,9 +34,14 @@ export default function ConversationMessageCard({ message, expanded, onToggle, o
   const [aiResult, setAiResult] = useState(null);
   const [hasBeenExpanded, setHasBeenExpanded] = useState(expanded);
   const [visuallyExpanded, setVisuallyExpanded] = useState(expanded);
-  const aiAbortRef = useRef(null);
+  const activeActionRef = useRef(null);
 
-  useEffect(() => () => aiAbortRef.current?.abort(), []);
+  useEffect(() => () => { activeActionRef.current = null; }, []);
+  useEffect(() => {
+    if (!expanded || activeActionRef.current) return;
+    const saved = Object.entries(getResults(message.id)).sort((a, b) => b[1].at - a[1].at)[0];
+    if (saved) setAiResult({ ...saved[1], actionKey: saved[0], status: 'done' });
+  }, [expanded, message.id]);
   useEffect(() => {
     if (expanded) setHasBeenExpanded(true);
   }, [expanded]);
@@ -96,47 +106,41 @@ export default function ConversationMessageCard({ message, expanded, onToggle, o
       || '';
     if (!action?.id || !textContent) return;
     setShowMoreMenu(false);
-    aiAbortRef.current?.abort();
-    const controller = new AbortController();
-    aiAbortRef.current = controller;
+    const controller = aiRuns.start(message.id, action.id, new AbortController());
+    activeActionRef.current = controller;
     const label = action.id === BUILTIN_SUMMARIZE.id ? t('message.summary') : action.label;
-    setAiResult({ status: 'loading', label, text: '' });
-    try {
-      const response = await fetch('/api/ai/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'MailFlow' },
-        credentials: 'include',
-        signal: controller.signal,
-        body: JSON.stringify({ messages: [{ role: 'user', content: `${action.prompt}\n\n${textContent.slice(0, 6000)}` }] }),
-      });
-      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let fullText = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const chunk = line.slice(6).trim();
-          if (chunk === '[DONE]') continue;
-          try {
-            const delta = JSON.parse(chunk)?.choices?.[0]?.delta?.content;
-            if (delta) {
-              fullText += delta;
-              setAiResult({ status: 'loading', label, text: fullText });
-            }
-          } catch { /* Ignore malformed streaming chunks. */ }
-        }
+    const applyResult = result => {
+      if (activeActionRef.current === controller && !controller.signal.aborted) {
+        setAiResult({ ...result, actionKey: action.id });
       }
-      setAiResult({ status: 'done', label, text: fullText });
+    };
+    applyResult({ status: 'loading', label, text: '' });
+    try {
+      const prompt = action.builtin ? summarizePromptForLocale(i18n.language) : action.prompt;
+      const fullText = await api.ai.chat([{
+        role: 'user', content: `${prompt}\n\n${textContent.slice(0, 6000)}`,
+      }], {
+        signal: controller.signal,
+        onDelta: text => applyResult({ status: 'loading', label, text }),
+      });
+      if (!controller.signal.aborted) {
+        if (fullText) saveResult(message.id, action.id, fullText, label);
+        applyResult({ status: 'done', label, text: fullText });
+      }
     } catch (requestError) {
-      if (requestError.name !== 'AbortError') setAiResult({ status: 'error', label, text: requestError.message });
+      if (requestError.name !== 'AbortError') applyResult({ status: 'error', label, text: requestError.message });
+    } finally {
+      if (!controller.signal.aborted) aiRuns.finish(message.id, action.id);
+      if (activeActionRef.current === controller) activeActionRef.current = null;
     }
+  };
+
+  const dismissAiResult = () => {
+    if (aiResult?.actionKey) {
+      aiRuns.abort(message.id, aiResult.actionKey);
+      removeResult(message.id, aiResult.actionKey);
+    }
+    setAiResult(null);
   };
 
   return (
@@ -180,6 +184,8 @@ export default function ConversationMessageCard({ message, expanded, onToggle, o
         </span>
       </button>
 
+      <SpamBadge message={message} onClick={() => setShowSpamExplain(true)} />
+
       {disclosure.renderShell && (
         <div
           className="conversation-message-card__disclosure"
@@ -210,7 +216,7 @@ export default function ConversationMessageCard({ message, expanded, onToggle, o
                   </div>
                 </div>
                 {aiResult && <div style={{ marginBottom: 10, padding: 10, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg-secondary)', color: 'var(--text-secondary)', fontSize: 12 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: aiResult.text ? 7 : 0 }}><strong style={{ flex: 1, color: 'var(--text-primary)' }}>{aiResult.label}</strong><span>{aiResult.status === 'loading' ? t('common.loading') : aiResult.status === 'error' ? t('common.error', { message: aiResult.text }) : ''}</span><button type="button" onClick={() => setAiResult(null)} title={t('common.dismiss')} aria-label={t('common.dismiss')} style={{ border: 'none', background: 'transparent', color: 'var(--text-tertiary)', cursor: 'pointer' }}>x</button></div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: aiResult.text ? 7 : 0 }}><strong style={{ flex: 1, color: 'var(--text-primary)' }}>{aiResult.label}</strong><span>{aiResult.status === 'loading' ? t('common.loading') : aiResult.status === 'error' ? t('common.error', { message: aiResult.text }) : ''}</span><button type="button" onClick={dismissAiResult} title={t('common.dismiss')} aria-label={t('common.dismiss')} style={{ border: 'none', background: 'transparent', color: 'var(--text-tertiary)', cursor: 'pointer' }}>x</button></div>
                   {aiResult.status !== 'error' && aiResult.text && <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{aiResult.text}</div>}
                 </div>}
                 <MessageBodyView
@@ -228,6 +234,7 @@ export default function ConversationMessageCard({ message, expanded, onToggle, o
       )}
 
       {showHeaderModal && <MessageHeaderModal messageId={message.id} subject={message.subject} onClose={() => setShowHeaderModal(false)} />}
+      {showSpamExplain && <SpamExplainModal messageId={message.id} onClose={() => setShowSpamExplain(false)} />}
     </article>
   );
 }

@@ -83,4 +83,16 @@ describe('GET /api/mail/resolve-message account scope', () => {
     expect(sql).toContain("DISTINCT ON (COALESCE(NULLIF(m.message_id, ''), m.id::text))");
     expect(sql).toContain("ORDER BY COALESCE(NULLIF(m.message_id, ''), m.id::text)");
   });
+
+  it('includes spam classification in thread cards as well as message-list rows', async () => {
+    const message = { id: 'spam-message', spam_verdict: 'spam', spam_user_override: null, spam_score_ml: 0.98 };
+    query.mockResolvedValueOnce({ rows: [{ id: ACCOUNT_ID }] });
+    query.mockResolvedValueOnce({ rows: [message] });
+    const response = await fetch(`${base}/api/mail/thread/thread-1`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ messages: [message] });
+    const [sql, params] = query.mock.calls[1];
+    expect(sql).toContain('m.spam_verdict, m.spam_user_override, m.spam_score_ml');
+    expect(params).toEqual([[ACCOUNT_ID], 'thread-1']);
+  });
 });
