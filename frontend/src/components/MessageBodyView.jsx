@@ -1,568 +1,349 @@
-import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useStore } from '../store/index.js';
-import { api } from '../utils/api.js';
-import { useMobile } from '../hooks/useMobile.js';
-import { fetchMessageBodyWithRetry } from '../utils/messageBody.js';
-import { downloadAttachmentFile } from '../utils/attachmentDownload.js';
-import { classifyAttachmentRisk } from '../utils/attachmentRisk.js';
 import { measureContentHeight, createHeightController, forceEagerImages } from '../utils/emailFrameHeight.js';
 
-const USE_DIV_RENDER = import.meta.env.VITE_EMAIL_DIV_RENDER === 'true';
-
-let prepareEmailHtml = null;
-let injectEmailStyles = null;
-let removeEmailStyles = null;
-if (USE_DIV_RENDER) {
-  ({ prepareEmailHtml } = await import('../utils/scopeEmailCss.js'));
-  ({ injectEmailStyles, removeEmailStyles } = await import('../utils/emailStyleRegistry.js'));
-}
-
-const BODY_CACHE_LIMIT = 50;
-const bodyCache = new Map();
-const bodyCacheOrder = [];
-const imagesRequested = new Set();
-
-function cacheBody(messageId, body) {
-  if (!body?.html && !body?.text) return;
-  bodyCache.set(messageId, body);
-  const previousIndex = bodyCacheOrder.indexOf(messageId);
-  if (previousIndex >= 0) bodyCacheOrder.splice(previousIndex, 1);
-  bodyCacheOrder.push(messageId);
-  while (bodyCacheOrder.length > BODY_CACHE_LIMIT) {
-    bodyCache.delete(bodyCacheOrder.shift());
-  }
-}
-
-function evictBody(messageId) {
-  bodyCache.delete(messageId);
-  const index = bodyCacheOrder.indexOf(messageId);
-  if (index >= 0) bodyCacheOrder.splice(index, 1);
-}
-
-function evictBodies(predicate, clearImageRequests = false) {
-  for (const [id, body] of bodyCache) {
-    if (!predicate(body)) continue;
-    bodyCache.delete(id);
-    if (clearImageRequests) imagesRequested.delete(id);
-  }
-  for (let index = bodyCacheOrder.length - 1; index >= 0; index -= 1) {
-    if (!bodyCache.has(bodyCacheOrder[index])) bodyCacheOrder.splice(index, 1);
-  }
-}
-
-function linkifyText(text) {
-  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return escaped.replace(
-    /https?:\/\/[^\s<>"']+/g,
-    url => `<a href="${url}" target="_blank" rel="noopener noreferrer" style="color:inherit">${url}</a>`,
-  );
-}
-
-function formatBytes(bytes) {
-  if (!bytes) return '';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function FileIcon({ type }) {
-  const normalized = (type || '').toLowerCase();
-  const props = { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.75 };
-  if (normalized.startsWith('image/')) return <svg {...props}><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>;
-  if (normalized === 'application/pdf' || normalized.includes('word') || normalized.includes('document')) return <svg {...props}><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>;
-  if (normalized.includes('sheet') || normalized.includes('excel') || normalized.includes('csv')) return <svg {...props}><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="10" y1="13" x2="10" y2="17"/><line x1="8" y1="15" x2="12" y2="15"/></svg>;
-  if (normalized.includes('zip') || normalized.includes('compressed') || normalized.includes('archive')) return <svg {...props}><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="11" x2="16" y2="11"/></svg>;
-  if (normalized.startsWith('video/')) return <svg {...props}><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>;
-  if (normalized.startsWith('audio/')) return <svg {...props}><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>;
-  return <svg {...props}><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>;
-}
-
-const MessageBodyView = forwardRef(function MessageBodyView({ message, eager = true, onBodyLoaded, onContextMenu, beforeContent = null, banner = null, inset = true, framed = true }, ref) {
+// The email body, rendered in its own sandboxed frame.
+//
+// Extracted from MessagePane so a conversation view can mount one per expanded message
+// (#316). Only expanded messages render a body; a collapsed message is a header and costs
+// nothing, which is what keeps a long thread affordable when each body is a whole document.
+//
+// The frame node is forwarded rather than owned. MessagePane reaches into it for five
+// separate things (selection, find-in-message, the context menu, positioning, resetting
+// height between messages) and forwarding leaves every one of those untouched.
+//
+// The experimental div renderer (VITE_EMAIL_DIV_RENDER) is deliberately NOT here: it is off
+// by default and untested, and moving it would double the size of this change.
+function MessageBodyView({ body, messageId, emailScaleRef, hasNativeContextTarget, onContextMenu, iframeRef }) {
   const { t } = useTranslation();
-  const isMobile = useMobile();
-  const { imageWhitelist, addToImageWhitelist, blockRemoteImages, addNotification } = useStore();
-  const [body, setBody] = useState(null);
-  const [bodyError, setBodyError] = useState(null);
-  const [loadingBody, setLoadingBody] = useState(false);
-  const [retryKey, setRetryKey] = useState(0);
-  const [downloadingPart, setDownloadingPart] = useState(null);
-  const [downloadingAll, setDownloadingAll] = useState(false);
-  const [riskArmed, setRiskArmed] = useState(null);
-  const [savingAllow, setSavingAllow] = useState(false);
-  const iframeRef = useRef(null);
-  const resizeObserverRef = useRef(null);
-  const emailScaleRef = useRef(1);
-  const outerRef = useRef(null);
-  const scaleRef = useRef(null);
-  const innerRef = useRef(null);
-  const previousBlockingPolicyRef = useRef(null);
-
-  useImperativeHandle(ref, () => ({
-    getSelectionText() {
-      const iframeSelection = iframeRef.current?.contentDocument?.getSelection?.().toString() || '';
-      return iframeSelection.trim() ? iframeSelection : (window.getSelection?.().toString() || '');
-    },
-    selectAll() {
-      const doc = iframeRef.current?.contentDocument || document;
-      const root = iframeRef.current?.contentDocument?.body || innerRef.current || outerRef.current;
-      if (!root) return false;
-      const selection = doc.getSelection?.();
-      const range = doc.createRange();
-      range.selectNodeContents(root);
-      selection?.removeAllRanges();
-      selection?.addRange(range);
-      return true;
-    },
-    find(query, matchCase = false, backwards = false) {
-      const targetWindow = iframeRef.current?.contentWindow || window;
-      return targetWindow.find?.(query, matchCase, backwards, true, false, false, false) || false;
-    },
-  }), []);
-
-  const messageId = message?.id;
-  useEffect(() => { setRiskArmed(null); }, [messageId]);
-  const prepared = useMemo(() => {
-    if (!USE_DIV_RENDER || !body?.html) return null;
-    return prepareEmailHtml(body.html, String(messageId ?? 'preview'));
-  }, [body?.html, messageId]);
-
-  useEffect(() => {
-    onBodyLoaded?.(body);
-  }, [body, onBodyLoaded]);
-
-  useEffect(() => {
-    const previous = previousBlockingPolicyRef.current;
-    const current = {
-      blockRemoteImages,
-      addressCount: (imageWhitelist?.addresses || []).length,
-      domainCount: (imageWhitelist?.domains || []).length,
-    };
-    previousBlockingPolicyRef.current = current;
-    if (!previous) return;
-
-    const tightened = (!previous.blockRemoteImages && current.blockRemoteImages)
-      || previous.addressCount > current.addressCount
-      || previous.domainCount > current.domainCount;
-    const loosened = (previous.blockRemoteImages && !current.blockRemoteImages)
-      || (!tightened && (current.addressCount > previous.addressCount || current.domainCount > previous.domainCount));
-
-    if (tightened) evictBodies(cached => !cached?.hasBlockedRemoteImages, true);
-    if (loosened) evictBodies(cached => cached?.hasBlockedRemoteImages);
-    if (tightened || loosened) setRetryKey(key => key + 1);
-  }, [blockRemoteImages, imageWhitelist]);
-
-  useLayoutEffect(() => {
-    if (!messageId) {
-      setBody(null);
-      setBodyError(null);
-      setLoadingBody(false);
-      return;
-    }
-
-    const wantsImages = imagesRequested.has(messageId);
-    const cached = bodyCache.get(messageId);
-    if (cached && (!wantsImages || !cached.hasBlockedRemoteImages)) {
-      setBody(cached);
-      setBodyError(null);
-      setLoadingBody(false);
-      return;
-    }
-    if (!eager) {
-      setBody(null);
-      setBodyError(null);
-      setLoadingBody(false);
-      return;
-    }
-    if (cached) evictBody(messageId);
-
-    let cancelled = false;
-    setBody(null);
-    setBodyError(null);
-    setLoadingBody(true);
-
-    fetchMessageBodyWithRetry(messageId, {
-      load: api.getMessageBody,
-      remoteImages: wantsImages,
-      isCancelled: () => cancelled,
-    })
-      .then(data => {
-        if (cancelled) return;
-        cacheBody(messageId, data);
-        setBody(data);
-      })
-      .catch(error => {
-        if (!cancelled) setBodyError(error.message);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingBody(false);
-      });
-
-    return () => { cancelled = true; };
-  }, [eager, messageId, retryKey]);
+  // Holds the ResizeObserver watching the frame's document, so the effect can disconnect the
+  // previous one before observing a new document.
+  const roRef = useRef(null);
 
   useEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe || !body?.html) return;
-    let animationFrame;
-    let pollFrame = null;
-    let initialisedDocument = null;
+
+    let rafId;
+    let pollId = null;
     const heights = createHeightController();
-    let contextMenuDocument = null;
-    let contextMenuHandler = null;
-    let clickDocument = null;
-    let clickHandler = null;
+    let initialisedDoc = null;
+    let contextMenuDoc = null;
+    let iframeContextMenuHandler = null;
+    let clickDoc = null;
+    let iframeClickHandler = null;
 
     const setHeight = () => {
       const doc = iframe.contentDocument;
       if (!doc) return;
-      const emailBody = doc.body;
+      const b = doc.body;
       const wrapper = doc.getElementById('mf-scale-wrapper');
-      const height = measureContentHeight({
-        wrapperOffsetHeight: wrapper?.offsetHeight,
-        wrapperOffsetTop: wrapper?.offsetTop,
-        bodyScrollHeight: emailBody?.scrollHeight,
-        bodyOffsetHeight: emailBody?.offsetHeight,
+      // documentElement is deliberately NOT measured: its scrollHeight is floored by
+      // the frame's own viewport, so once the frame is N tall every reading is >= N
+      // and an over-estimate can never be walked back. That floor, not the guard that
+      // used to sit below it, is what left whitespace under short emails.
+      const h = measureContentHeight({
+        wrapperOffsetHeight: wrapper ? wrapper.offsetHeight : 0,
+        wrapperOffsetTop:    wrapper ? wrapper.offsetTop    : 0,
+        bodyScrollHeight:    b ? b.scrollHeight : 0,
+        bodyOffsetHeight:    b ? b.offsetHeight : 0,
       });
-      const next = heights.next(height, emailScaleRef.current);
-      if (next !== null) iframe.style.height = `${next}px`;
+      // Scale visual height to match the proportional scale applied to the
+      // email wrapper (1 for normal emails, <1 for wide fixed-layout emails).
+      // offsetHeight above is untransformed, so the factor applies exactly once.
+      const next = heights.next(h, emailScaleRef.current);
+      if (next !== null) iframe.style.height = next + 'px';
     };
 
     const onLoaded = () => {
       const doc = iframe.contentDocument;
-      if (!doc?.getElementById('mf-scale-wrapper') || doc === initialisedDocument) return;
-      initialisedDocument = doc;
-      emailScaleRef.current = 1;
+      // Only ever initialise against OUR document. A freshly mounted frame exposes an
+      // about:blank whose readyState is already 'complete', and a frame whose srcDoc has
+      // just changed still exposes the PREVIOUS email until the swap lands. Either way the
+      // readyState fast path further down can fire against a document that is not this
+      // email, measuring it and binding a ResizeObserver to it. #mf-scale-wrapper is only
+      // present in a document we rendered, which makes it a reliable marker.
+      if (!doc || !doc.getElementById('mf-scale-wrapper')) return;
+      // Guard the fast path against re-running on a document already wired up. This is
+      // per effect run, so a genuine re-run (changed deps) still re-attaches everything
+      // the cleanup tore down.
+      if (doc === initialisedDoc) return;
+      initialisedDoc = doc;
+
+      emailScaleRef.current = 1; // reset for each new email
+
+      // Start every image fetching now, rather than letting the browser defer them.
+      //
+      // Lazy loading is gated on the scroll viewport, and for an iframe that viewport is
+      // the frame's own box, which starts at 300px. Images below that never fetch, so they
+      // measure as zero height, so the frame is sized short, which brings the next image
+      // into range, which fetches, which grows the content, which resizes the frame again.
+      // Every step of that staircase costs a network round trip, and a marketing email with
+      // nine stacked images renders in visible instalments. Looking at it mid-staircase is
+      // the "half loaded" email; it only appears fixed on a second visit because the images
+      // are cached by then.
+      //
+      // Nothing is lost by loading eagerly: the frame has no internal scrolling and is
+      // sized to its full content, so every image ends up on screen regardless.
+      //
+      // Done against the DOM rather than by rewriting the srcDoc HTML so there is no chance
+      // of matching the attribute inside text content. Flipping here, before the load
+      // handlers further down are attached, is safe because everything between is
+      // synchronous: a fetch cannot deliver its load event until this function yields, by
+      // which point the handlers exist. The ResizeObserver on the body is the backstop
+      // regardless.
       forceEagerImages(doc);
-      const emailBody = doc.body;
-      const html = doc.documentElement;
-      for (const element of [emailBody, html]) {
-        if (!element) continue;
-        element.style.setProperty('height', 'auto', 'important');
-        element.style.setProperty('min-height', '0', 'important');
-        element.style.setProperty('overflow-y', 'hidden', 'important');
+
+      // Some marketing emails have inline styles on their <body> tag (e.g. overflow:auto,
+      // height:100%) that the HTML parser merges into the iframe's outer <body>.  Our
+      // injected <style> with !important can't win against inline !important rules.
+      // Setting the properties via JS style.setProperty(...,'important') writes them as
+      // inline !important, which always beats any same-property inline value from the email.
+      const b = doc.body;
+      const h = doc.documentElement;
+      if (b) {
+        b.style.setProperty('height', 'auto', 'important');
+        b.style.setProperty('min-height', '0', 'important');
+        b.style.setProperty('overflow-y', 'hidden', 'important');
+      }
+      if (h) {
+        h.style.setProperty('height', 'auto', 'important');
+        h.style.setProperty('min-height', '0', 'important');
+        h.style.setProperty('overflow-y', 'hidden', 'important');
       }
 
-      const iframeWidth = iframe.offsetWidth;
-      if (iframeWidth > 0) {
-        emailBody?.style.setProperty('overflow-x', 'visible', 'important');
-        html?.style.setProperty('overflow-x', 'visible', 'important');
-        const contentWidth = Math.max(html?.scrollWidth || 0, emailBody?.scrollWidth || 0);
-        emailBody?.style.removeProperty('overflow-x');
-        html?.style.removeProperty('overflow-x');
+      // Some marketing emails (e.g. Avis) use class-based !important rules that
+      // lock layout to a fixed pixel width and cannot be overridden by our injected
+      // CSS. Measure the rendered content width and, if it exceeds the iframe,
+      // scale the entire wrapper div down proportionally so all content is visible.
+      const iframeW = iframe.offsetWidth;
+      if (iframeW > 0) {
+        // iOS Safari clamps scrollWidth to the iframe viewport when overflow:hidden
+        // is set on html/body, so wide fixed-layout emails are never detected.
+        // Temporarily expose overflow-x inline (beating the !important stylesheet
+        // rule) to let scrollWidth reflect the true content width, then restore.
+        // Note: overflow-x:visible is coerced to auto when overflow-y is non-visible —
+        // that's fine; auto still returns the real scrollable content width.
+        if (b) b.style.setProperty('overflow-x', 'visible', 'important');
+        if (h) h.style.setProperty('overflow-x', 'visible', 'important');
+        const contentW = Math.max(
+          h ? h.scrollWidth : 0,
+          b ? b.scrollWidth : 0,
+        );
+        if (b) b.style.removeProperty('overflow-x');
+        if (h) h.style.removeProperty('overflow-x');
+
         const wrapper = doc.getElementById('mf-scale-wrapper');
-        if (contentWidth > iframeWidth + 2 && wrapper) {
-          const scale = iframeWidth / contentWidth;
+        if (contentW > iframeW + 2) { // +2 absorbs sub-pixel rounding
+          const scale = iframeW / contentW;
           emailScaleRef.current = scale;
-          wrapper.style.transform = `scale(${scale})`;
-          wrapper.style.transformOrigin = 'top left';
-          wrapper.style.width = `${contentWidth}px`;
+          if (wrapper) {
+            wrapper.style.transform       = `scale(${scale})`;
+            wrapper.style.transformOrigin = 'top left';
+            // Lock the wrapper at its natural content width so the scale
+            // maps exactly contentW → iframeW with no clipping.
+            wrapper.style.width           = `${contentW}px`;
+          }
         }
       }
 
-      const expandedElements = new Set();
-      const view = doc.defaultView;
+      // Expand any nested scroll containers so their full content is visible
+      // without internal scrolling. Marketing emails sometimes apply overflow:auto
+      // plus a fixed height to inner divs/tds, which makes iOS scroll that element
+      // instead of the outer pane container — leaving the sender card pinned like a
+      // sticky header.
+      //
+      // Process in REVERSE document order (deepest elements first) so that when we
+      // expand an inner scroll container, the outer container's scrollHeight already
+      // reflects the expanded child when we evaluate it — preventing missed outer
+      // containers in a single pass.
+      //
+      // expandedEls tracks which elements we've already expanded so that subsequent
+      // calls from image load handlers can re-check and grow them as lazy images add
+      // height (an element that was 1 000 px after the first pass may be 3 000 px
+      // once all images are loaded).
+      const expandedEls = new Set();
+      const dv = doc.defaultView;
       const expandScrollContainers = () => {
-        if (!view) return;
-        Array.from(doc.querySelectorAll('*')).reverse().forEach(element => {
-          const overflowY = view.getComputedStyle(element).overflowY;
-          const isScrollable = (overflowY === 'auto' || overflowY === 'scroll') && element.scrollHeight > element.clientHeight + 2;
-          const grew = expandedElements.has(element) && element.scrollHeight > element.clientHeight + 2;
-          if (!isScrollable && !grew) return;
-          expandedElements.add(element);
-          element.style.setProperty('overflow-y', 'hidden', 'important');
-          element.style.setProperty('max-height', 'none', 'important');
-          element.style.setProperty('height', `${element.scrollHeight}px`, 'important');
+        if (!dv) return;
+        Array.from(doc.querySelectorAll('*')).reverse().forEach(el => {
+          const cs = dv.getComputedStyle(el);
+          const oy = cs.overflowY;
+          const isScrollContainer = (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 2;
+          const grewAfterExpansion = expandedEls.has(el) && el.scrollHeight > el.clientHeight + 2;
+          if (isScrollContainer || grewAfterExpansion) {
+            expandedEls.add(el);
+            el.style.setProperty('overflow-y', 'hidden', 'important');
+            el.style.setProperty('max-height', 'none', 'important');
+            el.style.setProperty('height', el.scrollHeight + 'px', 'important');
+          }
         });
       };
-
       expandScrollContainers();
+
+      // Recalculate from scratch with the new scale. The controller deliberately does
+      // not seed itself from the frame's current height, so this measurement is
+      // authoritative even when it is SHORTER than what is currently applied. That is
+      // what clears leftover whitespace when the previous email was taller.
       heights.reset();
       setHeight();
-      animationFrame = requestAnimationFrame(setHeight);
-      clickDocument?.removeEventListener('click', clickHandler);
-      clickHandler = event => {
-        const anchor = event.target.closest('a[href]');
-        if (!anchor) return;
-        event.preventDefault();
-        let href = anchor.getAttribute('href') || '';
-        if (href.startsWith('//')) href = `https:${href}`;
-        if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) window.open(href, '_blank', 'noopener,noreferrer');
-      };
-      clickDocument = doc;
-      doc.addEventListener('click', clickHandler);
-      contextMenuDocument?.removeEventListener('contextmenu', contextMenuHandler);
-      if (onContextMenu) {
-        contextMenuHandler = event => {
-          event.preventDefault();
-          const rect = iframe.getBoundingClientRect();
-          onContextMenu({
-            x: rect.left + event.clientX,
-            y: rect.top + event.clientY,
-            selectedText: doc.getSelection?.().toString() || '',
-            source: 'iframe',
-          });
-        };
-        contextMenuDocument = doc;
-        doc.addEventListener('contextmenu', contextMenuHandler);
+      rafId = requestAnimationFrame(setHeight);
+
+      // Intercept all link clicks so they always open in a real browser tab.
+      // Without this, relative hrefs (e.g. href="/") resolve to the mailflow
+      // origin via allow-same-origin and open a new mailflow tab instead of
+      // the intended destination.  We read the raw attribute to bypass
+      // browser resolution and only forward absolute http(s)/mailto links.
+      // Tracked and removed like the contextmenu handler below — onLoaded can
+      // re-run on the same document when the effect's callback deps change,
+      // and an untracked listener stacks up, opening N duplicate tabs per click.
+      if (clickDoc && iframeClickHandler) {
+        clickDoc.removeEventListener('click', iframeClickHandler);
       }
-      doc.querySelectorAll('img').forEach(image => {
-        if (image.complete) return;
-        image.addEventListener('load', () => { expandScrollContainers(); requestAnimationFrame(setHeight); }, { once: true });
-        image.addEventListener('error', () => requestAnimationFrame(setHeight), { once: true });
+      iframeClickHandler = (ev) => {
+        const anchor = ev.target.closest('a[href]');
+        if (!anchor) return;
+        ev.preventDefault();
+        let raw = anchor.getAttribute('href') || '';
+        if (raw.startsWith('//')) raw = 'https:' + raw;
+        if (/^https?:\/\//i.test(raw)) {
+          window.open(raw, '_blank', 'noopener,noreferrer');
+        } else if (/^mailto:/i.test(raw)) {
+          window.open(raw, '_blank', 'noopener,noreferrer');
+        }
+      };
+      clickDoc = doc;
+      doc.addEventListener('click', iframeClickHandler);
+
+      if (contextMenuDoc && iframeContextMenuHandler) {
+        contextMenuDoc.removeEventListener('contextmenu', iframeContextMenuHandler);
+      }
+      iframeContextMenuHandler = (ev) => {
+        if (!onContextMenu || hasNativeContextTarget?.(ev, doc)) return;
+        ev.preventDefault();
+        const rect = iframe.getBoundingClientRect();
+        onContextMenu(rect.left + ev.clientX, rect.top + ev.clientY, {
+          source: 'iframe',
+          selectedText: doc.getSelection?.().toString() || '',
+        });
+      };
+      contextMenuDoc = doc;
+      doc.addEventListener('contextmenu', iframeContextMenuHandler);
+
+      // Re-measure after each lazy-loaded image settles; also re-expand any
+      // scroll containers whose content has grown due to the newly loaded image.
+      doc.querySelectorAll('img').forEach(img => {
+        if (!img.complete) {
+          img.addEventListener('load', () => { expandScrollContainers(); requestAnimationFrame(setHeight); }, { once: true });
+          img.addEventListener('error', () => requestAnimationFrame(setHeight), { once: true });
+        }
       });
+
+      // Watch for content that reflows after load (web fonts, dynamic content).
+      // Shrinking is allowed here: content height cannot depend on frame height,
+      // because html/body are pinned to height:auto above and media queries key off
+      // width. createHeightController still carries a tolerance band plus an
+      // oscillation freeze in case some email defeats that reasoning.
       const root = doc.body || doc.documentElement;
       if (window.ResizeObserver && root) {
-        resizeObserverRef.current?.disconnect();
-        resizeObserverRef.current = new ResizeObserver(() => requestAnimationFrame(setHeight));
-        resizeObserverRef.current.observe(root);
+        // Disconnect first: onLoaded can legitimately run more than once per effect
+        // (stale document, then the real one), and overwriting the ref without this
+        // leaves the previous observer running against the old document forever.
+        if (roRef.current) roRef.current.disconnect();
+        roRef.current = new ResizeObserver(() => requestAnimationFrame(setHeight));
+        roRef.current.observe(root);
       }
     };
 
+    // 'load' is kept, but it CANNOT be the only trigger. It waits for every subresource,
+    // so a single image that never settles (a dead tracking pixel, a blocked host, a host
+    // that accepts the connection and never answers) leaves the document parked at
+    // readyState 'interactive' forever. load never fires, none of the setup above ever
+    // runs, and the frame sits at its initial 300px with the email clipped inside it. One
+    // unreachable image was enough to break rendering of the whole message.
+    //
+    // Not { once: true } either: a frame fires 'load' for the about:blank it starts life
+    // with, and a once-listener is spent on that even though onLoaded correctly declines
+    // to initialise against a document that is not ours.
     iframe.addEventListener('load', onLoaded);
+
+    // Everything onLoaded does needs only a parsed DOM, never a finished one, so drive it
+    // from the parsed state and let the image handlers and the ResizeObserver grow the
+    // frame as pictures arrive. Polling by frame rather than listening for
+    // DOMContentLoaded because the document to listen on does not exist yet at this point:
+    // the frame is still showing about:blank and swaps in the real one later. onLoaded is
+    // idempotent per document, so the repeated calls are free and stop as soon as one
+    // succeeds.
     let pollFrames = 0;
+    const MAX_POLL_FRAMES = 300; // ~5s at 60fps; srcDoc parses far sooner
     const pollUntilParsed = () => {
-      pollFrame = null;
+      pollId = null;
       onLoaded();
-      if (initialisedDocument || pollFrames++ >= 300) return;
-      pollFrame = requestAnimationFrame(pollUntilParsed);
+      if (initialisedDoc || pollFrames++ >= MAX_POLL_FRAMES) return;
+      pollId = requestAnimationFrame(pollUntilParsed);
     };
     pollUntilParsed();
+
     return () => {
-      cancelAnimationFrame(animationFrame);
-      if (pollFrame) cancelAnimationFrame(pollFrame);
-      resizeObserverRef.current?.disconnect();
-      resizeObserverRef.current = null;
-      if (contextMenuDocument && contextMenuHandler) {
-        contextMenuDocument.removeEventListener('contextmenu', contextMenuHandler);
+      cancelAnimationFrame(rafId);
+      if (pollId) cancelAnimationFrame(pollId);
+      if (roRef.current) { roRef.current.disconnect(); roRef.current = null; }
+      if (contextMenuDoc && iframeContextMenuHandler) {
+        contextMenuDoc.removeEventListener('contextmenu', iframeContextMenuHandler);
       }
-      clickDocument?.removeEventListener('click', clickHandler);
+      if (clickDoc && iframeClickHandler) {
+        clickDoc.removeEventListener('click', iframeClickHandler);
+      }
       iframe.removeEventListener('load', onLoaded);
       emailScaleRef.current = 1;
     };
-  }, [body?.html, messageId, onContextMenu]);
-
-  useLayoutEffect(() => {
-    if (!prepared) return;
-    injectEmailStyles(prepared.prefix, prepared.styleBlocks);
-    return () => removeEmailStyles(prepared.prefix);
-  }, [prepared]);
-
-  useEffect(() => {
-    if (!USE_DIV_RENDER || !prepared) return;
-    let animationFrame = null;
-    const expandedElements = new Set();
-    const expandScrollContainers = root => {
-      if (!root) return;
-      Array.from(root.querySelectorAll('*')).reverse().forEach(element => {
-        const overflowY = window.getComputedStyle(element).overflowY;
-        const isScrollable = (overflowY === 'auto' || overflowY === 'scroll') && element.scrollHeight > element.clientHeight + 2;
-        const grew = expandedElements.has(element) && element.scrollHeight > element.clientHeight + 2;
-        if (!isScrollable && !grew) return;
-        expandedElements.add(element);
-        element.style.setProperty('overflow-y', 'hidden', 'important');
-        element.style.setProperty('max-height', 'none', 'important');
-        element.style.setProperty('height', `${element.scrollHeight}px`, 'important');
-      });
-    };
-    const applyScale = () => {
-      const inner = innerRef.current;
-      const outer = outerRef.current;
-      const scaler = scaleRef.current;
-      if (!inner || !outer || !scaler) return;
-      scaler.style.transform = '';
-      scaler.style.transformOrigin = '';
-      scaler.style.width = '';
-      outer.style.height = '';
-      outer.style.overflowX = '';
-      outer.style.overflowY = '';
-      expandScrollContainers(inner);
-      const containerWidth = outer.clientWidth;
-      const contentWidth = inner.scrollWidth;
-      if (containerWidth > 0 && contentWidth > containerWidth + 2) {
-        const scale = containerWidth / contentWidth;
-        scaler.style.width = `${contentWidth}px`;
-        scaler.style.transform = `scale(${scale})`;
-        scaler.style.transformOrigin = 'top left';
-        outer.style.height = `${Math.round(inner.scrollHeight * scale)}px`;
-        outer.style.overflowX = 'hidden';
-        outer.style.overflowY = 'hidden';
-      }
-    };
-    const scheduleScale = () => {
-      if (animationFrame) cancelAnimationFrame(animationFrame);
-      animationFrame = requestAnimationFrame(() => { animationFrame = null; applyScale(); });
-    };
-    const imageListeners = [];
-    innerRef.current?.querySelectorAll('img').forEach(image => {
-      if (image.complete) return;
-      const handler = () => scheduleScale();
-      image.addEventListener('load', handler, { once: true });
-      imageListeners.push({ image, handler });
-    });
-    let observer;
-    if (window.ResizeObserver && innerRef.current) {
-      observer = new ResizeObserver(scheduleScale);
-      observer.observe(innerRef.current);
-    }
-    scheduleScale();
-    return () => {
-      if (animationFrame) cancelAnimationFrame(animationFrame);
-      observer?.disconnect();
-      imageListeners.forEach(({ image, handler }) => image.removeEventListener('load', handler));
-    };
-  }, [prepared]);
-
-  const retry = () => {
-    if (messageId) evictBody(messageId);
-    setRetryKey(key => key + 1);
-  };
-
-  const loadImages = () => {
-    imagesRequested.add(messageId);
-    retry();
-  };
-
-  const allowRemoteImages = async (type, value) => {
-    if (!value) return;
-    setSavingAllow(true);
-    try {
-      await addToImageWhitelist({ type, value });
-      evictBodies(cached => cached?.hasBlockedRemoteImages);
-      setRetryKey(key => key + 1);
-    } catch {
-      addNotification({ title: t('message.whitelistFail.title'), body: t('message.whitelistFail.body') });
-    } finally {
-      setSavingAllow(false);
-    }
-  };
-
-  const downloadAttachment = async attachment => {
-    setDownloadingPart(attachment.part);
-    try {
-      await downloadAttachmentFile({
-        path: `/api/mail/messages/${messageId}/attachments/${encodeURIComponent(attachment.part)}`,
-        filename: attachment.filename,
-        mimeType: attachment.type,
-      });
-    } catch (error) {
-      console.error('Download error:', error);
-      addNotification({
-        type: 'error',
-        title: t('message.downloadFailed.title'),
-        body: t('message.downloadFailed.body'),
-      });
-    } finally {
-      setDownloadingPart(null);
-    }
-  };
-
-  const downloadAllAttachments = async () => {
-    setDownloadingAll(true);
-    try {
-      await downloadAttachmentFile({
-        path: `/api/mail/messages/${messageId}/attachments.zip`,
-        filename: `${message?.subject || 'attachments'}-attachments.zip`,
-        mimeType: 'application/zip',
-      });
-    } catch (error) {
-      console.error('Download all attachments error:', error);
-      addNotification({
-        type: 'error',
-        title: t('message.downloadFailed.title'),
-        body: t('message.downloadFailed.body'),
-      });
-    } finally {
-      setDownloadingAll(false);
-    }
-  };
-
-  const handleEmailClick = event => {
-    const anchor = event.target.closest('a[href]');
-    if (!anchor) return;
-    event.preventDefault();
-    let href = anchor.getAttribute('href') || '';
-    if (href.startsWith('//')) href = `https:${href}`;
-    if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) window.open(href, '_blank', 'noopener,noreferrer');
-  };
-
-  const handleBodyContextMenu = event => {
-    if (!onContextMenu) return;
-    event.preventDefault();
-    event.stopPropagation();
-    onContextMenu({
-      x: event.clientX,
-      y: event.clientY,
-      selectedText: window.getSelection?.().toString() || '',
-      source: 'body',
-    });
-  };
-
-  const attachments = body?.attachments || [];
-  const senderEmail = message?.from_email?.toLowerCase() || '';
-  const senderDomain = senderEmail.includes('@') ? senderEmail.split('@')[1] : '';
-  const horizontalPadding = inset && !isMobile ? '0 28px 24px' : '0 0 16px';
+  }, [body?.html, messageId, hasNativeContextTarget, onContextMenu, emailScaleRef, iframeRef]);
 
   return (
-    <>
-      {attachments.length > 0 && (
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <div style={{ fontSize: 12, color: 'var(--text-tertiary)', fontWeight: 500 }}>{t('message.attachment', { count: attachments.length })}</div>
-            {attachments.length > 1 && <button type="button" onClick={downloadAllAttachments} disabled={downloadingAll} style={{ padding: 0, border: 'none', background: 'transparent', fontSize: 12, color: 'var(--accent)', cursor: downloadingAll ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}><span aria-hidden="true">↓</span>{downloadingAll ? t('message.downloading') : t('message.downloadAll')}</button>}
-          </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-            {attachments.map((attachment, index) => {
-              const risk = classifyAttachmentRisk(attachment.filename, attachment.type);
-              const risky = risk.level === 'block' || risk.level === 'warn';
-              const riskColor = risk.level === 'block' ? 'var(--red)' : risk.level === 'warn' ? 'var(--amber)' : 'var(--text-tertiary)';
-              const armed = riskArmed === attachment.part;
-              return (
-              <button key={`${attachment.part}-${index}`} onClick={() => {
-                if (risky && !armed) { setRiskArmed(attachment.part); return; }
-                setRiskArmed(null);
-                downloadAttachment(attachment);
-              }} disabled={downloadingPart === attachment.part} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-secondary)', border: `1px solid ${risky ? riskColor : 'var(--border)'}`, cursor: downloadingPart === attachment.part ? 'wait' : 'pointer', color: 'var(--text-primary)', maxWidth: 240 }}>
-                <span style={{ display: 'flex', flexShrink: 0, color: 'var(--text-secondary)' }}><FileIcon type={attachment.type}/></span>
-                <span style={{ minWidth: 0, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 12, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{attachment.filename}</span><span style={{ display: 'block', fontSize: 10, color: 'var(--text-tertiary)', marginTop: 1 }}>{downloadingPart === attachment.part ? t('message.downloading') : formatBytes(attachment.size)}</span>
-                  {risk.level !== 'ok' && <span style={{ display: 'block', fontSize: 11, color: riskColor, fontWeight: risk.level === 'block' ? 600 : 400, whiteSpace: 'normal' }}>
-                    {risk.doubleExt ? t('message.attachmentRisk.doubleExt', { ext: risk.doubleExt }) : t(`message.attachmentRisk.${risk.level}`, { ext: risk.ext })}
-                    {armed && ` — ${t('message.attachmentRisk.confirm')}`}
-                  </span>}
-                </span>
-                <span aria-hidden="true" style={{ color: 'var(--text-tertiary)' }}>↓</span>
-              </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {beforeContent}
-
-      {loadingBody && <div style={{ padding: '20px 0', display: 'flex', flexDirection: 'column', gap: 8 }}>{['62%', '88%', '75%', '50%', '82%', '68%', '90%', '58%'].map((width, index) => <div key={width} className="skeleton-line" style={{ height: 13, width, borderRadius: 4, marginBottom: index === 3 ? 8 : 0 }}/>)}</div>}
-
-      {!loadingBody && bodyError && <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 12, padding: '20px 0' }}><div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 8, padding: '16px 20px', maxWidth: 480 }}><div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>{t('message.loadingError')}</div><div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.5 }}>{bodyError}</div></div><button onClick={retry} style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 6, padding: '6px 14px', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: 13 }}>{t('common.retry')}</button></div>}
-
-      {!loadingBody && !bodyError && body && !body.html && !body.text && <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 12, padding: '20px 0' }}><div style={{ fontSize: 14, color: 'var(--text-tertiary)' }}>{t('message.noContent')}</div><button onClick={retry} style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 6, padding: '6px 14px', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: 13 }}>{t('common.retry')}</button></div>}
-
-      {!loadingBody && !bodyError && body?.html && (
-        <div style={{ padding: horizontalPadding }}>
-          {banner}
-          {body.hasBlockedRemoteImages && <div style={{ marginBottom: 10, padding: '9px 14px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderLeft: '3px solid var(--accent)', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12, color: 'var(--text-secondary)' }}><span>{t('message.remoteImagesBlocked')}</span><div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>{[
-            { label: t('message.loadImages'), handler: loadImages },
-            senderEmail && { label: t('message.allowSender', { email: senderEmail }), handler: () => allowRemoteImages('address', senderEmail) },
-            senderDomain && { label: t('message.allowDomain', { domain: senderDomain }), handler: () => allowRemoteImages('domain', senderDomain) },
-          ].filter(Boolean).map(action => <button key={action.label} onClick={action.handler} disabled={savingAllow} style={{ background: 'none', border: '1px solid var(--border)', borderRadius: 5, padding: '3px 9px', cursor: savingAllow ? 'default' : 'pointer', color: 'var(--accent)', fontSize: 11, fontWeight: 500, opacity: savingAllow ? 0.5 : 1 }}>{action.label}</button>)}</div></div>}
-          <div style={{ position: 'relative', padding: '14px 16px 12px', background: 'white', borderRadius: isMobile || !framed ? 0 : 8, border: isMobile || !framed ? 'none' : '1px solid var(--border-subtle)', overflow: 'hidden', contain: 'layout' }}>
-            {USE_DIV_RENDER ? <div ref={outerRef} style={{ position: 'relative', width: '100%' }} onClick={handleEmailClick} onContextMenu={handleBodyContextMenu}><div ref={scaleRef}><div ref={innerRef} data-mailflow-email={prepared?.prefix} className={prepared?.prefix ?? ''} dangerouslySetInnerHTML={prepared ? { __html: prepared.html } : undefined}/></div></div> : <iframe ref={iframeRef} srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="only light"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; style-src 'unsafe-inline';"><base target="_blank"></head><body><div id="mf-scale-wrapper">${body.html.replace(/<a(\s)/gi, '<a rel="noopener noreferrer"$1')}</div><style>html,body{height:auto!important;min-height:0!important;overflow:hidden!important}body{margin:0!important;padding:0!important;background-color:#fff!important;color-scheme:light;font-family:-apple-system,Arial,sans-serif;font-size:14px;line-height:1.6;color:#1a1a1a;word-wrap:break-word;overflow-wrap:break-word}img{max-width:100%!important;height:auto!important}body>table,body>center>table,body>div>table,body>center>div>table,#mf-scale-wrapper>table,#mf-scale-wrapper>center>table,#mf-scale-wrapper>div>table,#mf-scale-wrapper>center>div>table{width:100%!important}td,th{min-width:0!important}td{word-break:break-word}th{overflow-wrap:normal;word-break:normal}a{color:#6366f1}pre,code{overflow-x:auto;white-space:pre-wrap;word-break:break-all}blockquote{border-left:3px solid #ddd;margin:0;padding-left:12px;color:#555}</style></body></html>`} scrolling="no" style={{ width: '1px', minWidth: '100%', border: 'none', display: 'block', height: '300px' }} sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" title={t('message.emailFrameTitle')}/>}
-          </div>
-        </div>
-      )}
-
-      {!loadingBody && !bodyError && body?.text && !body.html && <div style={{ padding: horizontalPadding }}>{banner}<div onContextMenu={handleBodyContextMenu} style={{ margin: 0, padding: '14px 16px 12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 14, color: '#1a1a1a', lineHeight: 1.7, fontFamily: 'DM Sans, sans-serif', background: 'white', borderRadius: isMobile || !framed ? 0 : 8, border: isMobile || !framed ? 'none' : '1px solid var(--border-subtle)', overflow: 'hidden' }} dangerouslySetInnerHTML={{ __html: linkifyText(body.text) }}/></div>}
-    </>
+    <iframe
+      ref={iframeRef}
+      srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="color-scheme" content="only light">
+      <meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; style-src 'unsafe-inline';">
+      <base target="_blank">
+    </head><body><div id="mf-scale-wrapper">${
+      body.html.replace(/<a(\s)/gi, '<a rel="noopener noreferrer"$1')
+    }</div><style>
+        /* Injected AFTER email HTML so our rules win the source-order tiebreak
+           for same-specificity !important declarations inside the email's own
+           <style> blocks (which land in <body> after the email HTML). */
+        html, body { height: auto !important; min-height: 0 !important; overflow: hidden !important; }
+        body { margin: 0 !important; padding: 0 !important;
+               background-color: #ffffff !important; color-scheme: light;
+               font-family: -apple-system, Arial, sans-serif;
+               font-size: 14px; line-height: 1.6; color: #1a1a1a;
+               word-wrap: break-word; overflow-wrap: break-word; }
+        img { max-width: 100% !important; height: auto !important; }
+        /* Force top-level wrapper tables to fill the viewport. Selectors cover
+           both the legacy body > table pattern and the mf-scale-wrapper layer. */
+        body > table, body > center > table,
+        body > div > table, body > center > div > table,
+        #mf-scale-wrapper > table, #mf-scale-wrapper > center > table,
+        #mf-scale-wrapper > div > table, #mf-scale-wrapper > center > div > table {
+          width: 100% !important;
+        }
+        /* Reset min-width on cells only — not on table elements, because fluid
+           grid systems (e.g. Oracle Eloqua "tolkien") set min-width on inline-table
+           column elements as a layout fallback when their calc() width resolves to 0. */
+        td, th { min-width: 0 !important; }
+        td { word-break: break-word; }
+        th { overflow-wrap: normal; word-break: normal; }
+        a { color: #6366f1; }
+        pre, code { overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+        blockquote { border-left: 3px solid #ddd; margin: 0; padding-left: 12px; color: #555; }
+      </style></body></html>`}
+      scrolling="no"
+      style={{ width: '1px', minWidth: '100%', border: 'none', display: 'block', height: '300px' }}
+      sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+      title={t('message.emailFrameTitle')}
+    />
   );
-});
+}
 
 export default MessageBodyView;

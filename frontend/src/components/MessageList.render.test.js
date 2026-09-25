@@ -9,7 +9,7 @@
 // hook transforms .jsx with sucrase, and react-i18next is stubbed because the component only
 // needs t() to return something.
 
-import { test, describe, after } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
@@ -20,7 +20,7 @@ registerHooks({
   load(url, context, nextLoad) {
     if (url.endsWith('react-i18next/dist/es/index.js') || url.endsWith('/react-i18next')) {
       return { format: 'module', shortCircuit: true, source: [
-        'export const useTranslation = () => ({ t: (k, d) => (typeof d === "string" ? d : k), i18n: { language: "en", changeLanguage: () => {} } });',
+        'export const useTranslation = () => ({ t: (k, d) => (typeof d === "string" ? d : d?.defaultValue ?? k), i18n: { language: "en", changeLanguage: () => {} } });',
         'export const initReactI18next = { type: "3rdParty", init: () => {} };',
         'export const Trans = ({ children }) => children ?? null;',
         'export const I18nextProvider = ({ children }) => children ?? null;',
@@ -60,6 +60,7 @@ Object.assign(globalThis, {
 dom.window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
 dom.window.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
 globalThis.matchMedia = dom.window.matchMedia;
+dom.window.Element.prototype.scrollIntoView = () => {};
 globalThis.__VITE_ENV__ = { MODE: 'test', DEV: false, PROD: true };
 // MessageList loads its own messages on mount and overwrites anything seeded in the store,
 // so the fetch stub has to serve the row rather than the store. Only the messages endpoint
@@ -76,6 +77,7 @@ globalThis.fetch = async (url) => {
 const React = await import('react');
 const { createRoot } = await import('react-dom/client');
 const { useStore } = await import('../store/index.js');
+const { shortcutBus } = await import('../utils/shortcutBus.js');
 const MessageList = (await import('./MessageList.jsx')).default;
 
 const ACCOUNT = { id: 'acct-1', email_address: 'a@example.com', name: 'A', color: '#6366f1', include_in_unified_inbox: true };
@@ -93,7 +95,7 @@ let container, root;
 
 // Mount fresh for each scenario. MessageList refetches on mount and overwrites anything seeded
 // in the store, so the fixture is served through fetch rather than set as state.
-async function mount({ rows, conversationMode = 'off' }) {
+async function mount({ rows, threadedView }) {
   SERVED = rows;
   if (root) await React.act(async () => root.unmount());
   container = dom.window.document.getElementById('root');
@@ -101,7 +103,7 @@ async function mount({ rows, conversationMode = 'off' }) {
     accounts: [ACCOUNT], accountsReady: true,
     selectedAccountId: 'acct-1', selectedFolder: 'INBOX',
     messages: rows, messagesTotal: rows.length, hasMoreMessages: false, loadingMessages: false,
-    searchQuery: '', conversationMode,
+    searchQuery: '', threadedView, conversationMode: threadedView ? 'list' : 'off',
     folders: { 'acct-1': [{ path: 'INBOX', name: 'INBOX' }, { path: 'Archive', name: 'Archive' }] },
   });
   await React.act(async () => {
@@ -109,8 +111,6 @@ async function mount({ rows, conversationMode = 'off' }) {
     root.render(React.createElement(MessageList));
   });
 }
-
-after(async () => { if (root) await React.act(async () => root.unmount()); });
 
 const draggableIn = (msgid) => {
   const row = container.querySelector(`[data-msgid="${msgid}"]`);
@@ -120,7 +120,7 @@ const draggableIn = (msgid) => {
 
 describe('MessageList — drag source (#130)', () => {
   test('an ordinary message row is draggable', async () => {
-    await mount({ rows: [MESSAGE] });
+    await mount({ rows: [MESSAGE], threadedView: false });
     const el = draggableIn('msg-1');
     assert.ok(el, 'expected a draggable element inside the message row');
     assert.equal(el.getAttribute('draggable'), 'true');
@@ -131,16 +131,40 @@ describe('MessageList — drag source (#130)', () => {
     // attribute and no onDragStart, so with conversations on nothing could be dragged and the
     // browser fell back to selecting the row's text. Asserting only on the non-threaded row
     // is what let this pass while the feature was broken for anyone using threading.
-    await mount({ rows: [THREAD], conversationMode: 'list' });
+    await mount({ rows: [THREAD], threadedView: true });
     const el = draggableIn('msg-2');
     assert.ok(el, 'expected a conversation row to be draggable');
     assert.equal(el.getAttribute('draggable'), 'true');
   });
+});
 
-  test('a conversation row remains draggable in the custom reading-pane mode', async () => {
-    await mount({ rows: [THREAD], conversationMode: 'pane' });
-    const el = draggableIn('msg-2');
-    assert.equal(el.getAttribute('draggable'), 'true');
-    assert.equal(container.querySelector('button[aria-expanded]'), null, 'pane mode does not expand the row inline');
+describe('MessageList — selected-row shortcuts', () => {
+  test('mark unread updates a selected GTD rail copy and its section row', async () => {
+    await mount({ rows: [MESSAGE], threadedView: false });
+    const rail = { ...MESSAGE, id: 'rail-copy', message_id: '<rail@example.com>', is_read: true };
+    await React.act(async () => {
+      useStore.setState({ gtdSections: { reference: { threads: [rail] } } });
+      useStore.getState().setSelectedMessage(rail.id);
+    });
+    await React.act(async () => { shortcutBus.emit('markUnread'); });
+    assert.equal(useStore.getState().gtdSections.reference.threads[0].is_read, false);
+    await React.act(async () => { useStore.setState({ gtdSections: null, selectedMessageId: null }); });
+  });
+
+  test('forward and Reply All act on the selected row; no selection does nothing', async () => {
+    await mount({ rows: [MESSAGE], threadedView: false });
+    const drafts = [];
+    useStore.setState({ openCompose: draft => drafts.push(draft) });
+    await React.act(async () => { useStore.getState().setSelectedMessage('msg-1'); });
+    await React.act(async () => { shortcutBus.emit('forward'); await new Promise(r => setTimeout(r, 10)); });
+    assert.equal(drafts.length, 1);
+    assert.equal(drafts[0].isForward, true);
+    assert.equal(useStore.getState().selectedMessageId, 'msg-1');
+    await React.act(async () => { shortcutBus.emit('replyAllFromSelection'); await new Promise(r => setTimeout(r, 10)); });
+    assert.equal(drafts.length, 2);
+    assert.equal(drafts[1].isReplyAll, true);
+    useStore.getState().setSelectedMessage(null);
+    await React.act(async () => { shortcutBus.emit('forward'); shortcutBus.emit('replyAllFromSelection'); await new Promise(r => setTimeout(r, 10)); });
+    assert.equal(drafts.length, 2);
   });
 });

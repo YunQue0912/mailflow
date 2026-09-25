@@ -80,8 +80,8 @@ describe('GET /api/mail/resolve-message account scope', () => {
 
     expect(response.status).toBe(200);
     const [sql] = query.mock.calls[1];
-    expect(sql).toContain("DISTINCT ON (COALESCE(NULLIF(m.message_id, ''), m.id::text))");
-    expect(sql).toContain("ORDER BY COALESCE(NULLIF(m.message_id, ''), m.id::text)");
+    expect(sql).toContain("DISTINCT ON (m.account_id, COALESCE(NULLIF(m.message_id, ''), m.id::text))");
+    expect(sql).toMatch(/ORDER BY m\.account_id,\s+COALESCE\(NULLIF\(m\.message_id, ''\), m\.id::text\)/);
   });
 
   it('includes spam classification in thread cards as well as message-list rows', async () => {

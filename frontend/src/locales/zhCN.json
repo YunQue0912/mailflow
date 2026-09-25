@@ -144,8 +144,11 @@
     },
     "toolbar": {
       "removeTable": "删除表格",
+      "typography": "排版",
       "textColor": "文字颜色",
       "removeColor": "移除颜色",
+      "customColor": "自定义颜色…",
+      "noColor": "无颜色",
       "insertImage": "插入图片",
       "minimize": "最小化",
       "maximize": "最大化",
@@ -193,6 +196,7 @@
     "noSubject": "（无主题）",
     "to": "收件人：",
     "via": "经由",
+    "forwardedFrom": "原始发件人（据 {{service}}）：",
     "attachment_one": "{{count}} 个附件",
     "attachment_other": "{{count}} 个附件",
     "loadingError": "无法加载邮件正文",
@@ -207,13 +211,10 @@
       "warn": "有风险的文件类型（.{{ext}}）— 可能包含宏或伪造的登录页面",
       "notice": "压缩包 — 无法检查其内容",
       "doubleExt": "隐藏扩展名：.{{ext}} — 真实类型为最后一个",
+      "armed": "{{label}} — 再次点击仍然下载",
       "confirm": "再次点击仍然下载"
     },
     "downloadAll": "下载全部",
-    "downloadFailed": {
-      "title": "下载失败",
-      "body": "无法下载此附件，请重试。"
-    },
     "reply": "回复",
     "replyAll": "回复全部",
     "replyOptions": "回复选项",
@@ -240,17 +241,20 @@
       "failTitle": "归档失败",
       "failBody": "无法归档此邮件。",
       "noFolderTitle": "未设置归档文件夹",
-      "noFolderBody": "此账户未配置归档文件夹。请前往「设置 → 账户 → 文件夹映射」中设置。"
+      "noFolderBody": "此账户未配置归档文件夹。请前往「设置 → 账户 → 文件夹映射」中设置。",
+      "conversationTitle": "会话已归档"
     },
     "moved": {
       "title": "邮件已移动",
       "failTitle": "移动失败",
-      "failBody": "无法移动此邮件。"
+      "failBody": "无法移动此邮件。",
+      "conversationTitle": "会话已移动"
     },
     "snoozed": {
       "title": "邮件已稍后提醒",
       "failTitle": "稍后提醒失败",
-      "failBody": "无法对此邮件设置稍后提醒。"
+      "failBody": "无法对此邮件设置稍后提醒。",
+      "conversationTitle": "会话已稍后提醒"
     },
     "whitelistFail": {
       "title": "无法保存偏好设置",
@@ -269,12 +273,11 @@
       "button": "AI 分类",
       "done": "已分类为 {{category}}",
       "error": "AI 分类失败。"
+    },
+    "downloadFailed": {
+      "title": "下载失败",
+      "body": "无法下载此附件，请重试。"
     }
-  },
-  "conversation": {
-    "messages_one": "{{count}} 封邮件",
-    "messages_other": "共 {{count}} 封邮件",
-    "replyLatest": "回复最新邮件"
   },
   "messageList": {
     "search": "搜索…",
@@ -307,7 +310,8 @@
       "title": "邮件已删除",
       "body": "已移至废件箱。",
       "failTitle": "删除失败",
-      "failBody": "无法删除此邮件。"
+      "failBody": "无法删除此邮件。",
+      "conversationTitle": "会话已删除"
     },
     "bulkDeleted": {
       "title_one": "已删除 {{count}} 封邮件",
@@ -480,6 +484,11 @@
     }
   },
   "commandPalette": {
+    "labelPicker": {
+      "copyTo": "复制到{{folder}}",
+      "error": "无法为邮件添加标签",
+      "placeholder": "复制或标记所选邮件…"
+    },
     "placeholder": "搜索操作…",
     "noResults": "未找到任何操作",
     "hint": {
@@ -501,6 +510,11 @@
     "customizeHint": "可在「设置 → 快捷键」中自定义快捷键",
     "closeHint": "按 ? 或 Esc 关闭",
     "then": "然后",
+    "browserMailboxFallback": "在浏览器中：按 g 后按 1–9 打开可见邮箱；按 g 后按 l 打开文件夹选择器。",
+    "visibleMailbox": {
+      "label": "可见邮箱 {{number}}",
+      "description": "打开可见邮箱 {{number}}"
+    },
     "groups": {
       "composeSearch": "撰写与搜索",
       "navigation": "导航",
@@ -508,6 +522,30 @@
       "gtd": "GTD"
     },
     "actions": {
+      "toggleLeftSidebar": {
+        "label": "切换左侧边栏",
+        "description": "显示或隐藏左侧边栏"
+      },
+      "openLabelPicker": {
+        "label": "打开文件夹选择器",
+        "description": "将选中的邮件复制到文件夹"
+      },
+      "replyAllFromSelection": {
+        "label": "回复选中邮件的所有人",
+        "description": "回复选中邮件的所有收件人"
+      },
+      "markUnread": {
+        "label": "标记为未读",
+        "description": "将选中的邮件标记为未读"
+      },
+      "unsubscribe": {
+        "label": "取消订阅",
+        "description": "取消订阅选中邮件的邮件列表"
+      },
+      "loadRemoteImages": {
+        "label": "加载远程图片",
+        "description": "加载选中邮件中的图片"
+      },
       "compose": {
         "label": "撰写",
         "description": "打开新的撰写窗口"
@@ -909,15 +947,36 @@
       "threadingMode": "会话归并",
       "threadingOff": "关闭",
       "threadingOffDesc": "每封邮件单独显示",
-      "threadingList": "会话列表",
-      "threadingListDesc": "将回复归并，并在邮件列表中展开",
-      "threadingPane": "会话阅读窗格",
-      "threadingPaneDesc": "将回复归并，并在阅读窗格中显示完整会话",
+      "threadingPane": "阅读窗格",
+      "threadingPaneDesc": "整个会话一起打开",
       "composeFormat": "撰写格式",
       "composeRichText": "富文本",
       "composeRichTextDesc": "以 HTML 形式发送 — 支持格式化与带样式的签名",
       "composePlainText": "纯文本",
       "composePlainTextDesc": "无 HTML 格式 — 兼容性最佳",
+      "defaultReplyAction": "默认回复方式",
+      "defaultReply": "回复",
+      "defaultReplyDesc": "回复按钮仅发送给发件人",
+      "defaultReplyAll": "回复全部",
+      "defaultReplyAllDesc": "回复按钮将发送给所有收件人",
+      "defaultSender": "默认发件人",
+      "defaultSenderDesc": "在非特定账户下撰写新邮件时使用的发件地址，例如在统一收件箱中。回复始终使用收到该邮件的账户。",
+      "defaultSenderLastUsed": "上次使用的账户",
+      "markReadBehavior": "标为已读",
+      "markReadImmediate": "立即",
+      "markReadImmediateDesc": "打开邮件后立即标为已读。",
+      "markReadDelay": "延迟后",
+      "markReadDelayDesc": "查看邮件一段时间后标为已读。",
+      "markReadManual": "手动",
+      "markReadManualDesc": "从不自动标为已读，请使用标为已读按钮。",
+      "defaultMailApp": "默认邮件应用",
+      "defaultMailAppDesc": "让 MailFlow 在此浏览器中打开 mailto: 链接。浏览器会要求你确认。支持 Firefox 和 Chrome/Edge；iOS 不支持。",
+      "defaultMailAppBtn": "注册 MailFlow",
+      "defaultMailAppOk": "在浏览器中确认提示以完成。",
+      "defaultMailAppError": "浏览器已阻止该请求。",
+      "markReadDelayLabel": "延迟",
+      "markReadDelaySeconds": "{{count}} 秒",
+      "markReadDelaySeconds_other": "{{count}} 秒",
       "hoverQuickActionsMode": "悬停快速操作",
       "hoverQuickActionsOff": "关闭",
       "hoverQuickActionsOffDesc": "隐藏快速操作，直到使用右键菜单或快捷键。",
@@ -938,29 +997,8 @@
       "gravatarOffDesc": "私密 — 从不联系第三方。",
       "gravatarOn": "开启",
       "gravatarOnDesc": "从 Gravatar 获取发件人照片 — 会与第三方共享经哈希处理的发件人地址。",
-      "defaultReplyAll": "回复全部",
-      "defaultReplyDesc": "回复按钮仅发送给发件人",
-      "defaultReplyAction": "默认回复方式",
-      "defaultReply": "回复",
-      "defaultReplyAllDesc": "回复按钮将发送给所有收件人",
-      "defaultSender": "默认发件人",
-      "defaultSenderDesc": "在非特定账户下撰写新邮件时使用的发件地址，例如在统一收件箱中。回复始终使用收到该邮件的账户。",
-      "defaultSenderLastUsed": "上次使用的账户",
-      "markReadBehavior": "标为已读",
-      "markReadImmediate": "立即",
-      "markReadImmediateDesc": "打开邮件后立即标为已读。",
-      "markReadDelay": "延迟后",
-      "markReadDelayDesc": "查看邮件一段时间后标为已读。",
-      "markReadManual": "手动",
-      "markReadManualDesc": "从不自动标为已读，请使用标为已读按钮。",
-      "defaultMailApp": "默认邮件应用",
-      "defaultMailAppDesc": "让 MailFlow 在此浏览器中打开 mailto: 链接。浏览器会要求你确认。支持 Firefox 和 Chrome/Edge；iOS 不支持。",
-      "defaultMailAppBtn": "注册 MailFlow",
-      "defaultMailAppOk": "在浏览器中确认提示以完成。",
-      "defaultMailAppError": "浏览器已阻止该请求。",
-      "markReadDelayLabel": "延迟",
-      "markReadDelaySeconds": "{{count}} 秒",
-      "markReadDelaySeconds_other": "{{count}} 秒"
+      "threadingList": "会话列表",
+      "threadingListDesc": "将回复归并，并在邮件列表中展开"
     },
     "notifications": {
       "title": "通知",
@@ -1471,10 +1509,48 @@
       "sourceCode": "源代码",
       "sponsor": "支持开发",
       "updates": {
-        "title": "应用更新", "autoCheck": "自动检查应用更新", "currentVersion": "当前版本", "latestVersion": "最新版本", "published": "发布日期", "size": "下载大小", "notes": "发布说明", "check": "检查更新", "download": "下载更新", "later": "稍后", "skip": "跳过此版本", "cancel": "取消", "install": "重启并安装", "installAndroid": "安装", "retry": "重试", "browser": "在浏览器中下载",
-        "notificationAvailableTitle": "有可用更新", "notificationAvailableBody": "MailFlow {{version}} 可以下载。", "notificationReadyTitle": "更新已就绪", "notificationReadyBody": "MailFlow {{version}} 可以安装。", "notificationErrorTitle": "检查更新失败", "notificationInstallErrorTitle": "安装失败", "notificationInstallErrorBody": "无法安装已验证的更新。",
-        "status": { "idle": "可以检查更新。", "checking": "正在检查更新…", "up-to-date": "当前已是最新版本。", "available": "有新的已签名版本可用。", "downloading": "正在下载并验证更新…", "downloaded": "更新已验证，可以安装。", "installing": "正在重启并安装更新…", "error": "无法准备更新。", "skipped": "已跳过此版本；出现更高版本时会自动恢复提示。", "deferred": "明天会再次提示此更新。" },
-        "errors": { "genericError": "更新服务暂时不可用。", "downloadError": "无法下载更新或更新验证失败。", "verificationError": "下载的安装包未通过安全验证。", "invalidRelease": "最新 Release 不是合法的定制版本。", "packagedOnly": "安装后的原生应用才能检查应用更新。" }
+        "title": "应用更新",
+        "autoCheck": "自动检查应用更新",
+        "currentVersion": "当前版本",
+        "latestVersion": "最新版本",
+        "published": "发布日期",
+        "size": "下载大小",
+        "notes": "发布说明",
+        "check": "检查更新",
+        "download": "下载更新",
+        "later": "稍后",
+        "skip": "跳过此版本",
+        "cancel": "取消",
+        "install": "重启并安装",
+        "installAndroid": "安装",
+        "retry": "重试",
+        "browser": "在浏览器中下载",
+        "notificationAvailableTitle": "有可用更新",
+        "notificationAvailableBody": "MailFlow {{version}} 可以下载。",
+        "notificationReadyTitle": "更新已就绪",
+        "notificationReadyBody": "MailFlow {{version}} 可以安装。",
+        "notificationErrorTitle": "检查更新失败",
+        "notificationInstallErrorTitle": "安装失败",
+        "notificationInstallErrorBody": "无法安装已验证的更新。",
+        "status": {
+          "idle": "可以检查更新。",
+          "checking": "正在检查更新…",
+          "up-to-date": "当前已是最新版本。",
+          "available": "有新的已签名版本可用。",
+          "downloading": "正在下载并验证更新…",
+          "downloaded": "更新已验证，可以安装。",
+          "installing": "正在重启并安装更新…",
+          "error": "无法准备更新。",
+          "skipped": "已跳过此版本；出现更高版本时会自动恢复提示。",
+          "deferred": "明天会再次提示此更新。"
+        },
+        "errors": {
+          "genericError": "更新服务暂时不可用。",
+          "downloadError": "无法下载更新或更新验证失败。",
+          "verificationError": "下载的安装包未通过安全验证。",
+          "invalidRelease": "最新 Release 不是合法的定制版本。",
+          "packagedOnly": "安装后的原生应用才能检查应用更新。"
+        }
       }
     },
     "search": {
@@ -1587,7 +1663,8 @@
     "rulesFiredTitle": "触发的规则",
     "noRulesFired": "没有规则触发",
     "mlTokensTitle": "主要贡献词",
-    "noMlTokens": "无 ML 词汇"
+    "noMlTokens": "无 ML 词汇",
+    "conversationMovedToSpam": "会话已移至垃圾邮件"
   },
   "contacts": {
     "title": "联系人",

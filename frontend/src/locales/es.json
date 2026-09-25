@@ -144,8 +144,11 @@
     },
     "toolbar": {
       "removeTable": "Eliminar tabla",
+      "typography": "Tipografía",
       "textColor": "Color del texto",
       "removeColor": "Quitar color",
+      "customColor": "Color personalizado…",
+      "noColor": "Sin color",
       "insertImage": "Insertar imagen",
       "minimize": "Minimizar",
       "maximize": "Maximizar",
@@ -193,6 +196,7 @@
     "noSubject": "(sin asunto)",
     "to": "Para:",
     "via": "vía",
+    "forwardedFrom": "Remitente original (según {{service}}):",
     "attachment_one": "{{count}} adjunto",
     "attachment_other": "{{count}} adjuntos",
     "loadingError": "No se puede cargar el cuerpo del mensaje",
@@ -207,13 +211,10 @@
       "warn": "Tipo de archivo arriesgado (.{{ext}}): puede contener macros o una página de acceso falsa",
       "notice": "Archivo comprimido: no se puede inspeccionar el contenido",
       "doubleExt": "Extensión oculta: .{{ext}} — el tipo real es el último",
+      "armed": "{{label}} — haga clic de nuevo para descargar de todos modos",
       "confirm": "haga clic de nuevo para descargar de todos modos"
     },
     "downloadAll": "Descargar todo",
-    "downloadFailed": {
-      "title": "Error de descarga",
-      "body": "No se pudo descargar este archivo adjunto. Inténtalo de nuevo."
-    },
     "reply": "Responder",
     "replyAll": "Responder a todos",
     "replyOptions": "Opciones de respuesta",
@@ -240,17 +241,20 @@
       "failTitle": "Error al archivar",
       "failBody": "No se pudo archivar el mensaje.",
       "noFolderTitle": "Sin carpeta de archivo",
-      "noFolderBody": "No hay carpeta de archivo configurada para esta cuenta. Configura una en Ajustes → Cuentas → Asignación de carpetas."
+      "noFolderBody": "No hay carpeta de archivo configurada para esta cuenta. Configura una en Ajustes → Cuentas → Asignación de carpetas.",
+      "conversationTitle": "Conversación archivada"
     },
     "moved": {
       "title": "Mensaje movido",
       "failTitle": "Error al mover",
-      "failBody": "No se pudo mover el mensaje."
+      "failBody": "No se pudo mover el mensaje.",
+      "conversationTitle": "Conversación movida"
     },
     "snoozed": {
       "title": "Mensaje pospuesto",
       "failTitle": "Error al posponer",
-      "failBody": "No se pudo posponer este mensaje."
+      "failBody": "No se pudo posponer este mensaje.",
+      "conversationTitle": "Conversación pospuesta"
     },
     "whitelistFail": {
       "title": "No se pudo guardar la preferencia",
@@ -269,12 +273,11 @@
       "button": "Clasificar con IA",
       "done": "Clasificado como {{category}}",
       "error": "La clasificación con IA falló."
+    },
+    "downloadFailed": {
+      "title": "Error de descarga",
+      "body": "No se pudo descargar este archivo adjunto. Inténtalo de nuevo."
     }
-  },
-  "conversation": {
-    "messages_one": "{{count}} mensaje",
-    "messages_other": "{{count}} mensajes",
-    "replyLatest": "Responder al mensaje más reciente"
   },
   "messageList": {
     "search": "Buscar…",
@@ -307,7 +310,8 @@
       "title": "Mensaje eliminado",
       "body": "Movido a la papelera.",
       "failTitle": "Error al eliminar",
-      "failBody": "No se pudo eliminar el mensaje."
+      "failBody": "No se pudo eliminar el mensaje.",
+      "conversationTitle": "Conversación eliminada"
     },
     "bulkDeleted": {
       "title_one": "{{count}} mensaje eliminado",
@@ -480,6 +484,11 @@
     }
   },
   "commandPalette": {
+    "labelPicker": {
+      "copyTo": "Copiar a {{folder}}",
+      "error": "No se pudo etiquetar el mensaje",
+      "placeholder": "Copiar o etiquetar el mensaje seleccionado…"
+    },
     "placeholder": "Buscar acciones…",
     "noResults": "No se encontraron acciones",
     "hint": {
@@ -501,6 +510,11 @@
     "customizeHint": "Personaliza los atajos en Ajustes → Atajos",
     "closeHint": "Pulsa ? o Esc para cerrar",
     "then": "luego",
+    "browserMailboxFallback": "En el navegador: g y luego 1–9 abre un buzón visible; g y luego l abre el selector de carpetas.",
+    "visibleMailbox": {
+      "label": "Buzón visible {{number}}",
+      "description": "Abrir el buzón visible {{number}}"
+    },
     "groups": {
       "composeSearch": "Redacción y búsqueda",
       "navigation": "Navegación",
@@ -508,6 +522,30 @@
       "gtd": "GTD"
     },
     "actions": {
+      "toggleLeftSidebar": {
+        "label": "Mostrar u ocultar barra lateral izquierda",
+        "description": "Mostrar u ocultar la barra lateral izquierda"
+      },
+      "openLabelPicker": {
+        "label": "Abrir selector de carpetas",
+        "description": "Copiar el mensaje seleccionado a una carpeta"
+      },
+      "replyAllFromSelection": {
+        "label": "Responder a todos desde la selección",
+        "description": "Responder a todos los destinatarios del mensaje seleccionado"
+      },
+      "markUnread": {
+        "label": "Marcar como no leído",
+        "description": "Marcar el mensaje seleccionado como no leído"
+      },
+      "unsubscribe": {
+        "label": "Cancelar suscripción",
+        "description": "Cancelar la suscripción a la lista del mensaje seleccionado"
+      },
+      "loadRemoteImages": {
+        "label": "Cargar imágenes remotas",
+        "description": "Cargar las imágenes del mensaje seleccionado"
+      },
       "compose": {
         "label": "Redactar",
         "description": "Abrir una nueva ventana de redacción"
@@ -909,15 +947,36 @@
       "threadingMode": "Agrupación por conversación",
       "threadingOff": "Desactivado",
       "threadingOffDesc": "Cada mensaje se muestra individualmente",
-      "threadingList": "Lista agrupada",
-      "threadingListDesc": "Agrupa las respuestas y las despliega en la lista de mensajes",
-      "threadingPane": "Panel de conversación",
-      "threadingPaneDesc": "Agrupa las respuestas y muestra la conversación completa en el panel de lectura",
+      "threadingPane": "Panel de lectura",
+      "threadingPaneDesc": "La conversación completa se abre junta",
       "composeFormat": "Formato de redacción",
       "composeRichText": "Texto enriquecido",
       "composeRichTextDesc": "Envía HTML — admite formato y firmas con estilo",
       "composePlainText": "Texto sin formato",
       "composePlainTextDesc": "Sin formato HTML — máxima compatibilidad",
+      "defaultReplyAction": "Acción de respuesta predeterminada",
+      "defaultReply": "Responder",
+      "defaultReplyDesc": "El botón Responder envía solo al remitente",
+      "defaultReplyAll": "Responder a todos",
+      "defaultReplyAllDesc": "El botón Responder envía a todos los destinatarios",
+      "defaultSender": "Remitente predeterminado",
+      "defaultSenderDesc": "Desde qué dirección se envían los mensajes nuevos cuando redactas fuera de una cuenta concreta, como en la bandeja unificada. Las respuestas siempre usan la cuenta que recibió el mensaje.",
+      "defaultSenderLastUsed": "Última cuenta utilizada",
+      "markReadBehavior": "Marcar como leído",
+      "markReadImmediate": "Inmediatamente",
+      "markReadImmediateDesc": "Marcar los correos como leídos en cuanto los abres.",
+      "markReadDelay": "Después de un tiempo",
+      "markReadDelayDesc": "Marcar los correos como leídos después de verlos durante un tiempo determinado.",
+      "markReadManual": "Manualmente",
+      "markReadManualDesc": "Nunca marcar correos como leídos automáticamente. Usa el botón de marcar como leído.",
+      "defaultMailApp": "App de correo predeterminada",
+      "defaultMailAppDesc": "Haz que MailFlow abra los enlaces mailto: en este navegador. El navegador te pedirá que confirmes. Funciona en Firefox y Chrome/Edge; no disponible en iOS.",
+      "defaultMailAppBtn": "Registrar MailFlow",
+      "defaultMailAppOk": "Confirma el aviso en tu navegador para finalizar.",
+      "defaultMailAppError": "Tu navegador bloqueó la solicitud.",
+      "markReadDelayLabel": "Retraso",
+      "markReadDelaySeconds": "{{count}} segundo",
+      "markReadDelaySeconds_other": "{{count}} segundos",
       "hoverQuickActionsMode": "Acciones rápidas al pasar el ratón",
       "hoverQuickActionsOff": "Desactivado",
       "hoverQuickActionsOffDesc": "Mantener las acciones rápidas ocultas hasta usar el menú contextual o atajos.",
@@ -938,29 +997,8 @@
       "gravatarOffDesc": "Privado: nunca contacta con terceros.",
       "gravatarOn": "Activado",
       "gravatarOnDesc": "Obtiene fotos del remitente de Gravatar: comparte direcciones cifradas de remitentes con un tercero.",
-      "defaultReplyAll": "Responder a todos",
-      "defaultReplyDesc": "El botón Responder envía solo al remitente",
-      "defaultReplyAction": "Acción de respuesta predeterminada",
-      "defaultReply": "Responder",
-      "defaultReplyAllDesc": "El botón Responder envía a todos los destinatarios",
-      "defaultSender": "Remitente predeterminado",
-      "defaultSenderDesc": "Desde qué dirección se envían los mensajes nuevos cuando redactas fuera de una cuenta concreta, como en la bandeja unificada. Las respuestas siempre usan la cuenta que recibió el mensaje.",
-      "defaultSenderLastUsed": "Última cuenta utilizada",
-      "markReadBehavior": "Marcar como leído",
-      "markReadImmediate": "Inmediatamente",
-      "markReadImmediateDesc": "Marcar los correos como leídos en cuanto los abres.",
-      "markReadDelay": "Después de un tiempo",
-      "markReadDelayDesc": "Marcar los correos como leídos después de verlos durante un tiempo determinado.",
-      "markReadManual": "Manualmente",
-      "markReadManualDesc": "Nunca marcar correos como leídos automáticamente. Usa el botón de marcar como leído.",
-      "defaultMailApp": "App de correo predeterminada",
-      "defaultMailAppDesc": "Haz que MailFlow abra los enlaces mailto: en este navegador. El navegador te pedirá que confirmes. Funciona en Firefox y Chrome/Edge; no disponible en iOS.",
-      "defaultMailAppBtn": "Registrar MailFlow",
-      "defaultMailAppOk": "Confirma el aviso en tu navegador para finalizar.",
-      "defaultMailAppError": "Tu navegador bloqueó la solicitud.",
-      "markReadDelayLabel": "Retraso",
-      "markReadDelaySeconds": "{{count}} segundo",
-      "markReadDelaySeconds_other": "{{count}} segundos"
+      "threadingList": "Lista agrupada",
+      "threadingListDesc": "Agrupa las respuestas y las despliega en la lista de mensajes"
     },
     "notifications": {
       "title": "Notificaciones",
@@ -1471,10 +1509,48 @@
       "sourceCode": "Código fuente",
       "sponsor": "Apoyar el desarrollo",
       "updates": {
-        "title": "Actualizaciones de la aplicación", "autoCheck": "Buscar actualizaciones automáticamente", "currentVersion": "Versión actual", "latestVersion": "Última versión", "published": "Publicada", "size": "Tamaño de descarga", "notes": "Notas de la versión", "check": "Buscar actualizaciones", "download": "Descargar actualización", "later": "Más tarde", "skip": "Omitir esta versión", "cancel": "Cancelar", "install": "Reiniciar e instalar", "installAndroid": "Instalar", "retry": "Reintentar", "browser": "Descargar en el navegador",
-        "notificationAvailableTitle": "Actualización disponible", "notificationAvailableBody": "MailFlow {{version}} está listo para descargar.", "notificationReadyTitle": "Actualización lista", "notificationReadyBody": "MailFlow {{version}} está listo para instalar.", "notificationErrorTitle": "Error al buscar actualizaciones", "notificationInstallErrorTitle": "Error de instalación", "notificationInstallErrorBody": "No se pudo instalar la actualización verificada.",
-        "status": { "idle": "Listo para buscar actualizaciones.", "checking": "Buscando actualizaciones...", "up-to-date": "La aplicación está actualizada.", "available": "Hay una versión firmada más reciente.", "downloading": "Descargando y verificando la actualización...", "downloaded": "La actualización está verificada y lista para instalar.", "installing": "Reiniciando para instalar...", "error": "No se pudo preparar la actualización.", "skipped": "Esta versión se omitirá. Una versión más reciente aparecerá automáticamente.", "deferred": "Esta actualización se volverá a ofrecer mañana." },
-        "errors": { "genericError": "El servicio de actualizaciones no está disponible temporalmente.", "downloadError": "No se pudo descargar o verificar la actualización.", "verificationError": "El paquete no superó la verificación de seguridad.", "invalidRelease": "La última versión no usa una versión personalizada válida.", "packagedOnly": "La búsqueda de actualizaciones está disponible en la aplicación instalada." }
+        "title": "Actualizaciones de la aplicación",
+        "autoCheck": "Buscar actualizaciones automáticamente",
+        "currentVersion": "Versión actual",
+        "latestVersion": "Última versión",
+        "published": "Publicada",
+        "size": "Tamaño de descarga",
+        "notes": "Notas de la versión",
+        "check": "Buscar actualizaciones",
+        "download": "Descargar actualización",
+        "later": "Más tarde",
+        "skip": "Omitir esta versión",
+        "cancel": "Cancelar",
+        "install": "Reiniciar e instalar",
+        "installAndroid": "Instalar",
+        "retry": "Reintentar",
+        "browser": "Descargar en el navegador",
+        "notificationAvailableTitle": "Actualización disponible",
+        "notificationAvailableBody": "MailFlow {{version}} está listo para descargar.",
+        "notificationReadyTitle": "Actualización lista",
+        "notificationReadyBody": "MailFlow {{version}} está listo para instalar.",
+        "notificationErrorTitle": "Error al buscar actualizaciones",
+        "notificationInstallErrorTitle": "Error de instalación",
+        "notificationInstallErrorBody": "No se pudo instalar la actualización verificada.",
+        "status": {
+          "idle": "Listo para buscar actualizaciones.",
+          "checking": "Buscando actualizaciones...",
+          "up-to-date": "La aplicación está actualizada.",
+          "available": "Hay una versión firmada más reciente.",
+          "downloading": "Descargando y verificando la actualización...",
+          "downloaded": "La actualización está verificada y lista para instalar.",
+          "installing": "Reiniciando para instalar...",
+          "error": "No se pudo preparar la actualización.",
+          "skipped": "Esta versión se omitirá. Una versión más reciente aparecerá automáticamente.",
+          "deferred": "Esta actualización se volverá a ofrecer mañana."
+        },
+        "errors": {
+          "genericError": "El servicio de actualizaciones no está disponible temporalmente.",
+          "downloadError": "No se pudo descargar o verificar la actualización.",
+          "verificationError": "El paquete no superó la verificación de seguridad.",
+          "invalidRelease": "La última versión no usa una versión personalizada válida.",
+          "packagedOnly": "La búsqueda de actualizaciones está disponible en la aplicación instalada."
+        }
       }
     },
     "search": {
@@ -1587,7 +1663,8 @@
     "rulesFiredTitle": "Reglas activadas",
     "noRulesFired": "Ninguna regla activada",
     "mlTokensTitle": "Tokens principales",
-    "noMlTokens": "Sin tokens ML"
+    "noMlTokens": "Sin tokens ML",
+    "conversationMovedToSpam": "Conversación movida a Spam"
   },
   "contacts": {
     "title": "Contactos",

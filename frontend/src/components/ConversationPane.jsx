@@ -1,415 +1,252 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
-import { useMobile } from '../hooks/useMobile.js';
-import { openForwardFromMessage, openReplyFromMessage } from '../utils/composeFromMessage.js';
+import { useStore } from '../store/index.js';
 import {
-  conversationMembershipKey,
-  conversationListScopeMessages,
-  conversationPaneOwnsAutoRead,
-  conversationReadTargets,
-  inboxConversationReadTargets,
+  normalizeConversation,
   initialExpandedMessageIds,
+  conversationMembershipKey,
   newestConversationMessage,
-  unreadConversationIds,
   reconcileExpandedMessageIds,
-  shouldFallbackToSingleMessagePane,
+  conversationReadTargets,
 } from '../utils/conversation.js';
-import { useConversation } from '../hooks/useConversation.js';
-import { resolveThreadMessages } from '../utils/threadActions.js';
-import { folderMatchesQuery } from '../utils/folderDisplay.js';
-import FolderPathLabel from './FolderPathLabel.jsx';
-import {
-  conversationActionIds,
-  conversationSpamTargets,
-  groupConversationMessagesByAccount,
-  newestSnoozeTarget,
-} from '../utils/conversationActions.js';
+import { archiveThread, deleteThread, spamThread, moveThread, snoozeThread } from '../utils/threadActions.js';
 import ConversationMessageCard from './ConversationMessageCard.jsx';
-import MessagePane from './MessagePane.jsx';
+import ContextMenu from './ContextMenu.jsx';
+import { completedMarkReadMap } from '../utils/pendingReads.js';
+import { cancelScheduledMarkReadFor } from '../utils/markRead.js';
 
-function ConversationIcon({ type }) {
-  if (type === 'read') return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M4 12l5 5L20 6"/></svg>;
-  if (type === 'unread') return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M4 5h16v14H4z"/><path d="M4 7l8 6 8-6"/></svg>;
-  if (type === 'archive') return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="3" y="4" width="18" height="5"/><path d="M5 9v11h14V9"/><path d="M9 13h6"/></svg>;
-  if (type === 'move') return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 6h7l2 3h9v11H3z"/></svg>;
-  if (type === 'spam') return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M12 3l8 4v5c0 5-3.5 9-8 10-4.5-1-8-5-8-10V7z"/><path d="M12 8v5"/><path d="M12 17h.01"/></svg>;
-  if (type === 'snooze') return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>;
-  if (type === 'delete') return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M7 7l1 13h8l1-13"/></svg>;
-  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M6 9l6 6 6-6"/></svg>;
+function ThreadBtn({ onClick, title, children, disabled = false }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={title}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 10px',
+        background: 'none', border: '1px solid var(--border)', borderRadius: 4,
+        color: 'var(--text-primary)', font: 'inherit', fontSize: 13, cursor: 'pointer',
+      }}
+    >
+      {children}
+    </button>
+  );
 }
 
-function ToolbarButton({ title, onClick, disabled, danger = false, children }) {
-  return <button type="button" onClick={onClick} disabled={disabled} title={title} aria-label={title} style={{ border: '1px solid var(--border)', borderRadius: 6, background: 'transparent', color: danger ? 'var(--red, #e53e3e)' : 'var(--text-secondary)', cursor: disabled ? 'wait' : 'pointer', padding: 6, opacity: disabled ? 0.55 : 1, display: 'flex', alignItems: 'center' }}>{children}</button>;
-}
-
-export default function ConversationPane({ message, threadId, refreshKey }) {
+// The whole conversation, stacked, with only what the reader has opened rendered.
+//
+// The thread endpoint already returns every message across folders, Sent replies included,
+// deduplicated by Message-ID preferring the INBOX copy, so this needs no scope parameter of
+// its own.
+//
+// Design from #317 by YunQue0912.
+export default function ConversationPane({ threadId, folder, unified = false, selectedMessageId = null, refreshKey = null }) {
   const { t } = useTranslation();
-  const isMobile = useMobile();
-  const {
-    accounts, openCompose, setSelectedMessage, updateMessage,
-    decrementUnread, incrementUnread, adjustCategoryCount,
-    markReadBehavior, markReadDelay, replyDefault, addNotification,
-    selectedMessageSource,
-    selectedAccountId, selectedFolder, setSelectedAccount,
-    setUnreadCounts, setCategoryCounts,
-  } = useStore();
-  const { messages, loading, error, retry } = useConversation(threadId, refreshKey);
-  const [expandedIds, setExpandedIds] = useState(() => initialExpandedMessageIds([]));
-  const previousMessagesRef = useRef([]);
-  const automaticExpandedIdRef = useRef(null);
-  const messagesRef = useRef(messages);
-  const autoReadRunRef = useRef(null);
-  const [paneScrolled, setPaneScrolled] = useState(false);
-  const [actionBusy, setActionBusy] = useState(null);
-  const [showMovePicker, setShowMovePicker] = useState(false);
-  const [moveFolders, setMoveFolders] = useState([]);
-  const [moveFoldersLoading, setMoveFoldersLoading] = useState(false);
-  const [moveSearch, setMoveSearch] = useState('');
-  const [showSnoozePicker, setShowSnoozePicker] = useState(false);
-  const [customSnoozeValue, setCustomSnoozeValue] = useState('');
-  messagesRef.current = messages;
+  const addNotification = useStore(s => s.addNotification);
+  const accounts = useStore(s => s.accounts);
+  const setSelectedMessage = useStore(s => s.setSelectedMessage);
+  const setThreadMessages = useStore(s => s.setThreadMessages);
+  const cachedMessages = useStore(s => s.threadMessages[threadId]);
+  const previousMessages = useRef([]);
+  const previousThread = useRef(null);
+  const [messages, setMessages] = useState([]);
+  const [expanded, setExpanded] = useState(() => new Set());
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [readBusy, setReadBusy] = useState(false);
+  // { x, y, view } — the move and snooze pickers are ContextMenu's, opened straight
+  // into the relevant sub-view rather than reimplemented here.
+  const [picker, setPicker] = useState(null);
 
   useEffect(() => {
-    const previousMessages = previousMessagesRef.current;
-    if (messages.length === 0) return;
-    if (previousMessages.length === 0) {
-      const initial = initialExpandedMessageIds(messages);
-      setExpandedIds(initial);
-      automaticExpandedIdRef.current = [...initial][0] || null;
-    } else {
-      setExpandedIds(current => {
-        const result = reconcileExpandedMessageIds({
-          previousMessages,
-          nextMessages: messages,
-          expandedIds: current,
-          automaticExpandedId: automaticExpandedIdRef.current,
-        });
-        automaticExpandedIdRef.current = result.automaticExpandedId;
-        return result.expandedIds;
-      });
-    }
-    previousMessagesRef.current = messages;
-  }, [messages]);
+    if (!threadId) { setMessages([]); return; }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api.getThread(threadId, folder, unified)
+      .then(data => {
+        if (cancelled) return;
+        const ordered = normalizeConversation(data?.messages || []);
+        const previous = previousMessages.current;
+        const sameThread = previousThread.current === threadId;
+        previousMessages.current = ordered;
+        previousThread.current = threadId;
+        setMessages(ordered);
+        setThreadMessages(threadId, ordered);
+        // Opens on the newest message, the way every threaded client does: the reader
+        // almost always wants the latest reply, and expanding everything would render a
+        // document per message.
+        setExpanded(current => sameThread
+          ? reconcileExpandedMessageIds({ previousMessages: previous, nextMessages: ordered, expandedIds: current }).expandedIds
+          : initialExpandedMessageIds(ordered));
+      })
+      .catch(err => { if (!cancelled) setError(err.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [threadId, folder, unified, refreshKey, setThreadMessages]);
 
-  const resolveActionMessages = useCallback(() => resolveThreadMessages({
-    message,
-    isThreadRow: true,
-    fetchThread: () => api.getThread(threadId),
-  }), [message, threadId]);
-
-  const setConversationRead = useCallback(async read => {
-    let currentMessages;
-    try {
-      currentMessages = await resolveActionMessages();
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('common.error', { message: requestError.message || t('message.loadingError') }) });
-      return;
-    }
-    const targets = conversationReadTargets(currentMessages, read);
-    const ids = targets.map(item => item.id);
-    if (ids.length === 0) return;
-    const scopedMessages = conversationListScopeMessages(currentMessages, { selectedAccountId, selectedFolder });
-    const previousParentReadState = {
-      is_read: message?.is_read,
-      unread_count: message?.unread_count,
-    };
-    const counterTargetIds = new Set(inboxConversationReadTargets(currentMessages, read).map(item => item.id));
-
-    targets.forEach(item => {
-      updateMessage(item.id, { is_read: read });
-      if (!counterTargetIds.has(item.id)) return;
-      if (read) {
-        decrementUnread(item.account_id);
-        adjustCategoryCount(item.category, -1);
-      } else {
-        incrementUnread(item.account_id);
-        adjustCategoryCount(item.category, 1);
-      }
-    });
-    updateMessage(message?.id, {
-      is_read: read,
-      unread_count: read ? 0 : scopedMessages.length,
-    });
-
-    try {
-      await api.bulkRead(ids, read);
-    } catch (requestError) {
-      targets.forEach(item => {
-        updateMessage(item.id, { is_read: !read });
-        if (!counterTargetIds.has(item.id)) return;
-        if (read) {
-          incrementUnread(item.account_id);
-          adjustCategoryCount(item.category, 1);
-        } else {
-          decrementUnread(item.account_id);
-          adjustCategoryCount(item.category, -1);
-        }
-      });
-      updateMessage(message?.id, previousParentReadState);
-      addNotification({ type: 'error', title: t('common.error', { message: requestError.message || t('message.loadingError') }) });
-    }
-  }, [addNotification, adjustCategoryCount, decrementUnread, incrementUnread, message?.id, message?.is_read, message?.unread_count, resolveActionMessages, selectedAccountId, selectedFolder, t, updateMessage]);
-
-  const membershipKey = useMemo(() => conversationMembershipKey(messages), [messages]);
-
+  // Opening a message from the list opens it here too. Picking a different message in the
+  // same thread leaves threadId untouched, so the pane used to re-render with identical
+  // props and nothing happened on screen, which read as the click being ignored.
+  const stackRef = useRef(null);
   useEffect(() => {
-    const currentMessages = messagesRef.current;
-    if (!conversationPaneOwnsAutoRead(selectedMessageSource)) {
-      autoReadRunRef.current = null;
-      return undefined;
-    }
-    if (markReadBehavior === 'manual') {
-      autoReadRunRef.current = null;
-      return undefined;
-    }
-    if (currentMessages.length === 0) return undefined;
-    const unread = unreadConversationIds(currentMessages);
-    if (unread.length === 0) return undefined;
-    const runKey = `${threadId}:${membershipKey}:${markReadBehavior}`;
-    if (markReadBehavior === 'immediate') {
-      if (autoReadRunRef.current === runKey) return undefined;
-      autoReadRunRef.current = runKey;
-      setConversationRead(true);
-      return undefined;
-    }
-    const timer = setTimeout(() => {
-      if (autoReadRunRef.current === runKey) return;
-      autoReadRunRef.current = runKey;
-      setConversationRead(true);
-    }, (markReadDelay || 1) * 1000);
-    return () => clearTimeout(timer);
-  }, [markReadBehavior, markReadDelay, membershipKey, selectedMessageSource, setConversationRead, threadId]);
+    if (!selectedMessageId || !messages.some(message => message.id === selectedMessageId)) return;
+    setExpanded(prev => (prev.has(selectedMessageId) ? prev : new Set(prev).add(selectedMessageId)));
+    // Long threads run past the fold, so the message that was asked for is brought into
+    // view rather than being opened somewhere off screen.
+    const card = stackRef.current?.querySelector(`[data-message-id="${selectedMessageId}"]`);
+    card?.scrollIntoView?.({ block: 'nearest' });
+  }, [selectedMessageId, messages]);
 
-  const toggleExpanded = useCallback(id => {
-    setExpandedIds(current => {
-      const next = new Set(current);
-      if (next.has(id)) {
-        next.delete(id);
-        if (automaticExpandedIdRef.current === id) automaticExpandedIdRef.current = null;
-      } else {
-        next.add(id);
-      }
-      return next;
+  const toggle = (id) => setExpanded(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
+  // Acting on the conversation empties the reading pane: every message it was showing
+  // has just been removed from the list behind it.
+  const runAction = (action) => {
+    action(messages, {
+      t,
+      addNotification,
+      accounts,
+      // The authoritative list, re-read when the action actually commits, so a reply
+      // that arrived while this conversation was open is not left behind.
+      fetchThread: () => api.getThread(threadId, folder, unified),
     });
-  }, []);
+    setSelectedMessage(null);
+  };
 
-  const replyTo = useCallback(async (target, replyAll = replyDefault === 'replyAll') => {
+  const openPicker = (event, view) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setPicker({ x: rect.left, y: rect.bottom + 4, view });
+  };
+
+  const setConversationRead = async read => {
+    if (readBusy) return;
+    setReadBusy(true);
     try {
-      await openReplyFromMessage(target, {
-        accounts,
-        openCompose,
-        getMessageBody: api.getMessageBody,
-        replyAll,
-      });
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('common.error', { message: requestError.message || t('message.loadingError') }) });
-    }
-  }, [accounts, addNotification, openCompose, replyDefault, t]);
-
-  const forward = useCallback(async target => {
-    try {
-      await openForwardFromMessage(target, { openCompose, getMessageBody: api.getMessageBody });
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('common.error', { message: requestError.message || t('message.loadingError') }) });
-    }
-  }, [addNotification, openCompose, t]);
-
-  const newest = useMemo(() => newestConversationMessage(messages), [messages]);
-  const subject = message?.subject || newest?.subject || t('common.noSubject');
-  const actionIds = useMemo(() => conversationActionIds(messages), [messages]);
-
-  const refreshAndClose = useCallback(async () => {
-    const [unreadResult, categoryResult] = await Promise.allSettled([
-      api.getUnreadCounts(),
-      api.getCategoryCounts(selectedAccountId ? { accountId: selectedAccountId } : {}),
-    ]);
-    if (unreadResult.status === 'fulfilled') setUnreadCounts(unreadResult.value);
-    if (categoryResult.status === 'fulfilled') setCategoryCounts(categoryResult.value.counts || {});
-    setSelectedAccount(selectedAccountId, selectedFolder);
-  }, [selectedAccountId, selectedFolder, setCategoryCounts, setSelectedAccount, setUnreadCounts]);
-
-  const archiveConversation = useCallback(async () => {
-    if (!actionIds.length || actionBusy) return;
-    setActionBusy('archive');
-    let ids = actionIds;
-    try {
-      ids = conversationActionIds(await resolveActionMessages());
-      const result = await api.bulkArchive(ids);
-      const succeeded = new Set(result.archived || []);
-      const failed = ids.length - succeeded.size;
-      addNotification(failed ? {
-        type: 'error',
-        title: result.noArchiveFolder?.length ? t('messageList.bulkArchived.noFolderTitle') : t('messageList.bulkArchived.failTitle'),
-        body: result.noArchiveFolder?.length ? t('messageList.bulkArchived.noFolderBody') : t('messageList.bulkArchived.failBody', { count: failed }),
-      } : { title: t('messageList.bulkArchived.title', { count: succeeded.size }), body: t('messageList.bulkArchived.body') });
-      if (succeeded.size) await refreshAndClose();
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('messageList.bulkArchived.failTitle'), body: requestError.message || t('messageList.bulkArchived.failBody', { count: ids.length }) });
-    } finally {
-      setActionBusy(null);
-    }
-  }, [actionBusy, actionIds, addNotification, refreshAndClose, resolveActionMessages, t]);
-
-  const deleteConversation = useCallback(async () => {
-    if (!actionIds.length || actionBusy) return;
-    setActionBusy('delete');
-    let ids = actionIds;
-    try {
-      ids = conversationActionIds(await resolveActionMessages());
-      const result = await api.bulkDelete(ids);
-      const succeeded = new Set(result.deleted || []);
-      const failed = ids.length - succeeded.size;
-      addNotification(failed ? {
-        type: 'error', title: t('messageList.bulkDeleted.failTitle'), body: t('messageList.bulkDeleted.failBody', { count: failed }),
-      } : { title: t('messageList.bulkDeleted.title', { count: succeeded.size }), body: t('messageList.bulkDeleted.body') });
-      if (succeeded.size) await refreshAndClose();
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('messageList.bulkDeleted.failTitle'), body: requestError.message || t('messageList.bulkDeleted.failBody', { count: ids.length }) });
-    } finally {
-      setActionBusy(null);
-    }
-  }, [actionBusy, actionIds, addNotification, refreshAndClose, resolveActionMessages, t]);
-
-  const openMovePicker = useCallback(async () => {
-    if (showMovePicker) {
-      setShowMovePicker(false);
-      return;
-    }
-    setShowSnoozePicker(false);
-    setShowMovePicker(true);
-    setMoveSearch('');
-    setMoveFoldersLoading(true);
-    try {
-      const accountIds = Object.keys(groupConversationMessagesByAccount(messages));
-      const folderLists = await Promise.all(accountIds.map(accountId => api.getFolders(accountId)
-        .then(data => Array.isArray(data) ? data : (data.folders || []))));
-      const availableInEveryAccount = (folderLists[0] || []).filter(folder =>
-        folderLists.every(list => list.some(candidate => candidate.path === folder.path))
-        && messages.some(item => item.folder !== folder.path));
-      setMoveFolders(availableInEveryAccount);
-    } catch {
-      setMoveFolders([]);
-    } finally {
-      setMoveFoldersLoading(false);
-    }
-  }, [messages, showMovePicker]);
-
-  const moveConversation = useCallback(async folder => {
-    if (!folder || actionBusy) return;
-    setShowMovePicker(false);
-    setActionBusy('move');
-    try {
-      const currentMessages = await resolveActionMessages();
-      const groups = Object.values(groupConversationMessagesByAccount(currentMessages));
-      const results = await Promise.allSettled(groups.map(group => api.bulkMove(group.map(item => item.id), folder)));
-      const succeeded = new Set(results.flatMap(result => result.status === 'fulfilled' ? (result.value.moved || []) : []));
-      const failed = conversationActionIds(currentMessages).length - succeeded.size;
-      addNotification(failed ? {
-        type: 'error', title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failed }),
-      } : { title: t('messageList.bulkMoved.title', { count: succeeded.size }), body: folder });
-      if (succeeded.size) await refreshAndClose();
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('messageList.bulkMoved.failTitle'), body: requestError.message });
-    } finally {
-      setActionBusy(null);
-    }
-  }, [actionBusy, addNotification, refreshAndClose, resolveActionMessages, t]);
-
-  const spamConversation = useCallback(async () => {
-    if (actionBusy) return;
-    setActionBusy('spam');
-    try {
-      const targets = conversationSpamTargets(await resolveActionMessages(), accounts);
+      // Resolve first; a failed refresh must never act on a stale conversation.
+      const data = await api.getThread(threadId, folder, unified);
+      const live = normalizeConversation(data?.messages || []);
+      const targets = conversationReadTargets(live, read);
       if (!targets.length) return;
-      const results = await Promise.allSettled(targets.map(item => api.markSpam(item.id)));
-      const succeeded = results.filter(result => result.status === 'fulfilled').length;
-      const failed = targets.length - succeeded;
-      addNotification(failed ? {
-        type: 'error', title: t('spam.failTitle'), body: t('spam.failBodyBulk', { count: failed }),
-      } : { title: t('spam.movedToSpamBulk', { count: succeeded }) });
-      if (succeeded) await refreshAndClose();
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('spam.failTitle'), body: requestError.message });
+      targets.forEach(item => cancelScheduledMarkReadFor(item.id));
+      await api.bulkRead(targets.map(item => item.id), read);
+      const store = useStore.getState();
+      // An automatic read may already have updated one visible card while the
+      // authoritative lookup was in flight. Count only actual local transitions.
+      const previous = new Map((store.threadMessages[threadId] || []).map(item => [item.id, item.is_read]));
+      store.setThreadMessages(threadId, live);
+      targets.forEach(item => {
+        store.updateMessage(item.id, { is_read: read });
+        if (item.folder === 'INBOX' && (previous.get(item.id) ?? item.is_read) !== read) {
+          if (read) store.decrementUnread(item.account_id); else store.incrementUnread(item.account_id);
+          store.adjustCategoryCount(item.category, read ? -1 : 1);
+        }
+        if (read) {
+          completedMarkReadMap.set(item.id, item.account_id);
+          setTimeout(() => completedMarkReadMap.delete(item.id), 10000);
+        } else completedMarkReadMap.delete(item.id);
+      });
+    } catch (err) {
+      addNotification({ type: 'error', title: t('common.error', { message: err.message || t('message.loadingError') }) });
     } finally {
-      setActionBusy(null);
+      setReadBusy(false);
     }
-  }, [accounts, actionBusy, addNotification, refreshAndClose, resolveActionMessages, t]);
+  };
+  const hasUnread = (cachedMessages || messages).some(message => !message.is_read);
 
-  const snoozeConversation = useCallback(async until => {
-    const target = newestSnoozeTarget(messages);
-    if (!target || !until || actionBusy) return;
-    setShowSnoozePicker(false);
-    setActionBusy('snooze');
-    try {
-      await api.snoozeMessage(target.id, until);
-      addNotification({ title: t('message.snoozed.title'), body: subject });
-      await refreshAndClose();
-    } catch (requestError) {
-      addNotification({ type: 'error', title: t('message.snoozed.failTitle'), body: requestError.message || t('message.snoozed.failBody') });
-    } finally {
-      setActionBusy(null);
-    }
-  }, [actionBusy, addNotification, messages, refreshAndClose, subject, t]);
+  // Every branch that returns from here fills the reading area, for the same flex reason
+  // as the stack below: a bare div would collapse to the width of its own text.
+  const fill = { flex: 1, minWidth: 0, height: '100%', background: 'var(--bg-primary)' };
 
-  if (!message) return null;
-  if (shouldFallbackToSingleMessagePane({ loading, error, messages })) return <MessagePane />;
+  if (error) return <div style={{ ...fill, padding: 16, color: 'var(--red, #e03131)' }}>{error}</div>;
+  if (loading && !messages.length) {
+    return (
+      <div style={{ ...fill, padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div className="skeleton-line" style={{ height: 13, width: '48%', borderRadius: 4 }} />
+        <div className="skeleton-line" style={{ height: 13, width: '70%', borderRadius: 4 }} />
+      </div>
+    );
+  }
+  if (!messages.length) return null;
 
   return (
-    <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-primary)' }}>
-      {isMobile && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: 'calc(var(--sat) + 10px) 14px 10px', borderBottom: '1px solid var(--border-subtle)', background: 'var(--bg-secondary)', flexShrink: 0 }}>
-          <button type="button" onClick={() => setSelectedMessage(null)} title={t('common.back')} aria-label={t('common.back')} style={{ border: 'none', background: 'none', color: 'var(--accent)', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: 4 }}><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="15 18 9 12 15 6"/></svg></button>
-          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>{subject}</span>
-        </div>
+    <div
+      // Remounts the stack when the thread's membership changes, so expansion state from a
+      // previous conversation can never be applied to this one's message ids.
+      key={conversationMembershipKey(messages)}
+      ref={stackRef}
+      // flex: 1 and minWidth: 0 are load-bearing. The reading area is a flex row, so
+      // without them this pane is sized shrink-to-fit by its contents: collapsed cards
+      // are narrow, an expanded newsletter is as wide as the newsletter, and the pane
+      // jumped around as the reader opened and closed messages. minWidth: 0 is the other
+      // half, since a flex item defaults to min-width:auto and a wide email would
+      // otherwise push the pane past its share of the row.
+      style={{
+        flex: 1, minWidth: 0,
+        padding: 12, overflowY: 'auto', height: '100%',
+        background: 'var(--bg-primary)',
+      }}
+    >
+      {/* Thread-level actions, the way Gmail does it: archiving a conversation archives
+          all of it, so the reader does not file the same thread message by message. */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+        <ThreadBtn onClick={() => setConversationRead(hasUnread)} disabled={readBusy} title={t(hasUnread ? 'contextMenu.markRead' : 'contextMenu.markUnread')}>
+          {t(hasUnread ? 'contextMenu.markRead' : 'contextMenu.markUnread')}
+        </ThreadBtn>
+        <ThreadBtn onClick={() => runAction(archiveThread)} title={t('message.archive')}>
+          {t('message.archive')}
+        </ThreadBtn>
+        <ThreadBtn onClick={() => runAction(deleteThread)} title={t('message.delete')}>
+          {t('message.delete')}
+        </ThreadBtn>
+        <ThreadBtn onClick={() => runAction(spamThread)} title={t('contextMenu.markAsSpam')}>
+          {t('contextMenu.markAsSpam')}
+        </ThreadBtn>
+        <ThreadBtn
+          onClick={e => openPicker(e, 'move')}
+          title={t('contextMenu.moveToFolder')}
+        >
+          {t('contextMenu.moveToFolder')}
+        </ThreadBtn>
+        <ThreadBtn
+          onClick={e => openPicker(e, 'snooze')}
+          title={t('contextMenu.snooze.label')}
+        >
+          {t('contextMenu.snooze.label')}
+        </ThreadBtn>
+      </div>
+
+      {picker && (
+        <ContextMenu
+          x={picker.x}
+          y={picker.y}
+          message={newestConversationMessage(messages)}
+          variant="conversation"
+          defaultMoveView={picker.view === 'move'}
+          defaultSnoozeView={picker.view === 'snooze'}
+          onClose={() => setPicker(null)}
+          onAction={(action, data) => {
+            if (action === 'moveTo') runAction((list, opts) => moveThread(list, data, opts));
+            else if (action === 'snooze') runAction((list, opts) => snoozeThread(list, data, opts));
+            setPicker(null);
+          }}
+        />
       )}
 
-      <div style={{ padding: '8px 14px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, boxShadow: paneScrolled ? '0 1px 10px rgba(0,0,0,0.2)' : 'none' }}>
-        {!isMobile && <button type="button" onClick={() => setSelectedMessage(null)} title={t('common.back')} aria-label={t('common.back')} style={{ border: 'none', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', padding: 5 }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg></button>}
-        <div style={{ flex: 1, minWidth: 0 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-primary)', fontSize: 14, fontWeight: 600 }}>{subject}</div><div style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>{t('conversation.messages', { count: messages.length })}</div></div>
-        <ToolbarButton onClick={archiveConversation} disabled={Boolean(actionBusy)} title={t('message.archive')}><ConversationIcon type="archive" /></ToolbarButton>
-        <div style={{ position: 'relative' }}>
-          <ToolbarButton onClick={openMovePicker} disabled={Boolean(actionBusy)} title={t('contextMenu.moveToFolder')}><ConversationIcon type="move" /></ToolbarButton>
-          {showMovePicker && <>
-            <div aria-hidden onClick={() => setShowMovePicker(false)} style={{ position: 'fixed', inset: 0, zIndex: 29 }} />
-            <div style={{ position: 'absolute', top: 'calc(100% + 5px)', right: 0, width: 230, maxHeight: 300, overflowY: 'auto', zIndex: 30, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg-elevated)', boxShadow: 'var(--shadow-popover)' }}>
-              {!moveFoldersLoading && moveFolders.length > 0 && <div style={{ padding: 6, borderBottom: '1px solid var(--border-subtle)' }}><input autoFocus value={moveSearch} onChange={event => setMoveSearch(event.target.value)} placeholder={t('contextMenu.folders.search')} style={{ width: '100%', boxSizing: 'border-box', padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg-tertiary)', color: 'var(--text-primary)' }} /></div>}
-              {moveFoldersLoading ? <div style={{ padding: 14, color: 'var(--text-tertiary)', fontSize: 12 }}>{t('contextMenu.folders.loading')}</div>
-                : moveFolders.length === 0 ? <div style={{ padding: 14, color: 'var(--text-tertiary)', fontSize: 12 }}>{t('contextMenu.folders.empty')}</div>
-                  : moveFolders.filter(folder => folderMatchesQuery(folder, moveSearch)).map(folder => <button type="button" key={folder.path} onClick={() => moveConversation(folder.path)} title={folder.path} style={{ display: 'flex', width: '100%', border: 'none', background: 'transparent', color: 'var(--text-primary)', padding: '8px 11px', textAlign: 'left', cursor: 'pointer', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><FolderPathLabel folder={folder} /></button>)}
-            </div>
-          </>}
-        </div>
-        <ToolbarButton onClick={spamConversation} disabled={Boolean(actionBusy) || conversationSpamTargets(messages, accounts).length === 0} title={t('contextMenu.markAsSpam')}><ConversationIcon type="spam" /></ToolbarButton>
-        <div style={{ position: 'relative' }}>
-          <ToolbarButton onClick={() => { setShowMovePicker(false); setShowSnoozePicker(value => !value); }} disabled={Boolean(actionBusy) || !newestSnoozeTarget(messages)} title={t('contextMenu.snooze.label')}><ConversationIcon type="snooze" /></ToolbarButton>
-          {showSnoozePicker && <>
-            <div aria-hidden onClick={() => setShowSnoozePicker(false)} style={{ position: 'fixed', inset: 0, zIndex: 29 }} />
-            <div style={{ position: 'absolute', top: 'calc(100% + 5px)', right: 0, width: 220, zIndex: 30, border: '1px solid var(--border)', borderRadius: 7, padding: 5, background: 'var(--bg-elevated)', boxShadow: 'var(--shadow-popover)' }}>
-              {[
-                { label: t('contextMenu.snooze.threeHours'), date: () => new Date(Date.now() + 3 * 60 * 60 * 1000) },
-                { label: t('contextMenu.snooze.tomorrowMorning'), date: () => { const date = new Date(); date.setDate(date.getDate() + 1); date.setHours(9, 0, 0, 0); return date; } },
-                { label: t('contextMenu.snooze.nextWeek'), date: () => { const date = new Date(); date.setDate(date.getDate() + 7); date.setHours(9, 0, 0, 0); return date; } },
-              ].map(option => <button type="button" key={option.label} onClick={() => snoozeConversation(option.date().toISOString())} style={{ width: '100%', border: 'none', background: 'transparent', color: 'var(--text-primary)', padding: '8px 10px', textAlign: 'left', cursor: 'pointer' }}>{option.label}</button>)}
-              <div style={{ height: 1, background: 'var(--border-subtle)', margin: '4px 0' }} />
-              <div style={{ display: 'flex', gap: 5, padding: 5 }}>
-                <input type="datetime-local" value={customSnoozeValue} onChange={event => setCustomSnoozeValue(event.target.value)} aria-label={t('contextMenu.snooze.custom')} style={{ minWidth: 0, flex: 1, padding: '5px 6px', border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg-tertiary)', color: 'var(--text-primary)', colorScheme: 'dark light' }} />
-                <button type="button" disabled={!customSnoozeValue} onClick={() => snoozeConversation(new Date(customSnoozeValue).toISOString())} title={t('contextMenu.snooze.custom')} style={{ border: '1px solid var(--border)', borderRadius: 5, background: 'transparent', color: 'var(--text-primary)', cursor: customSnoozeValue ? 'pointer' : 'default', opacity: customSnoozeValue ? 1 : 0.5 }}>{t('common.save')}</button>
-              </div>
-            </div>
-          </>}
-        </div>
-        <ToolbarButton onClick={() => setConversationRead(messages.some(item => !item.is_read))} disabled={Boolean(actionBusy)} title={messages.some(item => !item.is_read) ? t('contextMenu.markRead') : t('contextMenu.markUnread')}><ConversationIcon type={messages.some(item => !item.is_read) ? 'read' : 'unread'} /></ToolbarButton>
-        <ToolbarButton onClick={deleteConversation} disabled={Boolean(actionBusy)} danger title={t('message.delete')}><ConversationIcon type="delete" /></ToolbarButton>
-      </div>
-
-      <div onScroll={event => setPaneScrolled(event.currentTarget.scrollTop > 4)} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}>
-        {loading && <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 10 }}><div className="skeleton-line" style={{ height: 18, width: '40%' }}/><div className="skeleton-line" style={{ height: 54, width: '100%' }}/><div className="skeleton-line" style={{ height: 54, width: '100%' }}/></div>}
-        {error && !loading && <div style={{ padding: 24, display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 12 }}><div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{error}</div><button type="button" onClick={retry} style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '6px 12px', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer' }}>{t('common.retry')}</button></div>}
-        {!loading && !error && messages.map(item => <ConversationMessageCard key={item.id} message={item} expanded={expandedIds.has(item.id)} onToggle={() => toggleExpanded(item.id)} onReply={target => replyTo(target)} onForward={target => forward(target)} />)}
-        {!loading && !error && newest && <div style={{ padding: isMobile ? '18px 14px 28px' : '22px 14px 34px', display: 'flex', justifyContent: 'center' }}><button type="button" onClick={() => replyTo(newest)} title={t('conversation.replyLatest')} style={{ border: '1px solid var(--border)', borderRadius: 7, padding: '8px 14px', background: 'var(--bg-secondary)', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 13 }}>{t('conversation.replyLatest')}</button></div>}
-      </div>
+      {messages.map(message => (
+        <ConversationMessageCard
+          key={message.id}
+          message={cachedMessages?.find(cached => cached.id === message.id) || message}
+          expanded={expanded.has(message.id)}
+          selected={message.id === selectedMessageId}
+          onToggle={toggle}
+        />
+      ))}
     </div>
   );
 }

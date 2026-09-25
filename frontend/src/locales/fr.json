@@ -144,8 +144,11 @@
     },
     "toolbar": {
       "removeTable": "Supprimer le tableau",
+      "typography": "Typographie",
       "textColor": "Couleur du texte",
       "removeColor": "Supprimer la couleur",
+      "customColor": "Couleur personnalisée…",
+      "noColor": "Aucune couleur",
       "insertImage": "Insérer une image",
       "minimize": "Réduire",
       "maximize": "Agrandir",
@@ -193,6 +196,7 @@
     "noSubject": "(sans objet)",
     "to": "À :",
     "via": "via",
+    "forwardedFrom": "Expéditeur d'origine (selon {{service}}) :",
     "attachment_one": "{{count}} pièce jointe",
     "attachment_other": "{{count}} pièces jointes",
     "loadingError": "Impossible de charger le corps du message",
@@ -207,13 +211,10 @@
       "warn": "Type de fichier risqué (.{{ext}}) — peut contenir des macros ou une fausse page de connexion",
       "notice": "Archive — le contenu ne peut pas être inspecté",
       "doubleExt": "Extension masquée : .{{ext}} — le vrai type est le dernier",
+      "armed": "{{label}} — cliquez à nouveau pour télécharger quand même",
       "confirm": "cliquez à nouveau pour télécharger quand même"
     },
     "downloadAll": "Tout télécharger",
-    "downloadFailed": {
-      "title": "Échec du téléchargement",
-      "body": "Impossible de télécharger cette pièce jointe. Veuillez réessayer."
-    },
     "reply": "Répondre",
     "replyAll": "Répondre à tous",
     "replyOptions": "Options de réponse",
@@ -240,17 +241,20 @@
       "failTitle": "Échec de l'archivage",
       "failBody": "Impossible d'archiver le message.",
       "noFolderTitle": "Aucun dossier d'archive",
-      "noFolderBody": "Aucun dossier d'archive configuré pour ce compte. Définissez-en un dans Paramètres → Comptes → Mappage des dossiers."
+      "noFolderBody": "Aucun dossier d'archive configuré pour ce compte. Définissez-en un dans Paramètres → Comptes → Mappage des dossiers.",
+      "conversationTitle": "Conversation archivée"
     },
     "moved": {
       "title": "Message déplacé",
       "failTitle": "Échec du déplacement",
-      "failBody": "Impossible de déplacer le message."
+      "failBody": "Impossible de déplacer le message.",
+      "conversationTitle": "Conversation déplacée"
     },
     "snoozed": {
       "title": "Message mis en attente",
       "failTitle": "Échec de la mise en attente",
-      "failBody": "Impossible de mettre ce message en attente."
+      "failBody": "Impossible de mettre ce message en attente.",
+      "conversationTitle": "Conversation mise en attente"
     },
     "whitelistFail": {
       "title": "Impossible d'enregistrer la préférence",
@@ -269,12 +273,11 @@
       "button": "Classer avec l'IA",
       "done": "Classé comme {{category}}",
       "error": "La classification par IA a échoué."
+    },
+    "downloadFailed": {
+      "title": "Échec du téléchargement",
+      "body": "Impossible de télécharger cette pièce jointe. Veuillez réessayer."
     }
-  },
-  "conversation": {
-    "messages_one": "{{count}} message dans la conversation",
-    "messages_other": "{{count}} messages dans la conversation",
-    "replyLatest": "Répondre au dernier message"
   },
   "messageList": {
     "search": "Rechercher…",
@@ -307,7 +310,8 @@
       "title": "Message supprimé",
       "body": "Déplacé vers la corbeille.",
       "failTitle": "Échec de la suppression",
-      "failBody": "Impossible de supprimer le message."
+      "failBody": "Impossible de supprimer le message.",
+      "conversationTitle": "Conversation supprimée"
     },
     "bulkDeleted": {
       "title_one": "{{count}} message supprimé",
@@ -480,6 +484,11 @@
     }
   },
   "commandPalette": {
+    "labelPicker": {
+      "copyTo": "Copier vers {{folder}}",
+      "error": "Impossible d’étiqueter le message",
+      "placeholder": "Copier ou étiqueter le message sélectionné…"
+    },
     "placeholder": "Rechercher des actions…",
     "noResults": "Aucune action trouvée",
     "hint": {
@@ -501,6 +510,11 @@
     "customizeHint": "Personnaliser les raccourcis dans Paramètres → Raccourcis",
     "closeHint": "Appuyez sur ? ou Échap pour fermer",
     "then": "puis",
+    "browserMailboxFallback": "Dans le navigateur : g puis 1–9 ouvre une boîte visible ; g puis l ouvre le sélecteur de dossiers.",
+    "visibleMailbox": {
+      "label": "Boîte visible {{number}}",
+      "description": "Ouvrir la boîte visible {{number}}"
+    },
     "groups": {
       "composeSearch": "Rédaction et recherche",
       "navigation": "Navigation",
@@ -508,6 +522,30 @@
       "gtd": "GTD"
     },
     "actions": {
+      "toggleLeftSidebar": {
+        "label": "Afficher ou masquer la barre latérale gauche",
+        "description": "Afficher ou masquer la barre latérale gauche"
+      },
+      "openLabelPicker": {
+        "label": "Ouvrir le sélecteur de dossiers",
+        "description": "Copier le message sélectionné dans un dossier"
+      },
+      "replyAllFromSelection": {
+        "label": "Répondre à tous depuis la sélection",
+        "description": "Répondre à tous les destinataires du message sélectionné"
+      },
+      "markUnread": {
+        "label": "Marquer comme non lu",
+        "description": "Marquer le message sélectionné comme non lu"
+      },
+      "unsubscribe": {
+        "label": "Se désabonner",
+        "description": "Se désabonner de la liste du message sélectionné"
+      },
+      "loadRemoteImages": {
+        "label": "Charger les images distantes",
+        "description": "Charger les images du message sélectionné"
+      },
       "compose": {
         "label": "Composer",
         "description": "Ouvrir une nouvelle fenêtre de rédaction"
@@ -909,15 +947,36 @@
       "threadingMode": "Regroupement par conversation",
       "threadingOff": "Désactivé",
       "threadingOffDesc": "Chaque message affiché individuellement",
-      "threadingList": "Liste groupée",
-      "threadingListDesc": "Regroupe les réponses et les déplie dans la liste des messages",
-      "threadingPane": "Volet de conversation",
-      "threadingPaneDesc": "Regroupe les réponses et affiche toute la conversation dans le volet de lecture",
+      "threadingPane": "Volet de lecture",
+      "threadingPaneDesc": "Toute la conversation s'ouvre ensemble",
       "composeFormat": "Format de rédaction",
       "composeRichText": "Texte enrichi",
       "composeRichTextDesc": "Envoie du HTML — prend en charge la mise en forme et les signatures stylisées",
       "composePlainText": "Texte brut",
       "composePlainTextDesc": "Aucun formatage HTML — compatibilité maximale",
+      "defaultReplyAction": "Action de réponse par défaut",
+      "defaultReply": "Répondre",
+      "defaultReplyDesc": "Le bouton Répondre envoie uniquement à l'expéditeur",
+      "defaultReplyAll": "Répondre à tous",
+      "defaultReplyAllDesc": "Le bouton Répondre envoie à tous les destinataires",
+      "defaultSender": "Expéditeur par défaut",
+      "defaultSenderDesc": "Adresse utilisée pour les nouveaux messages rédigés en dehors d'un compte précis, par exemple depuis la boîte unifiée. Les réponses utilisent toujours le compte qui a reçu le message.",
+      "defaultSenderLastUsed": "Dernier compte utilisé",
+      "markReadBehavior": "Marquer comme lu",
+      "markReadImmediate": "Immédiatement",
+      "markReadImmediateDesc": "Marquer les e-mails comme lus dès que vous les ouvrez.",
+      "markReadDelay": "Après un délai",
+      "markReadDelayDesc": "Marquer les e-mails comme lus après les avoir consultés pendant un certain temps.",
+      "markReadManual": "Manuellement",
+      "markReadManualDesc": "Ne jamais marquer les e-mails comme lus automatiquement. Utiliser le bouton marquer comme lu.",
+      "defaultMailApp": "Application e-mail par défaut",
+      "defaultMailAppDesc": "Faites en sorte que MailFlow ouvre les liens mailto: dans ce navigateur. Le navigateur vous demandera de confirmer. Fonctionne dans Firefox et Chrome/Edge ; non disponible sur iOS.",
+      "defaultMailAppBtn": "Enregistrer MailFlow",
+      "defaultMailAppOk": "Confirmez l'invite dans votre navigateur pour terminer.",
+      "defaultMailAppError": "Votre navigateur a bloqué la demande.",
+      "markReadDelayLabel": "Délai",
+      "markReadDelaySeconds": "{{count}} seconde",
+      "markReadDelaySeconds_other": "{{count}} secondes",
       "hoverQuickActionsMode": "Actions rapides au survol",
       "hoverQuickActionsOff": "Désactivé",
       "hoverQuickActionsOffDesc": "Garder les actions rapides masquées jusqu'à l'utilisation du menu contextuel ou des raccourcis.",
@@ -938,29 +997,8 @@
       "gravatarOffDesc": "Privé — ne contacte jamais de tiers.",
       "gravatarOn": "Activé",
       "gravatarOnDesc": "Récupère les photos de l'expéditeur depuis Gravatar — partage les adresses hachées des expéditeurs avec un tiers.",
-      "defaultReplyAll": "Répondre à tous",
-      "defaultReplyDesc": "Le bouton Répondre envoie uniquement à l'expéditeur",
-      "defaultReplyAction": "Action de réponse par défaut",
-      "defaultReply": "Répondre",
-      "defaultReplyAllDesc": "Le bouton Répondre envoie à tous les destinataires",
-      "defaultSender": "Expéditeur par défaut",
-      "defaultSenderDesc": "Adresse utilisée pour les nouveaux messages rédigés en dehors d'un compte précis, par exemple depuis la boîte unifiée. Les réponses utilisent toujours le compte qui a reçu le message.",
-      "defaultSenderLastUsed": "Dernier compte utilisé",
-      "markReadBehavior": "Marquer comme lu",
-      "markReadImmediate": "Immédiatement",
-      "markReadImmediateDesc": "Marquer les e-mails comme lus dès que vous les ouvrez.",
-      "markReadDelay": "Après un délai",
-      "markReadDelayDesc": "Marquer les e-mails comme lus après les avoir consultés pendant un certain temps.",
-      "markReadManual": "Manuellement",
-      "markReadManualDesc": "Ne jamais marquer les e-mails comme lus automatiquement. Utiliser le bouton marquer comme lu.",
-      "defaultMailApp": "Application e-mail par défaut",
-      "defaultMailAppDesc": "Faites en sorte que MailFlow ouvre les liens mailto: dans ce navigateur. Le navigateur vous demandera de confirmer. Fonctionne dans Firefox et Chrome/Edge ; non disponible sur iOS.",
-      "defaultMailAppBtn": "Enregistrer MailFlow",
-      "defaultMailAppOk": "Confirmez l'invite dans votre navigateur pour terminer.",
-      "defaultMailAppError": "Votre navigateur a bloqué la demande.",
-      "markReadDelayLabel": "Délai",
-      "markReadDelaySeconds": "{{count}} seconde",
-      "markReadDelaySeconds_other": "{{count}} secondes"
+      "threadingList": "Liste groupée",
+      "threadingListDesc": "Regroupe les réponses et les déplie dans la liste des messages"
     },
     "notifications": {
       "title": "Notifications",
@@ -1471,10 +1509,48 @@
       "sourceCode": "Code source",
       "sponsor": "Soutenir le développement",
       "updates": {
-        "title": "Mises à jour de l’application", "autoCheck": "Rechercher automatiquement les mises à jour", "currentVersion": "Version actuelle", "latestVersion": "Dernière version", "published": "Publication", "size": "Taille du téléchargement", "notes": "Notes de version", "check": "Rechercher des mises à jour", "download": "Télécharger la mise à jour", "later": "Plus tard", "skip": "Ignorer cette version", "cancel": "Annuler", "install": "Redémarrer et installer", "installAndroid": "Installer", "retry": "Réessayer", "browser": "Télécharger dans le navigateur",
-        "notificationAvailableTitle": "Mise à jour disponible", "notificationAvailableBody": "MailFlow {{version}} est prêt à être téléchargé.", "notificationReadyTitle": "Mise à jour prête", "notificationReadyBody": "MailFlow {{version}} est prêt à être installé.", "notificationErrorTitle": "Échec de la recherche", "notificationInstallErrorTitle": "Échec de l’installation", "notificationInstallErrorBody": "La mise à jour vérifiée n’a pas pu être installée.",
-        "status": { "idle": "Prêt à rechercher des mises à jour.", "checking": "Recherche de mises à jour...", "up-to-date": "L’application est à jour.", "available": "Une version signée plus récente est disponible.", "downloading": "Téléchargement et vérification...", "downloaded": "La mise à jour est vérifiée et prête à installer.", "installing": "Redémarrage pour l’installation...", "error": "La mise à jour n’a pas pu être préparée.", "skipped": "Cette version est ignorée. Une version plus récente sera affichée automatiquement.", "deferred": "Cette mise à jour sera proposée à nouveau demain." },
-        "errors": { "genericError": "Le service de mise à jour est temporairement indisponible.", "downloadError": "La mise à jour n’a pas pu être téléchargée ou vérifiée.", "verificationError": "Le paquet a échoué à la vérification de sécurité.", "invalidRelease": "La dernière version n’utilise pas un numéro personnalisé valide.", "packagedOnly": "La recherche de mises à jour est disponible dans l’application installée." }
+        "title": "Mises à jour de l’application",
+        "autoCheck": "Rechercher automatiquement les mises à jour",
+        "currentVersion": "Version actuelle",
+        "latestVersion": "Dernière version",
+        "published": "Publication",
+        "size": "Taille du téléchargement",
+        "notes": "Notes de version",
+        "check": "Rechercher des mises à jour",
+        "download": "Télécharger la mise à jour",
+        "later": "Plus tard",
+        "skip": "Ignorer cette version",
+        "cancel": "Annuler",
+        "install": "Redémarrer et installer",
+        "installAndroid": "Installer",
+        "retry": "Réessayer",
+        "browser": "Télécharger dans le navigateur",
+        "notificationAvailableTitle": "Mise à jour disponible",
+        "notificationAvailableBody": "MailFlow {{version}} est prêt à être téléchargé.",
+        "notificationReadyTitle": "Mise à jour prête",
+        "notificationReadyBody": "MailFlow {{version}} est prêt à être installé.",
+        "notificationErrorTitle": "Échec de la recherche",
+        "notificationInstallErrorTitle": "Échec de l’installation",
+        "notificationInstallErrorBody": "La mise à jour vérifiée n’a pas pu être installée.",
+        "status": {
+          "idle": "Prêt à rechercher des mises à jour.",
+          "checking": "Recherche de mises à jour...",
+          "up-to-date": "L’application est à jour.",
+          "available": "Une version signée plus récente est disponible.",
+          "downloading": "Téléchargement et vérification...",
+          "downloaded": "La mise à jour est vérifiée et prête à installer.",
+          "installing": "Redémarrage pour l’installation...",
+          "error": "La mise à jour n’a pas pu être préparée.",
+          "skipped": "Cette version est ignorée. Une version plus récente sera affichée automatiquement.",
+          "deferred": "Cette mise à jour sera proposée à nouveau demain."
+        },
+        "errors": {
+          "genericError": "Le service de mise à jour est temporairement indisponible.",
+          "downloadError": "La mise à jour n’a pas pu être téléchargée ou vérifiée.",
+          "verificationError": "Le paquet a échoué à la vérification de sécurité.",
+          "invalidRelease": "La dernière version n’utilise pas un numéro personnalisé valide.",
+          "packagedOnly": "La recherche de mises à jour est disponible dans l’application installée."
+        }
       }
     },
     "search": {
@@ -1587,7 +1663,8 @@
     "rulesFiredTitle": "Règles déclenchées",
     "noRulesFired": "Aucune règle déclenchée",
     "mlTokensTitle": "Principaux tokens",
-    "noMlTokens": "Aucun token ML"
+    "noMlTokens": "Aucun token ML",
+    "conversationMovedToSpam": "Conversation déplacée dans le dossier Spam"
   },
   "contacts": {
     "title": "Contacts",
