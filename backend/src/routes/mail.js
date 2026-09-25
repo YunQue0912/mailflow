@@ -6,6 +6,8 @@ const archiver = require('archiver');
 import { query } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { imapManager } from '../index.js';
+import { extractImapError } from '../services/imapError.js';
+import { isConnectionRefusal } from '../services/imapManager.js';
 import { sanitizeEmail, stripEmailHead, hasRemoteImages, blockRemoteImages, rewriteEbayImageserUrls, rewriteAnchorHrefs } from '../services/emailSanitizer.js';
 import { snippetFromBody, decodeMimeWords, parseRawHeaders, buildHeadersFromMessage } from '../services/messageParser.js';
 import { resolveTrashFolder, resolveAllTrashPaths, resolveAllDraftsPaths, resolveArchiveFolder, isAllMailFolder, resolveSpamFolder, resolveAllSpamPaths, getDeleteStrategy, adjustFolderCounts, fanOutReadToSiblings, fanOutStarToSiblings, fanOutBulkReadToSiblings } from '../utils/mailUtils.js';
@@ -148,7 +150,6 @@ router.get('/messages', async (req, res) => {
   // WHERE clause in listMessages (even though it uses parameterised queries, belt-and-suspenders).
   const VALID_CATEGORIES = new Set(['primary', 'newsletter', 'promotion', 'automated', 'social']);
   const safeCategory = VALID_CATEGORIES.has(category) ? category : undefined;
-  const safeThreadScope = threadScope === 'all' ? 'all' : 'folder';
 
   const { messages, total, threaded: isThreaded, resolvedAccountId } = await listMessages({
     userId: req.session.userId,
@@ -158,7 +159,7 @@ router.get('/messages', async (req, res) => {
     offset,
     unreadOnly,
     threaded,
-    threadScope: safeThreadScope,
+    threadScope: threadScope === 'all' ? 'all' : 'folder',
     category: safeCategory,
   });
 
@@ -224,7 +225,7 @@ router.get('/resolve-message', async (req, res) => {
   const accountId = rawAccountId || null;
   const COLS = `m.id, m.uid, m.folder, m.message_id, m.subject,
              m.from_name, m.from_email, m.to_addresses, m.cc_addresses,
-             m.reply_to, m.in_reply_to,
+             m.reply_to, m.in_reply_to, m.thread_id,
              m.date, m.snippet, m.is_read, m.is_starred,
              m.has_attachments, m.account_id, m.category,
              m.list_unsubscribe, m.list_unsubscribe_post, m.unsubscribed_at, m.delivery_addresses,
@@ -297,11 +298,19 @@ router.get('/thread/:threadId', async (req, res) => {
 
     // Show all non-deleted messages in the thread regardless of folder. This includes
     // Sent replies (which have distinct message_ids) alongside received messages.
-    // The RFC Message-ID deduplicates copies across folders (e.g. Gmail's All Mail),
-    // while missing IDs fall back to the row ID so unrelated messages stay distinct.
+    // DISTINCT ON deduplicates the same message appearing in multiple folders (e.g. Gmail's
+    // All Mail), preferring the INBOX copy.
+    //
+    // The key is scoped to the account. One email delivered to two connected accounts is two
+    // separate mailbox items sharing a Message-ID, and a bare message_id key dropped one of
+    // them: the copy vanished from the conversation as well as from the grouped list, so in
+    // conversation mode it was not reachable anywhere in the UI (#476). Thunderbird puts both
+    // copies in the one thread here, keyed by Message-ID and explicitly folder- and
+    // account-agnostic for THREADING while still listing each copy, which is the behavior this
+    // matches. Same-account duplicates (All Mail, the Sent twin) still collapse.
     const result = await query(`
       WITH deduped AS (
-        SELECT DISTINCT ON (COALESCE(NULLIF(m.message_id, ''), m.id::text))
+        SELECT DISTINCT ON (m.account_id, COALESCE(NULLIF(m.message_id, ''), m.id::text))
                m.id, m.uid, m.folder, m.message_id, m.thread_id, m.subject,
                m.from_name, m.from_email, m.to_addresses, m.cc_addresses,
                m.reply_to, m.in_reply_to,
@@ -315,11 +324,14 @@ router.get('/thread/:threadId', async (req, res) => {
         WHERE m.is_deleted = false
           AND m.account_id = ANY($1)
           AND m.thread_key = $2
-        ORDER BY COALESCE(NULLIF(m.message_id, ''), m.id::text),
+        ORDER BY m.account_id,
+                 COALESCE(NULLIF(m.message_id, ''), m.id::text),
                  CASE WHEN m.folder = 'INBOX' THEN 0 ELSE 1 END,
                  m.date ASC
       )
-      SELECT * FROM deduped ORDER BY date ASC
+      -- account_id, id break the tie: two accounts' copies of one email carry the same Date,
+      -- so date alone would order them arbitrarily between requests.
+      SELECT * FROM deduped ORDER BY date ASC, account_id, id
     `, [accountIds, threadId]);
 
     res.json({ messages: result.rows });
@@ -448,7 +460,7 @@ router.get('/messages/:id/body', async (req, res) => {
       responseHtml = blockRemoteImages(html);
       hasBlockedRemoteImages = true;
     }
-    return res.json({ html: responseHtml, text: message.body_text, attachments, hasBlockedRemoteImages, senderEmail: message.sender_email, senderName: message.sender_name });
+    return res.json({ html: responseHtml, text: message.body_text, attachments, hasBlockedRemoteImages, senderEmail: message.sender_email, senderName: message.sender_name, forwardedFromEmail: message.forwarded_from_email, forwardedFromName: message.forwarded_from_name, forwardedVia: message.forwarded_via });
   }
 
   // Fetch from IMAP — signal user activity so background jobs back off during this request.
@@ -487,7 +499,7 @@ router.get('/messages/:id/body', async (req, res) => {
       responseHtml = blockRemoteImages(safeHtml);
       hasBlockedRemoteImages = true;
     }
-    res.json({ html: responseHtml, text: safeText, attachments: attachments || [], hasBlockedRemoteImages, senderEmail: message.sender_email, senderName: message.sender_name });
+    res.json({ html: responseHtml, text: safeText, attachments: attachments || [], hasBlockedRemoteImages, senderEmail: message.sender_email, senderName: message.sender_name, forwardedFromEmail: message.forwarded_from_email, forwardedFromName: message.forwarded_from_name, forwardedVia: message.forwarded_via });
   } catch (err) {
     const msg = err.message || 'Unknown error';
     console.error('Body fetch error:', msg);
@@ -503,6 +515,24 @@ router.get('/messages/:id/body', async (req, res) => {
       return res.status(504).json({
         error: 'This message is taking too long to load — the mail server may be temporarily unreachable. Please try again.',
         timeout: true,
+      });
+    }
+    // Our own connection budget, not the provider's. Saying so beats a generic 500:
+    // the account is busy, the request is worth retrying, and nothing is broken.
+    // The provider itself is refusing additional connections (Yahoo's per-account session
+    // ceiling, #474). Distinct from poolExhausted below, which is OUR budget: here nothing
+    // MailFlow does right now will make the request succeed, so say what is happening and
+    // that MailFlow is already backing off, instead of the raw server string.
+    if (err.providerRefusing || isConnectionRefusal(msg)) {
+      return res.status(503).json({
+        error: 'The mail server is limiting connections for this account. MailFlow is backing off and will retry automatically; please try again shortly.',
+        providerLimited: true,
+      });
+    }
+    if (err.poolExhausted) {
+      return res.status(503).json({
+        error: 'This account is busy with other mail operations. Please try again in a moment.',
+        busy: true,
       });
     }
     res.status(500).json({ error: msg });
@@ -538,15 +568,20 @@ router.get('/messages/:id/headers', async (req, res) => {
       headers = buildHeadersFromMessage(message);
     }
 
+    // This exists only to REPAIR a subject we never stored, so it is gated on the stored one
+    // being missing. It used to re-derive the subject every time and hand it back
+    // unconditionally; MessageHeaderModal pushes that value up through onSubjectResolved, so
+    // any flaw in header decoding silently rewrote the list and the open message with a worse
+    // value than the one already on screen. That is how #454 became visible. Never replacing
+    // a subject we already have keeps a decoding bug contained to this modal.
     let resolvedSubject = message.subject;
-    if (headers?.trim()) {
+    const storedSubjectMissing = !message.subject || message.subject === '(no subject)';
+    if (storedSubjectMissing && headers?.trim()) {
       const parsed = parseRawHeaders(headers);
       const imapSubject = decodeMimeWords(parsed.subject || '').trim();
       if (imapSubject && imapSubject !== '(no subject)') {
         resolvedSubject = imapSubject;
-        if (!message.subject || message.subject === '(no subject)') {
-          await query('UPDATE messages SET subject = $1 WHERE id = $2', [imapSubject, id]);
-        }
+        await query('UPDATE messages SET subject = $1 WHERE id = $2', [imapSubject, id]);
       }
     }
 
@@ -1138,7 +1173,7 @@ router.post('/messages/bulk-read', async (req, res) => {
       );
       results.forEach((r, i) => {
         if (r.status === 'rejected') {
-          console.error(`bulk-read IMAP ${msgs[i].id}:`, r.reason.message);
+          console.error(`bulk-read IMAP ${msgs[i].id}:`, extractImapError(r.reason));
           // Durable retry so a later flag-sync pull can't revert this message to unread.
           imapManager._enqueueFlagPush(accountId, msgs[i].id, '\\Seen', read);
         } else {
@@ -1564,6 +1599,43 @@ router.post('/messages/bulk-move', async (req, res) => {
     res.status(500).json({ error: 'Failed to move messages' });
   } finally {
     for (const g of moveGuards) imapManager._unguardMoveUid(g.accountId, g.folder, g.uid);
+  }
+});
+
+// Copy into a selectable account-owned folder.
+router.post('/messages/:id/copy', async (req, res) => {
+  const { id } = req.params;
+  const { folder } = req.body || {};
+  if (!areValidUUIDs([id]) || !isValidFolderName(folder)) {
+    return res.status(400).json({ error: 'Invalid message or folder' });
+  }
+  const source = await query(`
+    SELECT m.id, m.account_id, m.uid, m.folder, a.folder_mappings
+    FROM messages m JOIN email_accounts a ON a.id = m.account_id
+    WHERE m.id = $1 AND a.user_id = $2 AND a.enabled = true AND m.is_deleted = false
+  `, [id, req.session.userId]);
+  const message = source.rows[0];
+  if (!message) return res.status(404).json({ error: 'Message not found' });
+  const destination = await query(`
+    SELECT path, name, special_use FROM folders
+    WHERE account_id = $1 AND path = $2 AND no_select = false
+  `, [message.account_id, folder]);
+  const target = destination.rows[0];
+  if (!target || message.folder === folder) return res.status(400).json({ error: 'Folder is not a copy target' });
+  const special = String(target.special_use || '').replaceAll('\\', '').toLowerCase();
+  const system = new Set(['inbox', 'sent', 'drafts', 'trash', 'junk', 'spam', 'archive', 'all', 'flagged']);
+  const names = new Set(['inbox', 'sent', 'drafts', 'trash', 'spam', 'junk', 'archive', 'all mail', 'starred', 'important']);
+  const mapped = Object.values(message.folder_mappings || {}).includes(folder);
+  if (system.has(special) || names.has(String(target.name || '').toLowerCase()) || mapped) {
+    return res.status(400).json({ error: 'System folder is not a label target' });
+  }
+  try {
+    const uid = await imapManager.copyMessage(message.account_id, message.uid, message.folder, folder);
+    imapManager.broadcast?.({ type: 'folder_updated', folder, accountId: message.account_id }, req.session.userId);
+    res.json({ ok: true, uid });
+  } catch (error) {
+    console.error('Message copy failed:', error.message);
+    res.status(502).json({ error: 'Could not copy message' });
   }
 });
 

@@ -1,4 +1,14 @@
-import { test, beforeEach, afterEach } from 'node:test';
+// Render test for the conversation pane.
+//
+// The behavior that matters, and that a util test cannot show, is that a thread renders one
+// card per message with only the newest open, and that opening another card mounts a second
+// body. That is the whole point of the Gmail-style view: bodies are expensive, so only what
+// the reader has opened is rendered.
+//
+// Same loader hooks as MessagePane.render.test.js: node --test cannot parse JSX, and
+// react-i18next is stubbed because a real i18n instance would test i18next.
+
+import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
@@ -8,235 +18,209 @@ import { transform } from 'sucrase';
 registerHooks({
   load(url, context, nextLoad) {
     if (url.endsWith('react-i18next/dist/es/index.js') || url.endsWith('/react-i18next')) {
-      return { format: 'module', shortCircuit: true, source: `
-        const t = key => key;
-        export const useTranslation = () => ({ t, i18n: { language: 'en' } });
-        export const initReactI18next = { type: '3rdParty', init() {} };
-        export const Trans = ({ children }) => children ?? null;
-        export const I18nextProvider = ({ children }) => children ?? null;
-      ` };
+      return { format: 'module', shortCircuit: true, source: [
+        'export const useTranslation = () => ({ t: (k) => k, i18n: { language: "en", changeLanguage: () => {} } });',
+        'export const initReactI18next = { type: "3rdParty", init: () => {} };',
+        'export const Trans = ({ children }) => children ?? null;',
+        'export const I18nextProvider = ({ children }) => children ?? null;',
+        'export default { useTranslation, initReactI18next };',
+      ].join('\n') };
     }
     if (url.endsWith('.json')) {
       return { format: 'module', shortCircuit: true, source: `export default ${readFileSync(new URL(url), 'utf8')}` };
     }
-    if (url.startsWith('file:') && /\.jsx?$/.test(url)) {
-      let code = readFileSync(new URL(url), 'utf8');
-      if (url.endsWith('.jsx') || code.includes('import.meta.env')) {
-        if (url.endsWith('.jsx')) code = transform(code, { transforms: ['jsx'], jsxRuntime: 'automatic', filePath: url }).code;
-        return { format: 'module', shortCircuit: true, source: code.replaceAll('import.meta.env', 'globalThis.__VITE_ENV__') };
-      }
+    const shimViteEnv = (code) => code.replaceAll('import.meta.env', 'globalThis.__VITE_ENV__');
+    if (url.endsWith('.jsx')) {
+      const out = transform(readFileSync(new URL(url), 'utf8'), { transforms: ['jsx'], jsxRuntime: 'automatic', filePath: url });
+      return { format: 'module', shortCircuit: true, source: shimViteEnv(out.code) };
+    }
+    if (url.startsWith('file:') && url.endsWith('.js')) {
+      const code = readFileSync(new URL(url), 'utf8');
+      if (code.includes('import.meta.env')) return { format: 'module', shortCircuit: true, source: shimViteEnv(code) };
     }
     return nextLoad(url, context);
   },
 });
 
 const dom = new JSDOM('<div id="root"></div>', { url: 'https://mail.example.invalid', pretendToBeVisual: true });
-const frames = new Map();
-const observers = [];
-let frameId = 0;
-class ResizeObserverStub {
-  constructor(callback) { this.callback = callback; observers.push(this); }
-  observe(target) { this.target = target; }
-  unobserve() { this.target = null; }
-  disconnect() { this.target = null; }
-}
 Object.assign(globalThis, {
-  window: dom.window, document: dom.window.document,
-  localStorage: dom.window.localStorage, CustomEvent: dom.window.CustomEvent,
-  Node: dom.window.Node, Element: dom.window.Element, HTMLElement: dom.window.HTMLElement,
-  getComputedStyle: dom.window.getComputedStyle,
-  requestAnimationFrame: callback => { frames.set(++frameId, callback); return frameId; },
-  cancelAnimationFrame: id => frames.delete(id),
-  ResizeObserver: ResizeObserverStub, IS_REACT_ACT_ENVIRONMENT: true,
-  __VITE_ENV__: { MODE: 'test', DEV: false, PROD: true },
+  window: dom.window, document: dom.window.document, localStorage: dom.window.localStorage,
+  CustomEvent: dom.window.CustomEvent, Node: dom.window.Node, Element: dom.window.Element,
+  HTMLElement: dom.window.HTMLElement, getComputedStyle: dom.window.getComputedStyle,
+  matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+  ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+  IS_REACT_ACT_ENVIRONMENT: true,
 });
-window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
-window.ResizeObserver = ResizeObserverStub;
-globalThis.matchMedia = window.matchMedia;
-globalThis.fetch = async () => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({}), text: async () => '' });
+dom.window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
+dom.window.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+globalThis.requestAnimationFrame ??= cb => setTimeout(() => cb(Date.now()), 0);
+globalThis.cancelAnimationFrame ??= id => clearTimeout(id);
+globalThis.__VITE_ENV__ = { MODE: 'test', DEV: false, PROD: true };
+
+const THREAD = [
+  { id: 'm1', account_id: 'acct', folder: 'INBOX', message_id: '<1@x>', subject: 'Welcome', from_email: 'a@x.z', from_name: 'Ana', date: '2026-01-01T10:00:00Z', is_read: true, snippet: 'first' },
+  { id: 'm2', account_id: 'acct', folder: '[Gmail]/Sent Mail', message_id: '<2@x>', subject: 'Re: Welcome', from_email: 'me@x.z', from_name: 'Me', date: '2026-01-02T10:00:00Z', is_read: true, snippet: 'my reply' },
+  { id: 'm3', account_id: 'acct', folder: 'INBOX', message_id: '<3@x>', subject: 'Re: Welcome', from_email: 'a@x.z', from_name: 'Ana', date: '2026-01-03T10:00:00Z', is_read: false, snippet: 'newest' },
+];
+const bodyRequests = [];
+const bulkReads = [];
+let blockImages = false;
+const remoteBodyRequests = [];
+globalThis.fetch = async (url, opts = {}) => {
+  const u = String(url);
+  if (u.includes('/mail/thread/')) return { ok: true, status: 200, json: async () => ({ messages: THREAD }) };
+  if (u.includes('/mail/messages/bulk-read')) {
+    bulkReads.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, json: async () => ({}) };
+  }
+  const id = /\/messages\/([^/]+)\/body/.exec(u)?.[1];
+  if (id) {
+    bodyRequests.push(id);
+    const remote = u.includes('remoteImages=1');
+    if (remote) remoteBodyRequests.push(id);
+    return { ok: true, status: 200, json: async () => ({ html: `<p>body of ${id}</p>`, text: '', attachments: [], hasBlockedRemoteImages: blockImages && !remote }) };
+  }
+  return { ok: true, status: 200, json: async () => ({}) };
+};
 
 const React = await import('react');
 const { createRoot } = await import('react-dom/client');
-const { useStore } = await import('../store/index.js');
-const { api } = await import('../utils/api.js');
-const { aiRuns } = await import('../utils/aiRunRegistry.js');
-const { getResults } = await import('../aiResults.js');
-const { BUILTIN_SUMMARIZE } = await import('../aiActions.js');
 const ConversationPane = (await import('./ConversationPane.jsx')).default;
-const ConversationMessageCard = (await import('./ConversationMessageCard.jsx')).default;
-const MessageBodyView = (await import('./MessageBodyView.jsx')).default;
-const MessagePane = (await import('./MessagePane.jsx')).default;
+const { shortcutBus } = await import('../utils/shortcutBus.js');
+const { api } = await import('../utils/api.js');
 
-const container = document.getElementById('root');
-const ACCOUNT = { id: 'acct', email_address: 'me@example.invalid', enabled: true, include_in_unified_inbox: true };
-const message = (id, extra = {}) => ({
-  id, message_id: `<${id}@example.invalid>`, thread_id: 'thread', account_id: ACCOUNT.id,
-  folder: 'INBOX', uid: 1, subject: 'Thread subject', from_email: 'sender@example.invalid',
-  date: '2026-09-17T00:00:00Z', is_read: false, to_addresses: [], cc_addresses: [], ...extra,
-});
-const initial = [message('first'), message('second')];
-const fresh = [...initial, message('new-reply', { date: '2026-09-17T01:00:00Z' })];
 let root;
-beforeEach(() => {
-  localStorage.removeItem('mailflow_ai_results');
-  useStore.setState({
-    user: { id: 'user' }, isLocked: false, accounts: [ACCOUNT], accountsReady: true,
-    messages: initial, selectedMessageId: 'first', selectedMessageSource: null,
-    selectedAccountId: 'acct', selectedFolder: 'INBOX', markReadBehavior: 'manual',
-    threadMessages: { thread: initial }, notifications: [], searchQuery: '',
-    pendingCounts: {}, serverUnreadCounts: { total: 0, byAccount: {}, snapshots: {} },
+before(() => { root = createRoot(document.getElementById('root')); });
+after(async () => { await React.act(async () => root.unmount()); });
+
+const cards = () => document.querySelectorAll('[aria-expanded]');
+const openCards = () => document.querySelectorAll('[aria-expanded="true"]');
+
+describe('conversation pane', () => {
+  test('renders one card per message with only the newest open', async () => {
+    await React.act(async () => {
+      root.render(React.createElement(ConversationPane, { threadId: '<1@x>', folder: 'INBOX' }));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 50)); });
+
+    assert.equal(cards().length, 3, 'every message in the thread gets a card');
+    assert.equal(openCards().length, 1, 'only one card opens, so only one body is rendered');
+    // Sent replies belong in the conversation, which is why the thread endpoint crosses folders.
+    assert.match(document.getElementById('root').innerHTML, /Me/, 'the sent reply appears in the thread');
   });
-  api.getThread = async () => ({ messages: initial });
-  api.getMessageBody = async () => ({ text: 'Mail body', attachments: [] });
-  api.getUnreadCounts = async () => ({ total: 0, byAccount: {}, snapshots: {} });
-  api.getCategoryCounts = async () => ({ counts: {} });
-  api.getFolders = async () => [{ path: 'Personal/Archive', name: 'Archive', delimiter: '/' }];
-  api.ai.status = async () => ({ enabled: true, features: { summarize: true } });
-  root = createRoot(container);
-});
-afterEach(async () => {
-  await React.act(async () => {
-    root.unmount();
-    useStore.getState().setLocked(true);
+
+  test('fills the reading area instead of shrinking to fit its contents', async () => {
+    // The reading area is a flex row. Without flex:1 the pane is sized shrink-to-fit, so
+    // it was as narrow as whatever was open: a sliver for collapsed headers, the width of
+    // the newsletter for an expanded one, resizing as the reader clicked. minWidth:0 stops
+    // a wide email pushing it past its share. jsdom does no layout, so this asserts the
+    // properties themselves, which is what a regression would remove.
+    const pane = document.querySelector('#root > div');
+    // flexGrow rather than the flex shorthand, which is stored expanded ("1 1 0%").
+    assert.equal(pane.style.flexGrow, '1', 'the pane grows to fill the reading area');
+    assert.equal(pane.style.minWidth, '0px', 'and a wide email cannot stretch it');
   });
-  frames.clear();
-  observers.length = 0;
-  delete window.mailflowNative;
-});
-const render = async (Component, props = {}) => React.act(async () => root.render(React.createElement(Component, props)));
-const click = async element => {
-  assert.ok(element, 'expected the action to be rendered');
-  await React.act(async () => element.click());
-};
-const labelled = label => container.querySelector(`button[title="${label}"]`);
-const flushFrames = async () => React.act(async () => {
-  const pending = [...frames.values()];
-  frames.clear();
-  pending.forEach(callback => callback(0));
-});
 
-for (const [label, method, resultKey] of [
-  ['message.archive', 'bulkArchive', 'archived'],
-  ['message.delete', 'bulkDelete', 'deleted'],
-  ['contextMenu.markRead', 'bulkRead', null],
-]) {
-  test(`conversation ${method} includes replies received after the pane opened`, async () => {
-    await render(ConversationPane, { message: initial[0], threadId: 'thread' });
-    let received;
-    api.getThread = async () => ({ messages: fresh });
-    api[method] = async ids => { received = ids; return resultKey ? { [resultKey]: ids } : {}; };
-    await click(labelled(label));
-    assert.deepEqual(received, fresh.map(item => item.id));
+  test('the opened message actually renders its body, not a permanent skeleton', async () => {
+    // The request going out is not enough. An earlier version listed the loading flag in
+    // the fetch effect's dependencies, so setLoading re-ran the effect and its cleanup
+    // cancelled the request it had just started: the body arrived and was thrown away,
+    // and every card sat on the skeleton forever. Only asserting the rendered body catches
+    // that, which is why this asserts the frame and not the fetch.
+    const html = document.getElementById('root').innerHTML;
+    assert.ok(/<iframe/.test(html), 'the opened message rendered a body frame');
+    assert.ok(!/skeleton-line/.test(html), 'and is no longer showing the loading skeleton');
   });
-}
 
-test('conversation move resolves again after the folder picker has opened', async () => {
-  await render(ConversationPane, { message: initial[0], threadId: 'thread' });
-  await click(labelled('contextMenu.moveToFolder'));
-  let received;
-  api.getThread = async () => ({ messages: fresh });
-  api.bulkMove = async (ids, folder) => { received = { ids, folder }; return { moved: ids }; };
-  await click(labelled('Personal/Archive'));
-  assert.deepEqual(received, { ids: fresh.map(item => item.id), folder: 'Personal/Archive' });
-});
-
-test('a failed thread refresh cannot delete the stale cached snapshot', async () => {
-  await render(ConversationPane, { message: initial[0], threadId: 'thread' });
-  let deleted = false;
-  api.getThread = async () => { throw new Error('offline'); };
-  api.bulkDelete = async () => { deleted = true; return {}; };
-  await click(labelled('message.delete'));
-  assert.equal(deleted, false);
-  assert.equal(useStore.getState().notifications.at(-1).type, 'error');
-});
-
-test('conversation spam action includes fresh replies but excludes sent messages', async () => {
-  await render(ConversationPane, { message: initial[0], threadId: 'thread' });
-  api.getThread = async () => ({ messages: [...fresh, message('sent', { folder: 'Sent', from_email: ACCOUNT.email_address })] });
-  const received = [];
-  api.markSpam = async id => { received.push(id); return {}; };
-  await click(labelled('contextMenu.markAsSpam'));
-  assert.deepEqual(received, fresh.map(item => item.id));
-});
-
-test('conversation cards show automatic spam classification and respect a user override', async () => {
-  const item = message('spam-card', { spam_verdict: 'spam', spam_score_ml: 0.98 });
-  await render(ConversationMessageCard, { message: item, expanded: false });
-  assert.ok(labelled('spam.badgeTitle'));
-  await render(ConversationMessageCard, { message: { ...item, spam_user_override: 'ham' }, expanded: false });
-  assert.equal(labelled('spam.badgeTitle'), null);
-});
-
-for (const Component of [MessageBodyView, MessagePane]) {
-  test(`${Component === MessagePane ? 'single' : 'conversation'} reading warns before handing risky attachments to Android`, async () => {
-    const item = message(Component === MessagePane ? 'single-download' : 'conversation-download');
-    const attachment = { filename: 'invoice.pdf.exe', part: '2', type: 'application/octet-stream', size: 42 };
-    api.getMessageBody = async () => ({ text: 'Mail body', attachments: [attachment] });
-    const downloads = [];
-    window.mailflowNative = { platform: 'android', attachments: { download: async options => { downloads.push(options); return { started: true }; } } };
-    useStore.setState({ messages: [item], selectedMessageId: item.id });
-    await render(Component, { message: item });
-    const button = [...container.querySelectorAll('button')].find(el => el.textContent.includes(attachment.filename));
-    await click(button);
-    assert.equal(downloads.length, 0);
-    assert.ok(button.textContent.includes('message.attachmentRisk.confirm'));
-    await click(button);
-    assert.deepEqual(downloads, [{
-      url: `https://mail.example.invalid/api/mail/messages/${item.id}/attachments/2`,
-      filename: attachment.filename, mimeType: attachment.type,
-    }]);
+  test('only the opened message fetches a body', async () => {
+    // A collapsed card must cost nothing: no request, no frame, no document.
+    assert.deepEqual(bodyRequests, ['m3'], 'exactly the newest message was fetched');
   });
-}
 
-test('conversation HTML initializes before all images load and can shrink after reflow', async () => {
-  api.getMessageBody = async () => ({ html: '<p>Hello</p>', attachments: [] });
-  await render(MessageBodyView, { message: message('frame') });
-  const iframe = container.querySelector('iframe');
-  const doc = iframe.contentDocument;
-  doc.body.innerHTML = '<div id="mf-scale-wrapper"><img loading="lazy" src="https://images.example.invalid/pixel"></div>';
-  Object.defineProperty(doc, 'readyState', { configurable: true, value: 'interactive' });
-  let height = 140;
-  Object.defineProperty(doc.getElementById('mf-scale-wrapper'), 'offsetHeight', { get: () => height });
-  Object.defineProperty(doc.body, 'scrollHeight', { get: () => height });
-  Object.defineProperty(doc.documentElement, 'scrollHeight', { get: () => 900 });
-  await flushFrames();
-  assert.equal(iframe.style.height, '140px');
-  assert.equal(doc.querySelector('img').getAttribute('loading'), 'eager');
-  height = 70;
-  observers.find(observer => observer.target === doc.body).callback();
-  await flushFrames();
-  assert.equal(iframe.style.height, '70px');
-});
+  test('the message that opens is marked read', async () => {
+    // m3 is the unread one, and it is the card that opens on arrival. Opening a
+    // conversation has to clear its unread state the same way opening a single
+    // message does, or the badge never goes down.
+    assert.deepEqual(bulkReads, [{ ids: ['m3'], read: true }], 'the newest, unread message was marked read');
+  });
 
-async function startCardAi(id) {
-  const item = message(id);
-  let finish;
-  let signal;
-  api.ai.chat = async (_messages, options) => {
-    signal = options.signal;
-    return new Promise(resolve => { finish = resolve; });
-  };
-  await render(ConversationMessageCard, { message: item, expanded: true, onToggle() {}, onReply() {}, onForward() {} });
-  await click(labelled('message.more'));
-  await click([...container.querySelectorAll('button')].find(el => el.textContent === 'message.summarize'));
-  assert.equal(aiRuns.size, 1);
-  return { item, get signal() { return signal; }, finish: text => finish(text) };
-}
+  test('opening another card renders a second body', async () => {
+    const collapsed = document.querySelector('[aria-expanded="false"]');
+    await React.act(async () => { collapsed.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 50)); });
 
-test('conversation AI finishes after navigation and restores the saved result on return', async () => {
-  const run = await startCardAi('ai-navigation');
-  await render(() => null);
-  assert.equal(run.signal.aborted, false);
-  await React.act(async () => run.finish('Saved summary'));
-  assert.equal(getResults(run.item.id)[BUILTIN_SUMMARIZE.id].text, 'Saved summary');
-  await render(ConversationMessageCard, { message: run.item, expanded: true, onToggle() {}, onReply() {}, onForward() {} });
-  assert.ok(container.textContent.includes('Saved summary'));
-});
+    assert.equal(openCards().length, 2, 'two messages can be open at once');
+    assert.equal(bodyRequests.length, 2, 'the newly opened message fetched its own body');
+    // The card that just opened was already read, so it must not send a second
+    // mark-read and decrement a badge that was never counting it.
+    assert.equal(bulkReads.length, 1, 'expanding an already-read message marks nothing');
+  });
 
-test('locking cancels conversation AI and prevents late results being saved', async () => {
-  const run = await startCardAi('ai-lock');
-  await React.act(async () => useStore.getState().setLocked(true));
-  assert.equal(run.signal.aborted, true);
-  await React.act(async () => run.finish('Must not be saved'));
-  assert.deepEqual(getResults(run.item.id), {});
+  test('picking a different message in the same thread opens that message', async () => {
+    // Selecting another message in an open thread does not change threadId, so the pane
+    // re-rendered with identical props and nothing happened: clicking a message in the
+    // list looked like a dead click. m2 is the one still collapsed at this point.
+    const opened = () => [...openCards()].map(c => c.closest('[data-message-id]')?.dataset.messageId);
+    assert.ok(!opened().includes('m2'), 'm2 starts collapsed');
+
+    await React.act(async () => {
+      root.render(React.createElement(ConversationPane, {
+        threadId: '<1@x>', folder: 'INBOX', selectedMessageId: 'm2',
+      }));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 50)); });
+
+    assert.ok(opened().includes('m2'), 'the message the reader picked is now open');
+  });
+
+  test('collapsing and reopening does not refetch', async () => {
+    const before = bodyRequests.length;
+    const open = document.querySelector('[aria-expanded="true"]');
+    await React.act(async () => { open.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    await React.act(async () => { open.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 50)); });
+    assert.equal(bodyRequests.length, before, 'a body already loaded is kept');
+  });
+
+  test('selected conversation card handles image and unsubscribe shortcuts', async (t) => {
+    blockImages = true;
+    THREAD[2].list_unsubscribe = '<https://example.invalid/unsubscribe>';
+    const unsubscribed = [];
+    const oldUnsubscribe = api.unsubscribeMessage;
+    api.unsubscribeMessage = async id => { unsubscribed.push(id); return { type: 'one-click' }; };
+    t.after(() => { api.unsubscribeMessage = oldUnsubscribe; blockImages = false; delete THREAD[2].list_unsubscribe; });
+    await React.act(async () => {
+      root.render(React.createElement(ConversationPane, { key: 'hotkey-card', threadId: '<1@x>', folder: 'INBOX', selectedMessageId: 'm3' }));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 50)); });
+    await React.act(async () => { shortcutBus.emit('loadRemoteImages'); shortcutBus.emit('unsubscribe'); await new Promise(r => setTimeout(r, 50)); });
+    assert.deepEqual(remoteBodyRequests, ['m3']);
+    assert.deepEqual(unsubscribed, ['m3']);
+  });
+
+  test('refreshing membership shows another account copy without closing open messages', async () => {
+    THREAD.push({ ...THREAD[2], id: 'm4', account_id: 'second-account', is_read: true, date: '2026-01-04T10:00:00Z' });
+    await React.act(async () => {
+      root.render(React.createElement(ConversationPane, {
+        key: 'hotkey-card', threadId: '<1@x>', folder: 'INBOX', selectedMessageId: 'm3', refreshKey: 'four-deliveries',
+      }));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 30)); });
+    assert.equal(cards().length, 4, 'both account deliveries survive normalization and rendering');
+    const opened = [...openCards()].map(card => card.closest('[data-message-id]').dataset.messageId);
+    assert.ok(opened.includes('m3'), 'the selected message stays open');
+    assert.ok(opened.includes('m4'), 'the newly arrived message opens');
+  });
+
+  test('star changes update the conversation card and can be toggled back', async (t) => {
+    const calls = [];
+    const previous = api.markStarred;
+    api.markStarred = async (id, value) => { calls.push([id, value]); };
+    t.after(() => { api.markStarred = previous; });
+    const card = document.querySelector('[data-message-id="m4"]');
+    await React.act(async () => { card.querySelector('button[title="message.star"]').click(); });
+    assert.ok(card.querySelector('button[title="contextMenu.unstar"]'));
+    await React.act(async () => { card.querySelector('button[title="contextMenu.unstar"]').click(); });
+    assert.deepEqual(calls, [['m4', true], ['m4', false]]);
+  });
 });

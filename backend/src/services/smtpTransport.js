@@ -65,6 +65,7 @@ export function createSmtpTransport(resolved, transportOptions, createTransport 
     }),
   };
 }
+
 export async function createAccountSmtpTransport(inputAccount) {
   let account = inputAccount;
   const refreshers = { microsoft: refreshMicrosoftToken, google: refreshGoogleToken };

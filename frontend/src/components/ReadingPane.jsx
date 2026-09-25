@@ -1,25 +1,55 @@
 import { useStore } from '../store/index.js';
+import { resolveConversationMode } from '../utils/conversationMode.js';
 import { resolveConversationSelection, shouldUseConversationPane } from '../utils/conversation.js';
-import MessagePane from './MessagePane.jsx';
 import ConversationPane from './ConversationPane.jsx';
+import MessagePane from './MessagePane.jsx';
 
+// Chooses what the reading area shows.
+//
+// In 'pane' mode a selected row opens its whole conversation; in every other mode it opens
+// the single message, exactly as before. The thread is taken from the selected message
+// rather than tracked separately, so selecting a row needs no new behavior in MessageList.
+//
+// Pop-out windows deliberately keep MessagePane: a pop-out is one message by definition.
+//
+// Design from #317 by YunQue0912.
 export default function ReadingPane() {
-  const selectedMessageId = useStore(state => state.selectedMessageId);
-  const messages = useStore(state => state.messages);
-  const searchResults = useStore(state => state.searchResults);
-  const searchQuery = useStore(state => state.searchQuery);
-  const threadMessages = useStore(state => state.threadMessages);
-  const conversationMode = useStore(state => state.conversationMode);
-  const pool = searchQuery.trim() ? searchResults : messages;
-  const { selectedMessage, conversationMessage, refreshKey } = resolveConversationSelection({
+  const conversationMode = useStore(s => s.conversationMode);
+  const selectedMessageId = useStore(s => s.selectedMessageId);
+  const messages = useStore(s => s.messages);
+  const searchResults = useStore(s => s.searchResults);
+  const selectedFolder = useStore(s => s.selectedFolder);
+  const selectedAccountId = useStore(s => s.selectedAccountId);
+  const searchQuery = useStore(s => s.searchQuery);
+  const threadMessages = useStore(s => s.threadMessages);
+
+  const mode = resolveConversationMode({ conversationMode });
+  if (!selectedMessageId) return <MessagePane />;
+
+  // threadMessages is consulted too, because a message opened from a deep link or a
+  // notification tap is parked there and never enters the list: looking only at the list
+  // meant those always fell back to the single-message pane.
+  const { selectedMessage: selected, refreshKey } = resolveConversationSelection({
     selectedMessageId,
-    pool,
-    threadMessages,
+    pool: [...(messages || []), ...(searchResults || [])],
+    threadMessages: threadMessages || {},
   });
 
-  if (!selectedMessage || !shouldUseConversationPane({ mode: conversationMode, searchQuery, message: conversationMessage })) {
-    return <MessagePane />;
-  }
+  // A message with no thread of its own is just a message, and a search deliberately shows
+  // the one matched message rather than its conversation.
+  if (!shouldUseConversationPane({ mode, searchQuery, message: selected })) return <MessagePane />;
 
-  return <ConversationPane key={conversationMessage.thread_id} message={conversationMessage} threadId={conversationMessage.thread_id} refreshKey={refreshKey} />;
+  return (
+    <ConversationPane
+      key={selected.thread_id}
+      threadId={selected.thread_id}
+      refreshKey={refreshKey}
+      folder={selectedFolder}
+      unified={!selectedAccountId}
+      // Which message the reader picked. Selecting a different message inside the same
+      // thread does not change threadId, so without this the pane had no way to know a
+      // click had happened and nothing opened.
+      selectedMessageId={selectedMessageId}
+    />
+  );
 }

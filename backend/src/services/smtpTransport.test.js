@@ -98,6 +98,7 @@ describe('createSmtpTransport', () => {
     expect(isPreDeliveryConnectionError(new Error('timeout'))).toBe(false);
   });
 });
+
 describe('createAccountSmtpTransport', () => {
   beforeEach(() => {
     vi.clearAllMocks();
