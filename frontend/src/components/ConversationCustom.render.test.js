@@ -76,6 +76,7 @@ const message = (id, extra = {}) => ({
 const initial = [message('first'), message('second')];
 let root;
 beforeEach(() => {
+  window.innerWidth = 1024;
   localStorage.removeItem('mailflow_ai_results');
   useStore.setState({
     user: { id: 'user' }, isLocked: false, accounts: [ACCOUNT], accountsReady: true,
@@ -109,6 +110,27 @@ const click = async element => {
 const labelled = label => container.querySelector(`button[title="${label}"]`);
 
 for (const Component of [ConversationMessageCard, MessagePane]) {
+  for (const width of [480, 1024]) {
+  test(`${Component === MessagePane ? 'single' : 'conversation'} reading at width ${width} downloads original EML through Android`, async () => {
+    window.innerWidth = width;
+    const item = message('11111111-1111-4111-8111-111111111111');
+    const downloads = [];
+    window.mailflowNative = { platform: 'android', attachments: { download: async options => { downloads.push(options); return { started: true }; } } };
+    useStore.setState({ messages: [item], selectedMessageId: item.id });
+    await render(Component, { message: item, expanded: true, onToggle() {} });
+    if (Component === MessagePane && width >= 768) {
+      await click(labelled('message.downloadEml'));
+    } else {
+      await click(labelled('message.more'));
+      await click([...container.querySelectorAll('button, div')].find(el => el.textContent === 'message.downloadEml'));
+    }
+    assert.deepEqual(downloads, [{
+      url: `https://mail.example.invalid/api/mail/messages/${item.id}/raw.eml`,
+      filename: `message-${item.id}.eml`, mimeType: 'message/rfc822',
+    }]);
+  });
+  }
+
   test(`${Component === MessagePane ? 'single' : 'conversation'} reading warns before handing risky attachments to Android`, async () => {
     const item = message(Component === MessagePane ? 'single-download' : 'conversation-download');
     const attachment = { filename: 'invoice.pdf.exe', part: '2', type: 'application/octet-stream', size: 42 };

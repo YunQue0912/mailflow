@@ -14,7 +14,7 @@ final class AttachmentDownloadPolicy {
 
             String path = candidate.getRawPath();
             return path != null && path.matches(
-                "^/api/mail/messages/[0-9a-fA-F-]{36}/attachments(?:\\.zip|/[^/]+)$"
+                "^/api/mail/messages/[0-9a-fA-F-]{36}/(?:attachments(?:\\.zip|/[^/]+)|raw\\.eml)$"
             );
         } catch (RuntimeException error) {
             return false;

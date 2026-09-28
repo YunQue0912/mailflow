@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
+import { downloadMessageEml } from '../utils/attachmentDownload.js';
 import { BUILTIN_SUMMARIZE, summarizePromptForLocale } from '../aiActions.js';
 import { getResults, saveResult, removeResult } from '../aiResults.js';
 import { aiRuns } from '../utils/aiRunRegistry.js';
@@ -67,6 +68,15 @@ export default function ConversationMessageExtras({ message, body, expanded }) {
     }
   };
 
+  const handleDownloadEml = async () => {
+    setShowMoreMenu(false);
+    try {
+      await downloadMessageEml(message.id);
+    } catch {
+      addNotification({ type: 'error', title: t('message.downloadFailed.title'), body: t('message.downloadFailed.body') });
+    }
+  };
+
   const runAiAction = async action => {
     const textContent = body?.text
       || body?.html?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
@@ -121,6 +131,7 @@ export default function ConversationMessageExtras({ message, body, expanded }) {
                       <div aria-hidden onClick={() => setShowMoreMenu(false)} style={{ position: 'fixed', inset: 0, zIndex: 19 }} />
                       <div style={{ position: 'absolute', top: 'calc(100% + 4px)', left: 0, minWidth: 190, zIndex: 20, padding: 4, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg-elevated)', boxShadow: 'var(--shadow-popover)' }}>
                         <button type="button" onClick={() => { setShowMoreMenu(false); setShowHeaderModal(true); }} style={{ width: '100%', border: 'none', background: 'transparent', color: 'var(--text-primary)', padding: '8px 10px', textAlign: 'left', cursor: 'pointer' }}>{t('contextMenu.viewHeaders')}</button>
+                        <button type="button" onClick={handleDownloadEml} style={{ width: '100%', border: 'none', background: 'transparent', color: 'var(--text-primary)', padding: '8px 10px', textAlign: 'left', cursor: 'pointer' }}>{t('message.downloadEml')}</button>
                         {message.list_unsubscribe && !message.unsubscribed_at && unsubscribeStatus !== 'done' && <button type="button" disabled={unsubscribeStatus === 'loading'} onClick={unsubscribe} style={{ width: '100%', border: 'none', background: 'transparent', color: unsubscribeStatus === 'error' ? 'var(--red, #e53e3e)' : 'var(--text-primary)', padding: '8px 10px', textAlign: 'left', cursor: unsubscribeStatus === 'loading' ? 'wait' : 'pointer' }}>{unsubscribeStatus === 'loading' ? t('common.loading') : t('message.unsubscribe.button')}</button>}
                         {aiStatus?.enabled && aiStatus?.features?.summarize && body && <>
                           <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />

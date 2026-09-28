@@ -23,6 +23,15 @@ public class AttachmentDownloadPolicyTest {
     }
 
     @Test
+    public void acceptsOriginalMessagesOnlyOnTheConfiguredOrigin() {
+        String path = "/api/mail/messages/" + MESSAGE_ID + "/raw.eml";
+        assertTrue(AttachmentDownloadPolicy.isAllowed(HOST, HOST + path));
+        assertFalse(AttachmentDownloadPolicy.isAllowed(HOST, "https://evil.example" + path));
+        assertFalse(AttachmentDownloadPolicy.isAllowed(HOST, HOST + path + "/other"));
+        assertFalse(AttachmentDownloadPolicy.isAllowed(HOST, HOST + path + ".exe"));
+    }
+
+    @Test
     public void rejectsOtherOriginsAndNonAttachmentPaths() {
         assertFalse(AttachmentDownloadPolicy.isAllowed(
             HOST,
