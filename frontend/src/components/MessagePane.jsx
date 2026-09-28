@@ -1,4 +1,4 @@
-import { downloadAttachmentFile } from '../utils/attachmentDownload.js';
+import { downloadAttachmentFile, downloadMessageEml } from '../utils/attachmentDownload.js';
 import { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
@@ -1967,7 +1967,7 @@ ${bodyContent}
                 </div>
                 <div
                   onClick={() => { handlePrint(); setShowMoreMenu(false); }}
-                  style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: aiStatus?.enabled && aiStatus?.features?.summarize && body ? '1px solid var(--border-subtle)' : 'none' }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: '1px solid var(--border-subtle)' }}
                   onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
                   onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                 >
@@ -1977,6 +1977,27 @@ ${bodyContent}
                     <rect x="6" y="14" width="12" height="8"/>
                   </svg>
                   {t('message.print')}
+                </div>
+                {/* Use the native download bridge for Android as well as desktop downloads. */}
+                <div
+                  onClick={async () => {
+                    setShowMoreMenu(false);
+                    try {
+                      await downloadMessageEml(message.id);
+                    } catch {
+                      addNotification({ type: 'error', title: t('message.downloadFailed.title'), body: t('message.downloadFailed.body') });
+                    }
+                  }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: aiStatus?.enabled && aiStatus?.features?.summarize && body ? '1px solid var(--border-subtle)' : 'none' }}
+                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  {t('message.downloadEml')}
                 </div>
                 {aiStatus?.enabled && aiStatus?.features?.summarize && body && (
                   <div
@@ -2048,6 +2069,18 @@ ${bodyContent}
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
                 <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
                 <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+              </svg>
+            </PaneBtn>
+            <PaneBtn onClick={async () => {
+              try {
+                await downloadMessageEml(message.id);
+              } catch {
+                addNotification({ type: 'error', title: t('message.downloadFailed.title'), body: t('message.downloadFailed.body') });
+              }
+            }} title={t('message.downloadEml')}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
               </svg>
             </PaneBtn>
             <PaneBtn onClick={handlePrint} title={`${t('message.print')}${shortcutLabel('printMessage') ? ` (${shortcutLabel('printMessage')})` : ''}`}>

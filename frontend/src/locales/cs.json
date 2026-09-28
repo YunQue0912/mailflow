@@ -173,6 +173,8 @@
     "messagesPerPage": "Zpráv na stránku",
     "selectAll": "Vybrat vše",
     "deselectAll": "Zrušit výběr",
+    "starSelected": "Označit hvězdičkou",
+    "unstarSelected": "Odebrat hvězdičku",
     "markReadSelected": "Označit jako přečtené",
     "markUnreadSelected": "Označit jako nepřečtené",
     "archiveSelected": "Archivovat vybrané",
@@ -194,6 +196,10 @@
       "failTitle": "Smazání se nezdařilo",
       "failBody": "Zprávu se nepodařilo smazat.",
       "conversationTitle": "Konverzace smazána"
+    },
+    "draftBcc": {
+      "failTitle": "Koncept otevřen jen pro čtení",
+      "failBody": "Příjemce skryté kopie se nepodařilo načíst z poštovního serveru a uložení konceptu bez nich by je smazalo. Zkuste to znovu za chvíli."
     },
     "bulkDeleted": {
       "title_one": "Smazána {{count}} zpráva",
@@ -270,6 +276,29 @@
       "promotion": "Propagace",
       "automated": "Automatické",
       "social": "Sociální sítě"
+    },
+    "changeLayout": "Změnit rozvržení",
+    "layouts": {
+      "focused": {
+        "label": "Soustředěné",
+        "description": "Minimální panel se seznamem, maximum prostoru pro čtení"
+      },
+      "compact": {
+        "label": "Kompaktní",
+        "description": "Husté řádky — více zpráv najednou"
+      },
+      "comfortable": {
+        "label": "Pohodlné",
+        "description": "Prostorné řádky s velkorysým odsazením"
+      },
+      "wide": {
+        "label": "Široké",
+        "description": "Široký seznam ukáže delší předměty a náhledy"
+      },
+      "vertical": {
+        "label": "Svislé rozdělení",
+        "description": "Seznam zpráv nad čtecím podoknem"
+      }
     }
   },
   "message": {
@@ -314,6 +343,7 @@
     "archive": "Archivovat",
     "star": "Označit hvězdičkou",
     "delete": "Smazat",
+    "downloadEml": "Stáhnout jako .eml",
     "print": "Vytisknout",
     "more": "Další",
     "summarize": "Shrnout",
@@ -685,6 +715,10 @@
         "label": "Vybrat zprávu",
         "description": "Vybrat nebo zrušit výběr aktuální zprávy"
       },
+      "undoAction": {
+        "label": "Vrátit poslední akci",
+        "description": "Vrátí poslední archivaci, smazání, přesun nebo označení spamu, dokud je oznámení zobrazeno"
+      },
       "printMessage": {
         "label": "Vytisknout",
         "description": "Vytisknout aktuální zprávu"
@@ -704,9 +738,6 @@
       "toggleRightSidebar": {
         "label": "Pravý postranní panel",
         "description": "Skrýt nebo zobrazit pravý postranní panel"
-      },
-      "gtdUndo": {
-        "description": "Vrátit zpět poslední klasifikaci GTD"
       }
     }
   },
@@ -1793,5 +1824,13 @@
     "copyFailed": "Kopírování selhalo",
     "generating": "Generuji zprávu…",
     "error": "Zprávu se nepodařilo vytvořit."
+  },
+  "folders": {
+    "inbox": "Doručená pošta",
+    "sent": "Odeslané",
+    "drafts": "Koncepty",
+    "trash": "Koš",
+    "spam": "Spam",
+    "archive": "Archiv"
   }
 }

@@ -355,6 +355,12 @@ export default function ComposeModal() {
       Placeholder.configure({ placeholder: t('compose.bodyPh') }),
     ],
     content: composeData?.body || '',
+    // TipTap rewrites the HTML it loads, so a draft saved by another client never equals its
+    // own source. Baseline on what the editor holds, or merely opening a draft counts as an
+    // edit and autosave replaces it, expunging the original along with its attachments.
+    onCreate: ({ editor: created }) => {
+      if (!plaintextEmail) initialBodyRef.current = created.isEmpty ? '' : created.getHTML();
+    },
     // Records edit time in a ref only. Deliberately does not touch state: this fires on every
     // transaction, and re-rendering the composer per keystroke would be a real regression.
     onUpdate: () => { lastEditAtRef.current = Date.now(); },
@@ -878,7 +884,10 @@ export default function ComposeModal() {
         ...(signatureContentRef.current || fromSignature != null
           ? { editedSignature: plaintextEmail ? plainSig : signatureContentRef.current }
           : {}),
-        ...(draftUid != null && draftFolder != null ? { existingUid: draftUid, existingFolder: draftFolder } : {}),
+        // The old copy stays in the account it was saved to, which From may no longer name.
+        ...(draftUid != null && draftFolder != null && draftAccountId
+          ? { existingUid: draftUid, existingFolder: draftFolder, existingAccountId: draftAccountId }
+          : {}),
       });
       if (result.uid != null) {
         setDraftUid(result.uid);

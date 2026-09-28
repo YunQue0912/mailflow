@@ -222,6 +222,7 @@
     "archive": "Arquivar",
     "star": "Marcar com estrela",
     "delete": "Excluir",
+    "downloadEml": "Baixar como .eml",
     "print": "Imprimir",
     "more": "Mais",
     "summarize": "Resumir",
@@ -291,6 +292,8 @@
     "messagesPerPage": "Mensagens por página",
     "selectAll": "Selecionar tudo",
     "deselectAll": "Desmarcar tudo",
+    "starSelected": "Marcar com estrela",
+    "unstarSelected": "Tirar estrela",
     "markReadSelected": "Marcar como lida",
     "markUnreadSelected": "Marcar como não lida",
     "archiveSelected": "Arquivar selecionadas",
@@ -312,6 +315,10 @@
       "failTitle": "Falha ao excluir",
       "failBody": "Não foi possível excluir a mensagem.",
       "conversationTitle": "Conversa excluída"
+    },
+    "draftBcc": {
+      "failTitle": "Rascunho aberto somente para leitura",
+      "failBody": "Não foi possível ler os destinatários em Cco no servidor de e-mail, e salvá-lo sem eles os apagaria. Tente novamente em instantes."
     },
     "bulkDeleted": {
       "title_one": "{{count}} mensagem excluída",
@@ -376,6 +383,29 @@
       "promotion": "Promoções",
       "automated": "Automáticos",
       "social": "Social"
+    },
+    "changeLayout": "Alterar layout",
+    "layouts": {
+      "focused": {
+        "label": "Focado",
+        "description": "Painel de lista mínimo, área de leitura máxima"
+      },
+      "compact": {
+        "label": "Compacto",
+        "description": "Linhas densas — mostra mais mensagens de uma vez"
+      },
+      "comfortable": {
+        "label": "Confortável",
+        "description": "Linhas espaçosas, com bastante respiro para leitura"
+      },
+      "wide": {
+        "label": "Largo",
+        "description": "Lista ampla mostra assuntos e prévias mais longos"
+      },
+      "vertical": {
+        "label": "Divisão vertical",
+        "description": "Lista de mensagens acima do painel de leitura"
+      }
     }
   },
   "lockScreen": {
@@ -606,6 +636,10 @@
         "label": "Selecionar mensagem",
         "description": "Marcar ou desmarcar a mensagem atual"
       },
+      "undoAction": {
+        "label": "Desfazer a última ação",
+        "description": "Desfaz o último arquivamento, exclusão, movimentação ou marcação de spam enquanto o aviso está visível"
+      },
       "printMessage": {
         "label": "Imprimir",
         "description": "Imprimir a mensagem atual"
@@ -621,9 +655,6 @@
       "gtdDelegated": {
         "label": "Marcar como Delegada",
         "description": "Classificar a mensagem selecionada como Delegada"
-      },
-      "gtdUndo": {
-        "description": "Desfazer a última classificação GTD"
       },
       "toggleRightSidebar": {
         "label": "Alternar barra lateral direita",
@@ -1774,5 +1805,13 @@
     "copyFailed": "Falha ao copiar",
     "generating": "Gerando relatório…",
     "error": "Não foi possível gerar o relatório."
+  },
+  "folders": {
+    "inbox": "Caixa de entrada",
+    "sent": "Enviados",
+    "drafts": "Rascunhos",
+    "trash": "Lixeira",
+    "spam": "Spam",
+    "archive": "Arquivo"
   }
 }

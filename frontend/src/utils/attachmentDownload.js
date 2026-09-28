@@ -5,6 +5,14 @@ function responseError(response) {
     .then(message => new Error(message || `Download failed (${response.status})`));
 }
 
+export function downloadMessageEml(messageId) {
+  return downloadAttachmentFile({
+    path: `/api/mail/messages/${messageId}/raw.eml`,
+    filename: `message-${messageId}.eml`,
+    mimeType: 'message/rfc822',
+  });
+}
+
 export async function downloadAttachmentFile({
   path,
   filename,

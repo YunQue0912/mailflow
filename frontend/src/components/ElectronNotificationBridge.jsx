@@ -92,6 +92,21 @@ export default function ElectronNotificationBridge() {
     if (!nativeBridgeReady) return undefined;
     let active = true;
     const handleStatus = (status) => {
+      // Official unsigned shells can also connect to this server frontend.
+      if (status?.type === 'available' && status?.data?.canAutoInstall === false) {
+        const releaseUrl = status.data.releaseUrl;
+        addNotification({
+          type: 'info',
+          title: t('admin.about.updates.notificationAvailableTitle'),
+          body: t('admin.about.updates.notificationAvailableBody', { version: status.data.releaseName }),
+          persistent: true,
+          ...(releaseUrl ? {
+            actionLabel: t('admin.about.updates.browser'),
+            onAction: () => window.open(releaseUrl, '_blank'),
+          } : {}),
+        });
+        return;
+      }
       if (status?.type === 'available') {
         if (localStorage.getItem(NATIVE_UPDATE_KEYS.skippedVersion) === status.version) return;
         const deferredVersion = localStorage.getItem(NATIVE_UPDATE_KEYS.deferredVersion);
@@ -193,6 +208,7 @@ export default function ElectronNotificationBridge() {
       });
     };
     const unsubscribe = window.mailflowNative?.updates?.onStatus?.(handleStatus);
+    if (typeof unsubscribe === 'function') window.__mailflowNativeUpdateLinkReady = true;
     window.mailflowNative?.updates?.getState?.()
       ?.then?.((status) => {
         if (active && status) handleStatus(status);
@@ -201,6 +217,7 @@ export default function ElectronNotificationBridge() {
 
     return () => {
       active = false;
+      window.__mailflowNativeUpdateLinkReady = false;
       if (typeof unsubscribe === 'function') unsubscribe();
     };
   }, [addNotification, nativeBridgeReady, t]);

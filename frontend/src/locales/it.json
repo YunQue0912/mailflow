@@ -222,6 +222,7 @@
     "archive": "Archivia",
     "star": "Segna con stella",
     "delete": "Elimina",
+    "downloadEml": "Scarica come .eml",
     "print": "Stampa",
     "more": "Altro",
     "summarize": "Riassumi",
@@ -291,6 +292,8 @@
     "messagesPerPage": "Messaggi per pagina",
     "selectAll": "Seleziona tutto",
     "deselectAll": "Deseleziona tutto",
+    "starSelected": "Aggiungi stella",
+    "unstarSelected": "Rimuovi stella",
     "markReadSelected": "Segna come letto",
     "markUnreadSelected": "Segna come non letto",
     "archiveSelected": "Archivia selezionati",
@@ -312,6 +315,10 @@
       "failTitle": "Eliminazione fallita",
       "failBody": "Impossibile eliminare il messaggio.",
       "conversationTitle": "Conversazione eliminata"
+    },
+    "draftBcc": {
+      "failTitle": "Bozza aperta in sola lettura",
+      "failBody": "Impossibile leggere i destinatari in Bcc dal server di posta, e salvarla senza di loro li cancellerebbe. Riprova tra poco."
     },
     "bulkDeleted": {
       "title_one": "{{count}} messaggio eliminato",
@@ -376,6 +383,29 @@
       "promotion": "Promozioni",
       "automated": "Automatico",
       "social": "Social"
+    },
+    "changeLayout": "Cambia disposizione",
+    "layouts": {
+      "focused": {
+        "label": "Concentrato",
+        "description": "Pannello elenco minimo, area di lettura massima"
+      },
+      "compact": {
+        "label": "Compatto",
+        "description": "Righe dense — più messaggi in una volta"
+      },
+      "comfortable": {
+        "label": "Comodo",
+        "description": "Righe spaziose con margini generosi per la lettura"
+      },
+      "wide": {
+        "label": "Largo",
+        "description": "Elenco ampio con oggetti e anteprime più lunghi"
+      },
+      "vertical": {
+        "label": "Divisione verticale",
+        "description": "Elenco messaggi sopra il riquadro di lettura"
+      }
     }
   },
   "lockScreen": {
@@ -606,6 +636,10 @@
         "label": "Seleziona messaggio",
         "description": "Seleziona o deseleziona il messaggio corrente"
       },
+      "undoAction": {
+        "label": "Annulla l'ultima azione",
+        "description": "Annulla l'ultima archiviazione, eliminazione, spostamento o segnalazione spam finché l'avviso è visibile"
+      },
       "printMessage": {
         "label": "Stampa",
         "description": "Stampa il messaggio corrente"
@@ -621,9 +655,6 @@
       "gtdDelegated": {
         "label": "Segna Delegato",
         "description": "Classifica il messaggio selezionato come Delegato"
-      },
-      "gtdUndo": {
-        "description": "Annulla l'ultima classificazione GTD"
       },
       "toggleRightSidebar": {
         "label": "Mostra o nascondi la barra laterale destra",
@@ -1774,5 +1805,13 @@
     "copyFailed": "Copia non riuscita",
     "generating": "Generazione del report…",
     "error": "Impossibile generare il report."
+  },
+  "folders": {
+    "inbox": "Posta in arrivo",
+    "sent": "Inviati",
+    "drafts": "Bozze",
+    "trash": "Cestino",
+    "spam": "Spam",
+    "archive": "Archivio"
   }
 }

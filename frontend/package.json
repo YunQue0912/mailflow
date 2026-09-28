@@ -1,7 +1,8 @@
 {
   "name": "mailflow-frontend",
   "productName": "MailFlow",
-  "version": "3.5.7-custom.1",
+  "desktopName": "MailFlow",
+  "version": "3.5.9-custom.1",
   "description": "A self-hosted, unified webmail client.",
   "homepage": "https://github.com/YunQue0912/mailflow",
   "author": {
@@ -88,6 +89,7 @@
     },
     "linux": {
       "artifactName": "${productName}-${version}.${ext}",
+      "syncDesktopName": true,
       "target": [
         {
           "target": "deb",

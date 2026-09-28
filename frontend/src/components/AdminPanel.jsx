@@ -1620,7 +1620,7 @@ function SwipeActionIcon({ action, size = 17 }) {
 function LayoutsTab() {
   const { t } = useTranslation();
   const isMobile = useMobile();
-  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, conversationMode, setConversationMode, plaintextEmail, setPlaintextEmail, hoverQuickActions, setHoverQuickActions, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, replyDefault, setReplyDefault, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, senderFavicons, senderFaviconsSaving, setSenderFavicons, showMessagePreviews, setShowMessagePreviews, accounts, defaultSender, setDefaultSender } = useStore();
+  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, conversationMode, setConversationMode, plaintextEmail, setPlaintextEmail, hoverQuickActions, setHoverQuickActions, hoverActionSet, setHoverActionSet, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, replyDefault, setReplyDefault, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, senderFavicons, senderFaviconsSaving, setSenderFavicons, showMessagePreviews, setShowMessagePreviews, accounts, defaultSender, setDefaultSender } = useStore();
   const [senderFaviconsError, setSenderFaviconsError] = useState('');
 
   // "Set MailFlow as your default email app": registerProtocolHandler is the
@@ -1725,7 +1725,7 @@ function LayoutsTab() {
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
                 }}>
                   <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>
-                    {l.label}
+                    {t(l.labelKey, l.label)}
                   </div>
                   {isActive && (
                     <div style={{
@@ -1740,7 +1740,7 @@ function LayoutsTab() {
                   )}
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4, lineHeight: 1.4 }}>
-                  {l.description}
+                  {t(l.descriptionKey, l.description)}
                 </div>
               </div>
             </button>
@@ -1841,6 +1841,35 @@ function LayoutsTab() {
               );
             })}
           </div>
+          {/* #440: which actions the cluster shows. Membership only — order stays canonical. */}
+          {hoverQuickActions && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+              {[
+                { id: 'markRead', label: t('admin.messageList.swipeMarkRead') },
+                { id: 'star', label: t('admin.messageList.swipeStar') },
+                { id: 'archive', label: t('admin.messageList.swipeArchive') },
+                { id: 'snooze', label: t('contextMenu.snooze.label') },
+                { id: 'delete', label: t('admin.messageList.swipeDelete') },
+                { id: 'move', label: t('contextMenu.moveToFolder') },
+              ].map(({ id, label }) => {
+                const active = hoverActionSet.includes(id);
+                return (
+                  <button
+                    key={id}
+                    onClick={() => setHoverActionSet(active ? hoverActionSet.filter(k => k !== id) : [...hoverActionSet, id])}
+                    style={{
+                      padding: '6px 10px', fontSize: 12, borderRadius: 6, cursor: 'pointer',
+                      background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
+                      border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
+                      color: 'var(--text-primary)', transition: 'all 0.15s', outline: 'none',
+                    }}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>

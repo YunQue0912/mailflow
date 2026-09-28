@@ -222,6 +222,7 @@
     "archive": "Archive",
     "star": "Star",
     "delete": "Delete",
+    "downloadEml": "Download .eml",
     "print": "Print",
     "more": "More",
     "summarize": "Summarize",
@@ -291,6 +292,8 @@
     "messagesPerPage": "Messages per page",
     "selectAll": "Select all",
     "deselectAll": "Deselect all",
+    "starSelected": "Star",
+    "unstarSelected": "Remove star",
     "markReadSelected": "Mark as read",
     "markUnreadSelected": "Mark as unread",
     "archiveSelected": "Archive selected",
@@ -312,6 +315,10 @@
       "failTitle": "Delete failed",
       "failBody": "Could not delete message.",
       "conversationTitle": "Conversation deleted"
+    },
+    "draftBcc": {
+      "failTitle": "Draft opened read-only",
+      "failBody": "Its Bcc recipients couldn't be read from the mail server, and saving it without them would erase them. Please try again in a moment."
     },
     "bulkDeleted": {
       "title_one": "{{count}} message deleted",
@@ -376,6 +383,29 @@
       "promotion": "Promotions",
       "automated": "Automated",
       "social": "Social"
+    },
+    "changeLayout": "Change layout",
+    "layouts": {
+      "focused": {
+        "label": "Focused",
+        "description": "Minimal list panel, maximum reading area"
+      },
+      "compact": {
+        "label": "Compact",
+        "description": "Dense rows — fit more messages at once"
+      },
+      "comfortable": {
+        "label": "Comfortable",
+        "description": "Spacious rows with generous padding for easy scanning"
+      },
+      "wide": {
+        "label": "Wide",
+        "description": "Broad list shows longer subjects and previews"
+      },
+      "vertical": {
+        "label": "Vertical Split",
+        "description": "Message list stacked above the reading pane"
+      }
     }
   },
   "lockScreen": {
@@ -606,6 +636,10 @@
         "label": "Select message",
         "description": "Check or uncheck the current message"
       },
+      "undoAction": {
+        "label": "Undo last action",
+        "description": "Undo the most recent archive, delete, move, or spam action while its toast is showing"
+      },
       "printMessage": {
         "label": "Print",
         "description": "Print the current message"
@@ -621,9 +655,6 @@
       "gtdDelegated": {
         "label": "Mark Delegated",
         "description": "Classify the selected message as Delegated"
-      },
-      "gtdUndo": {
-        "description": "Undo the latest GTD classification"
       },
       "toggleRightSidebar": {
         "label": "Toggle right sidebar",
@@ -1774,5 +1805,13 @@
     "copyFailed": "Copy failed",
     "generating": "Generating report…",
     "error": "Could not generate the report."
+  },
+  "folders": {
+    "inbox": "Inbox",
+    "sent": "Sent",
+    "drafts": "Drafts",
+    "trash": "Trash",
+    "spam": "Spam",
+    "archive": "Archive"
   }
 }

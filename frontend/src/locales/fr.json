@@ -222,6 +222,7 @@
     "archive": "Archiver",
     "star": "Étoile",
     "delete": "Supprimer",
+    "downloadEml": "Télécharger en .eml",
     "print": "Imprimer",
     "more": "Plus",
     "summarize": "Résumer",
@@ -291,6 +292,8 @@
     "messagesPerPage": "Messages par page",
     "selectAll": "Tout sélectionner",
     "deselectAll": "Tout désélectionner",
+    "starSelected": "Étoiler",
+    "unstarSelected": "Retirer l'étoile",
     "markReadSelected": "Marquer comme lu",
     "markUnreadSelected": "Marquer comme non lu",
     "archiveSelected": "Archiver la sélection",
@@ -312,6 +315,10 @@
       "failTitle": "Échec de la suppression",
       "failBody": "Impossible de supprimer le message.",
       "conversationTitle": "Conversation supprimée"
+    },
+    "draftBcc": {
+      "failTitle": "Brouillon ouvert en lecture seule",
+      "failBody": "Impossible de lire ses destinataires en Cci depuis le serveur de messagerie, et l'enregistrer sans eux les effacerait. Veuillez réessayer dans un instant."
     },
     "bulkDeleted": {
       "title_one": "{{count}} message supprimé",
@@ -376,6 +383,29 @@
       "promotion": "Promotions",
       "automated": "Automatisé",
       "social": "Réseaux sociaux"
+    },
+    "changeLayout": "Changer la disposition",
+    "layouts": {
+      "focused": {
+        "label": "Concentré",
+        "description": "Panneau de liste minimal, zone de lecture maximale"
+      },
+      "compact": {
+        "label": "Compact",
+        "description": "Lignes denses — plus de messages à la fois"
+      },
+      "comfortable": {
+        "label": "Confortable",
+        "description": "Lignes aérées avec des marges généreuses"
+      },
+      "wide": {
+        "label": "Large",
+        "description": "Liste large affichant des objets et aperçus plus longs"
+      },
+      "vertical": {
+        "label": "Division verticale",
+        "description": "Liste des messages au-dessus du volet de lecture"
+      }
     }
   },
   "lockScreen": {
@@ -606,6 +636,10 @@
         "label": "Sélectionner le message",
         "description": "Cocher ou décocher le message actuel"
       },
+      "undoAction": {
+        "label": "Annuler la dernière action",
+        "description": "Annule le dernier archivage, suppression, déplacement ou marquage spam tant que la notification est affichée"
+      },
       "printMessage": {
         "label": "Imprimer",
         "description": "Imprimer le message actuel"
@@ -621,9 +655,6 @@
       "gtdDelegated": {
         "label": "Marquer Délégué",
         "description": "Classer le message sélectionné comme Délégué"
-      },
-      "gtdUndo": {
-        "description": "Annuler le dernier classement GTD"
       },
       "toggleRightSidebar": {
         "label": "Afficher ou masquer la barre latérale droite",
@@ -1774,5 +1805,13 @@
     "copyFailed": "Échec de la copie",
     "generating": "Génération du rapport…",
     "error": "Impossible de générer le rapport."
+  },
+  "folders": {
+    "inbox": "Boîte de réception",
+    "sent": "Envoyés",
+    "drafts": "Brouillons",
+    "trash": "Corbeille",
+    "spam": "Indésirables",
+    "archive": "Archives"
   }
 }
