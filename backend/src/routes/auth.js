@@ -770,7 +770,7 @@ export async function patchPreferences(req, res) {
           showAppBadge, showFaviconBadge, replyDefault, sidebarWidth,
           categorizationEnabled, markReadBehavior, markReadDelay, aiActions,
           autoLockMinutes, showMobileAvatars, gravatarAvatars, folderSyncInterval,
-          folderOrder, senderFavicons, showMessagePreviews, defaultSender } = req.body;
+          folderOrder, senderFavicons, showMessagePreviews, defaultSender, hoverActionSet } = req.body;
   // GTD content and generic right-sidebar layout preferences are independent flat
   // top-level keys with separate allow-lists. gtdEnabled is intentionally NOT a user
   // preference — it lives per-account in email_accounts.gtd_enabled.
@@ -828,6 +828,11 @@ export async function patchPreferences(req, res) {
     return res.status(400).json({ error: 'senderFavicons must be a boolean' });
   }
   const senderFaviconsVal = hasSenderFavicons ? senderFavicons : null;
+  // Same vocabulary and canonical order as frontend/src/utils/hoverActions.js.
+  const HOVER_ACTION_KEYS = ['markRead', 'star', 'archive', 'snooze', 'delete', 'move'];
+  const hoverActionSetJson = Array.isArray(hoverActionSet)
+    ? JSON.stringify(HOVER_ACTION_KEYS.filter(k => hoverActionSet.includes(k)))
+    : null;
   await query(`
     UPDATE users
     SET preferences = preferences
@@ -873,6 +878,7 @@ export async function patchPreferences(req, res) {
       || CASE WHEN $41::boolean IS NOT NULL THEN jsonb_build_object('senderFavicons', $41::boolean) ELSE '{}'::jsonb END
       || CASE WHEN $42::boolean IS NOT NULL THEN jsonb_build_object('showMessagePreviews', $42::boolean) ELSE '{}'::jsonb END
       || CASE WHEN $43::text IS NOT NULL THEN jsonb_build_object('defaultSender', $43::text) ELSE '{}'::jsonb END
+      || CASE WHEN $44::jsonb IS NOT NULL THEN jsonb_build_object('hoverActionSet', $44::jsonb) ELSE '{}'::jsonb END
     WHERE id = $1
   `, [req.session.userId, theme ?? null, font ?? null, layout ?? null, notificationSound ?? null,
       pageSize ?? null, scrollMode ?? null, syncInterval ?? null,
@@ -884,7 +890,7 @@ export async function patchPreferences(req, res) {
       rightSidebarWidth, rightSidebarHidden, gtdCollapsedSectionsJson, gtdPetSlug, autoLockMinutesVal,
       showMobileAvatars ?? null, gravatarAvatars ?? null, folderSyncIntervalVal, conversationModeVal,
       folderOrderJson, senderFaviconsVal,
-      showMessagePreviews ?? null, defaultSenderVal]);
+      showMessagePreviews ?? null, defaultSenderVal, hoverActionSetJson]);
 
   if (syncInterval != null) {
     const ms = parseInt(syncInterval) * 1000;

@@ -5,6 +5,7 @@ import { unreadBadge } from '../utils/unreadBadge.js';
 import { api } from '../utils/api.js';
 import { isNativeAppEnvironment } from '../utils/nativeUpdatePolicy.js';
 import { resolveThreadMessages } from '../utils/threadActions.js';
+import { folderDisplayName } from '../utils/folderDisplay.js';
 import {
   activateOnKey,
   buildFolderTree,
@@ -1111,7 +1112,7 @@ export default function Sidebar() {
                       />
                     ) : (
                       <span style={{ fontSize: 13, fontWeight: isActive ? 500 : 400, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {label || folderObj?.name || path.split('/').pop() || path}
+                        {label || (folderObj ? folderDisplayName(folderObj, t, account.folder_mappings) : (path.split('/').pop() || path))}
                       </span>
                     )}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
@@ -1507,7 +1508,7 @@ export default function Sidebar() {
                             fontSize: 12, color: 'var(--text-secondary)',
                             flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                           }}>
-                            {folder.name}
+                            {folderDisplayName(folder, t, account.folder_mappings)}
                           </span>
                         )}
 
