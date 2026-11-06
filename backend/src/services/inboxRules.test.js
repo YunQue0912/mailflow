@@ -21,7 +21,7 @@ const {
   adjustFolderCounts,
 } = await import('../utils/mailUtils.js');
 const { forwardRuleMessage } = await import('./ruleForwarder.js');
-import { applyInboxRules } from './inboxRules.js';
+import { applyInboxRules, newMailAlerts } from './inboxRules.js';
 
 const account = { id: 'acc-1', user_id: 'user-1', folder_mappings: {} };
 
@@ -46,10 +46,13 @@ const mockImap = {
   setFlag: vi.fn(),
   _guardMoveUid: vi.fn(),
   _unguardMoveUid: vi.fn(),
+  syncFolderOnDemand: vi.fn(),
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockImap.syncFolderOnDemand.mockResolvedValue(undefined);
+  mockImap.setFlag.mockResolvedValue(undefined);
 });
 
 describe('applyInboxRules — forwarding', () => {
@@ -477,21 +480,53 @@ describe('applyInboxRules — UID update after move', () => {
     expect(updateCall[1]).toEqual(['INBOX/Work', 789, 'msg-1']);
   });
 
-  it('updates only folder when uidMap is empty (no UIDPLUS)', async () => {
-    const rule = mkRule([{ type: 'move', value: 'INBOX/Work' }]);
-    query
-      .mockResolvedValueOnce({ rows: [rule] })
-      .mockResolvedValueOnce({ rows: [] });
-    mockImap.bulkMoveMessages.mockResolvedValue({
-      failed: [],
-      uidMap: new Map(), // empty — non-UIDPLUS server
-    });
+  // The source uid can belong to another message in the destination (#665), so the row is not
+  // kept on it, and nothing later in the run acts on it.
+  it.each([
+    ['move', { type: 'move', value: 'INBOX/Work' }, 'INBOX/Work'],
+    ['archive', { type: 'archive', value: '' }, 'Archive'],
+    ['delete', { type: 'delete', value: '' }, 'Trash'],
+  ])('a %s that names no new uid drops the row, pulls the destination, and a later mark_read or star flags nothing', async (_label, action, destination) => {
+    resolveArchiveFolder.mockResolvedValue('Archive');
+    isAllMailFolder.mockResolvedValue(false);
+    resolveTrashFolder.mockResolvedValue('Trash');
+    resolveAllTrashPaths.mockResolvedValue(['Trash']);
+    getDeleteStrategy.mockReturnValue({ action: 'move', destination: 'Trash' });
+    const rule = mkRule([action]);
+    const later = { ...mkRule([{ type: 'mark_read', value: '' }, { type: 'star', value: '' }]), id: 'rule-2', priority: 2 };
+    query.mockReset();
+    query.mockImplementation(async (sql) => (sql.includes('FROM inbox_rules') ? { rows: [rule, later] } : { rows: [] }));
+    mockImap.bulkMoveMessages.mockResolvedValue({ succeeded: [100], failed: [], uidMap: new Map() });
 
     const result = await applyInboxRules([mkMsg()], account, mockImap);
 
     expect(result.remaining).toHaveLength(0);
-    const updateCall = query.mock.calls[1];
-    expect(updateCall[1]).toEqual(['INBOX/Work', 'msg-1']); // only folder, no uid
+    const sqls = query.mock.calls.map(([sql, params]) => [sql.replace(/\s+/g, ' ').trim(), params]);
+    expect(sqls).toContainEqual(['DELETE FROM messages WHERE id = $1', ['msg-1']]);
+    expect(sqls.filter(([sql]) => sql.startsWith('UPDATE messages SET folder'))).toEqual([]);
+    expect(mockImap.syncFolderOnDemand).toHaveBeenCalledWith(account, destination);
+    expect(mockImap.setFlag).not.toHaveBeenCalled();
+  });
+});
+
+// A message a move left without a known uid has no address on the server, so no move, archive or
+// delete is attempted for it.
+describe('applyInboxRules: a message with no known uid', () => {
+  it.each([
+    ['move', { type: 'move', value: 'INBOX/Work' }],
+    ['archive', { type: 'archive', value: '' }],
+    ['delete', { type: 'delete', value: '' }],
+  ])('does not %s it', async (_label, action) => {
+    resolveArchiveFolder.mockResolvedValue('Archive');
+    isAllMailFolder.mockResolvedValue(false);
+    resolveTrashFolder.mockResolvedValue('Trash');
+    resolveAllTrashPaths.mockResolvedValue(['Trash']);
+    getDeleteStrategy.mockReturnValue({ action: 'move', destination: 'Trash' });
+    query.mockReset();
+    query.mockImplementation(async (sql) => (sql.includes('FROM inbox_rules') ? { rows: [mkRule([action])] } : { rows: [] }));
+    await applyInboxRules([mkMsg({ uid: null })], account, mockImap);
+    expect(mockImap.bulkMoveMessages).not.toHaveBeenCalled();
+    expect(mockImap._guardMoveUid).not.toHaveBeenCalled();
   });
 });
 
@@ -822,5 +857,128 @@ describe('applyInboxRules — to not_contains requires all recipients to not mat
     // no recipient contains 'filtered' → condition true → move fires
     expect(result.remaining).toHaveLength(0);
     expect(mockImap.bulkMoveMessages).toHaveBeenCalledOnce();
+  });
+});
+
+describe('applyInboxRules — set_category (#489)', () => {
+  it('stores the chosen category, Primary included, and leaves the message where it is', async () => {
+    for (const category of ['automated', 'primary']) {
+      vi.clearAllMocks();
+      query
+        .mockResolvedValueOnce({ rows: [mkRule([{ type: 'set_category', value: category }])] })
+        .mockResolvedValueOnce({ rows: [] }); // UPDATE category
+      const msg = mkMsg();
+      const { remaining } = await applyInboxRules([msg], account, mockImap);
+      expect(query).toHaveBeenLastCalledWith('UPDATE messages SET category = $1 WHERE id = $2', [category, 'msg-1']);
+      expect(remaining).toEqual([msg]); // not a destination: still in the inbox
+      expect(mockImap.bulkMoveMessages).not.toHaveBeenCalled();
+    }
+  });
+
+  it('ignores a category it does not know', async () => {
+    query.mockResolvedValueOnce({ rows: [mkRule([{ type: 'set_category', value: 'spam' }])] });
+    await applyInboxRules([mkMsg()], account, mockImap);
+    expect(query).toHaveBeenCalledTimes(1); // only the rule load, no UPDATE
+  });
+
+  it('runs alongside a move in the same rule', async () => {
+    query
+      .mockResolvedValueOnce({ rows: [mkRule([{ type: 'set_category', value: 'newsletter' }, { type: 'move', value: 'INBOX/News' }])] })
+      .mockResolvedValueOnce({ rows: [] })  // UPDATE category
+      .mockResolvedValueOnce({ rows: [] }); // UPDATE folder (move)
+    mockImap.bulkMoveMessages.mockResolvedValue({ failed: [] });
+    await applyInboxRules([mkMsg()], account, mockImap);
+    expect(query.mock.calls.some(([sql, params]) => /SET category/.test(sql) && params[0] === 'newsletter')).toBe(true);
+    expect(mockImap.bulkMoveMessages).toHaveBeenCalledOnce();
+  });
+});
+
+// "Notify me" (#588): a rule that files new mail out of the Inbox can still alert for it.
+describe('applyInboxRules — notify', () => {
+  const run = async (rules, { moveFails = false } = {}) => {
+    query.mockResolvedValueOnce({ rows: rules }).mockResolvedValue({ rows: [] });
+    resolveArchiveFolder.mockResolvedValue('Archive');
+    isAllMailFolder.mockResolvedValue(false);
+    resolveTrashFolder.mockResolvedValue('Trash');
+    resolveAllTrashPaths.mockResolvedValue(['Trash']);
+    getDeleteStrategy.mockReturnValue({ action: 'move', destination: 'Trash' });
+    mockImap.setFlag.mockResolvedValue(undefined);
+    mockImap.bulkMoveMessages.mockResolvedValue(moveFails
+      ? { failed: [100], uidMap: new Map() }
+      : { failed: [], uidMap: new Map([[100, 200]]) });
+    return applyInboxRules([mkMsg()], account, mockImap);
+  };
+
+  it('alerts for mail it moved, in the folder it went to', async () => {
+    const result = await run([mkRule([{ type: 'move', value: 'Shops/Coolblue' }, { type: 'notify' }])]);
+    expect(result.remaining).toHaveLength(0);
+    expect(result.notifyMessages.map(m => [m.id, m.folder])).toEqual([['msg-1', 'Shops/Coolblue']]);
+  });
+
+  it('alerts for mail it archived', async () => {
+    const result = await run([mkRule([{ type: 'archive' }, { type: 'notify' }])]);
+    expect(result.notifyMessages.map(m => m.id)).toEqual(['msg-1']);
+  });
+
+  it('never alerts for mail a rule deleted', async () => {
+    const result = await run([mkRule([{ type: 'delete' }, { type: 'notify' }])]);
+    expect(result.remaining).toHaveLength(0);
+    expect(result.notifyMessages).toEqual([]);
+  });
+
+  it('a rule without it files mail silently, as before', async () => {
+    const result = await run([mkRule([{ type: 'move', value: 'Shops/Coolblue' }])]);
+    expect(result.notifyMessages).toEqual([]);
+  });
+
+  it('wins over a mark_read rule silencing mail that stays in the Inbox', async () => {
+    const result = await run([mkRule([{ type: 'mark_read' }, { type: 'notify' }])]);
+    expect(result.remaining.map(m => m.id)).toEqual(['msg-1']);
+    expect(result.mutedIds.has('msg-1')).toBe(false);
+    expect(result.notifyMessages).toEqual([], 'still in the Inbox: alerted as inbox mail');
+  });
+
+  it('counts when another matching rule does the moving', async () => {
+    const result = await run([
+      mkRule([{ type: 'notify' }], { id: 'rule-notify' }),
+      mkRule([{ type: 'move', value: 'Shops/Coolblue' }], { id: 'rule-move' }),
+    ]);
+    expect(result.notifyMessages.map(m => m.id)).toEqual(['msg-1']);
+  });
+
+  it('a failed move leaves ordinary inbox mail, alerted as such', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const result = await run([mkRule([{ type: 'move', value: 'Shops/Coolblue' }, { type: 'notify' }])], { moveFails: true });
+      expect(result.remaining.map(m => m.id)).toEqual(['msg-1']);
+      expect(result.notifyMessages).toEqual([]);
+    } finally {
+      consoleError.mockRestore();
+      consoleWarn.mockRestore();
+    }
+  });
+
+  it('does nothing to the message itself', async () => {
+    const result = await run([mkRule([{ type: 'notify' }])]);
+    expect(mockImap.bulkMoveMessages).not.toHaveBeenCalled();
+    expect(mockImap.setFlag).not.toHaveBeenCalled();
+    expect(result.remaining.map(m => m.id)).toEqual(['msg-1']);
+  });
+});
+
+describe('newMailAlerts', () => {
+  const a = { id: 'a' }, b = { id: 'b' }, filed = { id: 'f', folder: 'Shops' };
+  it('alerts for inbox mail no rule silenced', () => {
+    expect(newMailAlerts({ remaining: [a, b], mutedIds: new Set(['b']) })).toEqual({ alertMessages: [a], alertCount: 1, send: true });
+  });
+  it('alerts for mail a notify rule filed, even with no new inbox mail', () => {
+    expect(newMailAlerts({ remaining: [], notifyMessages: [filed] })).toEqual({ alertMessages: [filed], alertCount: 1, send: true });
+  });
+  it('says nothing when there is neither', () => {
+    expect(newMailAlerts({ remaining: [] })).toEqual({ alertMessages: [], alertCount: 0, send: false });
+  });
+  it('still lists silenced inbox mail, without an alert', () => {
+    expect(newMailAlerts({ remaining: [a], mutedIds: new Set(['a']) })).toEqual({ alertMessages: [], alertCount: 0, send: true });
   });
 });

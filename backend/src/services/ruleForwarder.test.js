@@ -1,12 +1,16 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./db.js', () => ({ query: vi.fn() }));
 vi.mock('./smtpTransport.js', () => ({
   createAccountSmtpTransport: vi.fn(),
 }));
 
+import { createHash, createHmac, hkdfSync } from 'crypto';
+import nodemailer from 'nodemailer';
 import { query } from './db.js';
 import { createAccountSmtpTransport } from './smtpTransport.js';
+import { parseRawHeaders } from './messageParser.js';
+import { sanitizeEmail } from './emailSanitizer.js';
 import {
   buildForwardMessage,
   forwardRuleMessage,
@@ -48,6 +52,27 @@ const messageRow = {
   body_html: '<p>Original body</p>',
   attachments: [],
 };
+
+// The headers sync hands the rules when a sent forward lands in a mailbox: the message as
+// nodemailer writes it, read back by the parser sync uses.
+async function deliveredHeaders(mail) {
+  const { message } = await nodemailer
+    .createTransport({ streamTransport: true, buffer: true, newline: 'windows' })
+    .sendMail(mail);
+  return parseRawHeaders(message.subarray(0, message.indexOf('\r\n\r\n')));
+}
+
+// The loop token is keyed with a key derived from ENCRYPTION_KEY, which index.js requires.
+const KEY = 'a1'.repeat(32);
+const OTHER_KEY = '5e'.repeat(32);
+
+beforeEach(() => {
+  vi.stubEnv('ENCRYPTION_KEY', KEY);
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe('buildForwardMessage', () => {
   it('builds a PII-free-shape Fwd message and escapes forwarded headers', () => {
@@ -127,6 +152,22 @@ describe('buildForwardMessage', () => {
     expect(mail.text).toContain('Second line');
   });
 
+  // #228: the sanitizer keeps a sender's dark CSS for MailFlow's reader, switched off. A forward
+  // leaves MailFlow, where a mail client ignoring media="not all" would apply it on a light page.
+  it("leaves the sender's switched-off dark CSS out of a forward", () => {
+    const mail = buildForwardMessage({
+      row: { subject: 'Styled', from_name: 'S', from_email: 'sender@example.com', to_addresses: [], cc_addresses: [], date: null },
+      account,
+      recipient: 'recipient@example.com',
+      text: '',
+      html: '<style>.a{color:#111}@media (prefers-color-scheme: dark){.a{color:#eee}}</style><p class="a">Hi</p>',
+      attachments: [],
+    });
+    expect(mail.html).toContain('class="a"');
+    expect(mail.html).not.toContain('data-mf-dark-scheme');
+    expect(mail.html).not.toContain('#eee');
+  });
+
   it('preserves a text-only body without adding an HTML alternative', () => {
     const mail = buildForwardMessage({
       row: {
@@ -146,6 +187,31 @@ describe('buildForwardMessage', () => {
 
     expect(mail.text).toContain('Plain body only');
     expect(mail).not.toHaveProperty('html');
+  });
+
+  it('keys the loop token with a key derived from ENCRYPTION_KEY', async () => {
+    const tokenUnder = async key => {
+      vi.resetModules();
+      vi.stubEnv('ENCRYPTION_KEY', key);
+      const forwarder = await import('./ruleForwarder.js');
+      return forwarder.buildForwardMessage({
+        row: messageRow,
+        account,
+        recipient: 'recipient@example.com',
+        text: 'Plain body',
+      }).headers['X-MailFlow-Loop'];
+    };
+    const token = await tokenUnder(KEY);
+
+    // Only this instance can compute it: an HMAC of the address under the HKDF-derived key.
+    const derived = Buffer.from(
+      hkdfSync('sha256', Buffer.from(KEY, 'hex'), Buffer.alloc(0), 'mailflow:rule-forward-loop', 32)
+    );
+    expect(token).toBe(createHmac('sha256', derived)
+      .update(account.email_address)
+      .digest('hex')
+      .slice(0, 16));
+    expect(await tokenUnder(OTHER_KEY)).not.toBe(token);
   });
 });
 
@@ -426,6 +492,109 @@ describe('forwardRuleMessage', () => {
     }));
   });
 
+  // #640: an image the body shows as a data: URI goes out once, inline.
+  it('does not attach again an image the fetched body shows inline', async () => {
+    const pdf = Buffer.from('pdfdata');
+    const header = { part: '5', filename: 'header.png', type: 'image/png', encoding: 'base64', size: 3 };
+    const row = {
+      ...messageRow,
+      body_text: '',
+      body_html: null,
+      // The list stored at sync time, before the body showed the header is part of the page.
+      attachments: [header, storedAttachments[0]],
+    };
+    imapManager.fetchMessageBody.mockResolvedValue({
+      text: 'News',
+      html: '<p>News<img src="data:image/png;base64,QUJD"></p>',
+      attachments: [storedAttachments[0]],
+      inlineParts: ['5'],
+    });
+    imapManager.fetchMultipleAttachments.mockResolvedValue(new Map([['2', pdf]]));
+    query
+      .mockResolvedValueOnce({ rows: [{ id: 'delivery-1' }] })
+      .mockResolvedValueOnce({ rows: [row] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await expect(forwardRuleMessage(input)).resolves.toBe('sent');
+
+    expect(imapManager.fetchMultipleAttachments).toHaveBeenCalledWith(
+      account, messageRow.uid, messageRow.folder, [storedAttachments[0]]);
+    const mail = transport.sendMail.mock.calls[0][0];
+    expect(mail.attachments.map(a => a.filename)).toEqual(['image-0.png', 'invoice.pdf']);
+  });
+
+  // A background is not carried as an image part (embedInlineDataImages converts <img src> only),
+  // and mail clients drop CSS data: URIs: a photo shown only that way still goes as a file.
+  it('still attaches a listed photo the body shows only as a background', async () => {
+    const photo = { part: '3', filename: 'photo.jpg', type: 'image/jpeg', encoding: 'base64', size: 3 };
+    const jpeg = Buffer.from('JPEG');
+    imapManager.fetchMessageBody.mockResolvedValue({
+      text: 'Look',
+      html: '<table background="data:image/jpeg;base64,SlBFRw=="><tr><td>Look</td></tr></table>',
+      attachments: [photo],
+      inlineParts: [],
+    });
+    imapManager.fetchMultipleAttachments.mockResolvedValue(new Map([['3', jpeg]]));
+    query
+      .mockResolvedValueOnce({ rows: [{ id: 'delivery-1' }] })
+      .mockResolvedValueOnce({ rows: [{ ...messageRow, body_text: '', body_html: null, attachments: [photo] }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await expect(forwardRuleMessage(input)).resolves.toBe('sent');
+    expect(transport.sendMail.mock.calls[0][0].attachments.map(a => a.filename)).toEqual(['photo.jpg']);
+  });
+
+  it('does not attach again a listed photo the stored body shows inline, but does without HTML', async () => {
+    const photo = { part: '3', filename: 'photo.jpg', type: 'image/jpeg', encoding: 'base64', size: 3, shownInline: true };
+    const jpeg = Buffer.from('JPEG');
+    imapManager.fetchMultipleAttachments.mockResolvedValue(new Map([['3', jpeg]]));
+    const send = async (row) => {
+      query
+        .mockResolvedValueOnce({ rows: [{ id: 'delivery-1' }] })
+        .mockResolvedValueOnce({ rows: [row] })
+        .mockResolvedValueOnce({ rows: [] });
+      await expect(forwardRuleMessage(input)).resolves.toBe('sent');
+      return transport.sendMail.mock.calls.at(-1)[0].attachments.map(a => a.filename);
+    };
+
+    expect(await send({ ...messageRow, body_html: '<p>Look<img src="data:image/jpeg;base64,SlBFRw=="></p>', attachments: [photo] }))
+      .toEqual(['image-0.jpg']);
+    expect(await send({ ...messageRow, body_text: 'Look', body_html: null, attachments: [photo] }))
+      .toEqual(['photo.jpg']);
+  });
+
+  it('forwards an application/octet-stream image the stored body shows once, with the real file and no cache marker', async () => {
+    const logo = { part: '2', filename: 'logo.png', type: 'application/octet-stream', encoding: 'base64', size: 3, disposition: 'attachment', shownInline: true };
+    const data = { part: '3', filename: 'data.bin', type: 'application/octet-stream', encoding: 'base64', size: 3, disposition: 'attachment' };
+    imapManager.fetchMultipleAttachments.mockResolvedValue(new Map([['3', Buffer.from('BIN')]]));
+    query
+      .mockResolvedValueOnce({ rows: [{ id: 'delivery-1' }] })
+      .mockResolvedValueOnce({ rows: [{ ...messageRow, body_html: '<p>Hi<img src="data:image/png;base64,QUJD"></p><!--mf-cids-settled:3-->', attachments: [logo, data] }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await expect(forwardRuleMessage(input)).resolves.toBe('sent');
+    const mail = transport.sendMail.mock.calls[0][0];
+    expect(mail.attachments.map(a => a.filename)).toEqual(['image-0.png', 'data.bin']);
+    expect(mail.html).not.toContain('mf-cids-settled');
+  });
+
+  it('forwards a PDF named like an image as the file it is, not as an inline image', async () => {
+    const scan = { part: '2', filename: 'scan.png', type: 'application/octet-stream', encoding: 'base64', size: 3, disposition: 'attachment' };
+    const pdf = Buffer.from('%PDF');
+    // What fetchMessageBody gives for it: the HTML's reference left unresolved, nothing shown inline.
+    imapManager.fetchMessageBody.mockResolvedValue({
+      text: 'Scan', html: '<p>Scan<img src="cid:part-2-000000000000@mailflow.invalid"></p>', attachments: [scan], inlineParts: [],
+    });
+    imapManager.fetchMultipleAttachments.mockResolvedValue(new Map([['2', pdf]]));
+    query
+      .mockResolvedValueOnce({ rows: [{ id: 'delivery-1' }] })
+      .mockResolvedValueOnce({ rows: [{ ...messageRow, body_text: '', body_html: null, attachments: [scan] }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await expect(forwardRuleMessage(input)).resolves.toBe('sent');
+    expect(transport.sendMail.mock.calls[0][0].attachments).toEqual([expect.objectContaining({ filename: 'scan.png', content: pdf })]);
+  });
+
   it('rejects attachments larger than 25 MiB before SMTP delivery', async () => {
     const row = {
       ...messageRow,
@@ -550,5 +719,159 @@ describe('forwardRuleMessage', () => {
     expect(transport.sendMail).toHaveBeenCalledTimes(2);
     expect(createAccountSmtpTransport).toHaveBeenCalledTimes(2);
     expect(reservationStatus).toBe('sent');
+  });
+
+  // Every forward gets a reservation and the same source row.
+  function reserveEveryForward() {
+    query.mockImplementation(async sql => ({
+      rows: sql.includes('INSERT INTO inbox_rule_forwards')
+        ? [{ id: 'delivery-1' }]
+        : sql.includes('FROM messages') ? [messageRow] : [],
+    }));
+  }
+
+  it('stops a forward that comes back to a mailbox that already forwarded it', async () => {
+    const upstream = { ...account, id: 'account-0', email_address: 'upstream@example.net' };
+    const second = { ...account, id: 'account-2', email_address: 'second@example.org' };
+    const third = { ...account, id: 'account-3', email_address: 'third@example.org' };
+    const hops = [[upstream, account], [account, second], [second, third], [third, account]];
+    reserveEveryForward();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      let parsedHeaders;
+      for (const [index, [from, to]] of hops.entries()) {
+        await expect(forwardRuleMessage({
+          ...input,
+          ruleId: `rule-${index}`,
+          account: from,
+          recipient: to.email_address,
+          message: { id: `message-${index}`, parsedHeaders },
+        })).resolves.toBe('sent');
+        parsedHeaders = await deliveredHeaders(transport.sendMail.mock.calls[index][0]);
+      }
+      const queriesBeforeReturn = query.mock.calls.length;
+
+      await expect(forwardRuleMessage({
+        ...input,
+        recipient: second.email_address,
+        message: { id: 'message-4', parsedHeaders },
+      })).resolves.toBe('loop');
+
+      expect(query).toHaveBeenCalledTimes(queriesBeforeReturn);
+      expect(transport.sendMail).toHaveBeenCalledTimes(hops.length);
+      const tokens = parsedHeaders['x-mailflow-loop'].split(', ');
+      expect(tokens).toHaveLength(hops.length);
+      expect(new Set(tokens).size).toBe(hops.length);
+      for (const token of tokens) expect(token).toMatch(/^[0-9a-f]{16}$/);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const logged = warn.mock.calls.flat().join(' ');
+      for (const [from] of hops) expect(logged).not.toContain(from.email_address);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('stops a loop through ten mailboxes, the most a forward records', async () => {
+    const mailboxes = Array.from({ length: 10 }, (_, index) => ({
+      ...account,
+      id: `account-${index}`,
+      email_address: `mailbox${index}@example.org`,
+    }));
+    reserveEveryForward();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      let parsedHeaders;
+      for (const [index, from] of mailboxes.entries()) {
+        await expect(forwardRuleMessage({
+          ...input,
+          ruleId: `rule-${index}`,
+          account: from,
+          recipient: mailboxes[(index + 1) % mailboxes.length].email_address,
+          message: { id: `message-${index}`, parsedHeaders },
+        })).resolves.toBe('sent');
+        parsedHeaders = await deliveredHeaders(transport.sendMail.mock.calls[index][0]);
+      }
+      expect(parsedHeaders['x-mailflow-loop'].split(', ')).toHaveLength(10);
+
+      // Back at the first mailbox, whose token is now the oldest one kept.
+      await expect(forwardRuleMessage({
+        ...input,
+        ruleId: 'rule-0',
+        account: mailboxes[0],
+        recipient: mailboxes[1].email_address,
+        message: { id: 'message-10', parsedHeaders },
+      })).resolves.toBe('loop');
+      expect(transport.sendMail).toHaveBeenCalledTimes(mailboxes.length);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('passes on the nine newest well-formed tokens, so added tokens cannot stop a forward', async () => {
+    const added = Array.from({ length: 12 }, (_, i) => i.toString(16).repeat(16));
+    // A token anyone could compute from the address: an unkeyed hash of it.
+    const fromAddress = createHash('sha256')
+      .update(`mailflow-loop:${account.email_address}`)
+      .digest('hex')
+      .slice(0, 16);
+    reserveEveryForward();
+
+    await expect(forwardRuleMessage({
+      ...input,
+      message: {
+        id: 'message-2',
+        parsedHeaders: parseRawHeaders(
+          `X-MailFlow-Loop: ${[...added, fromAddress, 'mailbox@example.com'].join(', ')}`
+        ),
+      },
+    })).resolves.toBe('sent');
+
+    const delivered = await deliveredHeaders(transport.sendMail.mock.calls[0][0]);
+    const tokens = delivered['x-mailflow-loop'].split(', ');
+    expect(tokens.slice(0, -1)).toEqual([...added.slice(-8), fromAddress]);
+    expect(tokens.at(-1)).toMatch(/^[0-9a-f]{16}$/);
+    expect([...added, fromAddress]).not.toContain(tokens.at(-1));
+  });
+
+  it('reserves and sends nothing without a valid ENCRYPTION_KEY', async () => {
+    vi.resetModules();
+    vi.stubEnv('ENCRYPTION_KEY', '');
+    const { forwardRuleMessage: forward } = await import('./ruleForwarder.js');
+    const { query: freshQuery } = await import('./db.js');
+    const { createAccountSmtpTransport: freshSmtp } = await import('./smtpTransport.js');
+
+    await expect(forward(input)).rejects.toThrow(/ENCRYPTION_KEY/);
+    expect(freshQuery).not.toHaveBeenCalled();
+    expect(freshSmtp).not.toHaveBeenCalled();
+  });
+});
+
+// The stored body is already sanitized and ends with the sender's dark CSS switched off
+// (media="not all"). Sanitized again on the way out, the switch was dropped, so a forward of an
+// email with a dark design went out with its dark rules on: white text for the recipient.
+describe('forwarding a stored body', () => {
+  it("leaves the sender's dark design off", async () => {
+    vi.clearAllMocks();
+    query.mockReset();
+    const transport = { sendMail: vi.fn().mockResolvedValue({ accepted: true }) };
+    createAccountSmtpTransport.mockResolvedValue({ account, transport });
+    const stored = sanitizeEmail('<style>.x{color:#333} @media (prefers-color-scheme: dark){ .x{color:#fff !important} body{background:#000 !important} }</style><p class="x">Hello</p>');
+    expect(stored).toContain('media="not all"'); // as sync stores it
+    query
+      .mockResolvedValueOnce({ rows: [{ id: 'delivery-1' }] })
+      .mockResolvedValueOnce({ rows: [{ ...messageRow, body_html: stored }] })
+      .mockResolvedValueOnce({ rows: [] });
+    await expect(forwardRuleMessage({
+      ruleId: 'rule-1', message: { id: messageRow.id }, account,
+      imapManager: { fetchMessageBody: vi.fn(), fetchMultipleAttachments: vi.fn().mockResolvedValue(new Map()) },
+      recipient: 'recipient@example.com',
+    })).resolves.toBe('sent');
+    const { html } = transport.sendMail.mock.calls[0][0];
+    expect(html).toContain('Hello');
+    expect(html).toContain('.x{color:#333}');
+    expect(html).not.toContain('#fff');
+    expect(html).not.toContain('background:#000');
   });
 });

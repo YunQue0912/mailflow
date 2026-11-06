@@ -1,15 +1,68 @@
 import { query } from './db.js';
 import { resolveAccountScope } from './unifiedInbox.js';
+import { draftMessageSql } from '../utils/mailUtils.js';
 
-export async function listMessages({ userId, accountId, folder = 'INBOX', limit = 50, offset = 0, unreadOnly, threaded, threadScope = 'folder', category }) {
+// Where snoozed mail waits (routes/mail.js snoozes into it, imapManager wakes it from it). On a
+// server with an INBOX. namespace prefix the folder is INBOX.Snoozed: the snooze route stores the
+// path the server gave it, on the message and on its snooze record.
+export const SNOOZED_FOLDER = 'Snoozed';
+
+// Snoozed mail outside the folder named Snoozed (in INBOX.Snoozed, or wherever a rename took it) is
+// a message whose own snooze record names the folder it is in; the folder's other mail is not
+// snoozed. The ANY over the folders the records name lets the (account_id, folder) index find it.
+const snoozedElsewhereSql = (accounts) =>
+  `(m.folder = ANY(ARRAY(SELECT DISTINCT sm.snoozed_folder FROM snoozed_messages sm WHERE sm.account_id = ANY(${accounts})))`
+  + ' AND EXISTS (SELECT 1 FROM snoozed_messages own WHERE own.account_id = m.account_id'
+  + ' AND own.message_id_header = m.message_id AND own.snoozed_folder = m.folder))';
+
+// List orders (#528). Each maps to fixed SQL, never to text from the request. Sender and Subject
+// sort on what the row shows: the sender's name, or the address when there is none, and the
+// subject without its Re:/Fwd: prefixes (normalized_subject, a generated column). A conversation
+// row shows its opener's sender and subject, so the threaded list sorts by the opener's.
+// #407: a UID-only placeholder row whose envelope has not been fetched yet (see listMessages).
+// Lists and the counts beside them leave it out.
+export const NOT_PLACEHOLDER_SQL = "NOT (m.message_id IS NULL AND (m.subject IS NULL OR m.subject = '(no subject)') AND COALESCE(m.snippet, '') = '')";
+
+export const LIST_SORTS = ['date', 'from', 'subject'];
+export const LIST_SORT_DIRS = ['asc', 'desc'];
+// A row with no sender or subject sorts last either way (NULLS LAST), as the client orders it.
+const SENDER_SQL = "nullif(lower(coalesce(nullif(m.from_name, ''), m.from_email)), '')";
+const SUBJECT_SQL = "nullif(m.normalized_subject, '')";
+const OPENER_SQL = {
+  from: `(array_agg(${SENDER_SQL} ORDER BY m.date ASC, m.id))[1]`,
+  subject: `(array_agg(${SUBJECT_SQL} ORDER BY m.date ASC, m.id))[1]`,
+};
+
+// The ORDER BY keys for a list. Every order ends on date and id, so equal keys still page stably.
+// Date newest first is exactly the order the list always had, which idx_messages_list serves.
+function listOrderSql({ sort, dir, starredFirst, threaded }) {
+  const d = dir === 'asc' ? 'ASC' : 'DESC';
+  const keys = [];
+  if (starredFirst) keys.push(threaded ? 'bool_or(m.is_starred) DESC' : 'm.is_starred DESC');
+  if (sort === 'from' || sort === 'subject') {
+    keys.push(`${threaded ? OPENER_SQL[sort] : sort === 'from' ? SENDER_SQL : SUBJECT_SQL} ${d} NULLS LAST`);
+    keys.push(threaded ? 'MAX(m.date) DESC' : 'm.date DESC');
+  } else {
+    keys.push(threaded ? `MAX(m.date) ${d}` : `m.date ${d}`);
+  }
+  keys.push(threaded ? 'm.thread_key' : 'm.id');
+  return keys.join(', ');
+}
+
+export async function listMessages({ userId, accountId, folder = 'INBOX', limit = 50, offset = 0, unreadOnly, threaded, category, sort, dir, starredFirst }) {
   const accountsResult = await query(
     'SELECT id, include_in_unified_inbox FROM email_accounts WHERE user_id = $1 AND enabled = true',
     [userId]
   );
-  const {
-    accountIds: scopedAccountIds,
-    resolvedAccountId,
-  } = resolveAccountScope(accountsResult.rows, accountId);
+  // The Snoozed view (#269): snoozed mail with when it comes back, soonest first, one row per
+  // message. Without an account it is every enabled account's: a snooze is the reader's own,
+  // whether or not the account shows in All Inboxes.
+  const isSnoozedView = folder === SNOOZED_FOLDER;
+  const scope = resolveAccountScope(accountsResult.rows, accountId);
+  const resolvedAccountId = scope.resolvedAccountId;
+  const scopedAccountIds = isSnoozedView && resolvedAccountId === null
+    ? accountsResult.rows.map(r => r.id)
+    : scope.accountIds;
   if (!scopedAccountIds.length) return { messages: [], total: 0 };
 
   let whereConditions = ['m.is_deleted = false'];
@@ -24,9 +77,12 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
     whereConditions.push(`m.folder = $${p++}`);
     values.push(folder);
   } else {
-    whereConditions.push(`m.account_id = ANY($${p++})`);
+    const accountsParam = `$${p++}`;
+    whereConditions.push(`m.account_id = ANY(${accountsParam})`);
     values.push(scopedAccountIds);
-    whereConditions.push(`m.folder = 'INBOX'`);
+    whereConditions.push(isSnoozedView
+      ? `(m.folder = '${SNOOZED_FOLDER}' OR ${snoozedElsewhereSql(accountsParam)})`
+      : `m.folder = 'INBOX'`);
   }
 
   const isUnreadOnly = unreadOnly === 'true' || unreadOnly === true;
@@ -47,16 +103,29 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
   // Message-ID, a real subject, or a snippet, so this predicate only ever hides the hollow
   // placeholder, never a real message. Applies to both the flat and threaded queries (shared
   // `where`), so pagination and the threaded count stay consistent.
-  whereConditions.push(`NOT (m.message_id IS NULL AND (m.subject IS NULL OR m.subject = '(no subject)') AND COALESCE(m.snippet, '') = '')`);
+  whereConditions.push(NOT_PLACEHOLDER_SQL);
 
   const where = whereConditions.join(' AND ');
+
+  // The Snoozed view keeps its own order: soonest back first.
+  const order = {
+    sort: !isSnoozedView && LIST_SORTS.includes(sort) ? sort : 'date',
+    dir: !isSnoozedView && dir === 'asc' ? 'asc' : 'desc',
+    starredFirst: !isSnoozedView && (starredFirst === 'true' || starredFirst === true),
+  };
 
   const safeLimit  = Math.min(Math.max(parseInt(limit)  || 50, 1), 500);
   const safeOffset = Math.max(parseInt(offset) || 0, 0);
 
   let total = 0;
   try {
-    if (isSpecificAccount) {
+    if (safeCategory && !isSnoozedView) {
+      // A category tab lists only that category's mail; the folder's counts are of all its mail,
+      // so the list offered pages, or a "Load more", with nothing on them (#611). Counted by
+      // row, as the threaded list is.
+      const r = await query(`SELECT COUNT(*)::int AS n FROM messages m WHERE ${where}`, values);
+      total = r.rows[0]?.n ?? 0;
+    } else if (isSpecificAccount) {
       const r = await query(
         'SELECT total_count, unread_count FROM folders WHERE account_id = $1 AND path = $2',
         [accountId, folder]
@@ -65,14 +134,21 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
         total = isUnreadOnly ? (r.rows[0].unread_count ?? 0) : (r.rows[0].total_count ?? 0);
       }
     } else {
+      const unifiedPath = isSnoozedView ? SNOOZED_FOLDER : 'INBOX';
+      // Snoozed mail outside the folder named Snoozed is counted by row, as it is listed: the count
+      // of the folder it is in takes in that folder's other mail too.
+      const plusSnoozedElsewhere = isSnoozedView
+        ? ' + (SELECT COUNT(*)::int FROM messages m WHERE m.account_id = ANY($1) AND m.folder <> $2'
+          + ` AND m.is_deleted = false${isUnreadOnly ? ' AND m.is_read = false' : ''} AND ${snoozedElsewhereSql('$1')})`
+        : '';
       const r = isUnreadOnly
         ? await query(
-            "SELECT COALESCE(SUM(unread_count), 0)::int AS n FROM folders WHERE account_id = ANY($1) AND path = 'INBOX'",
-            [scopedAccountIds]
+            `SELECT COALESCE(SUM(unread_count), 0)::int${plusSnoozedElsewhere} AS n FROM folders WHERE account_id = ANY($1) AND path = $2`,
+            [scopedAccountIds, unifiedPath]
           )
         : await query(
-            "SELECT COALESCE(SUM(total_count), 0)::int AS n FROM folders WHERE account_id = ANY($1) AND path = 'INBOX'",
-            [scopedAccountIds]
+            `SELECT COALESCE(SUM(total_count), 0)::int${plusSnoozedElsewhere} AS n FROM folders WHERE account_id = ANY($1) AND path = $2`,
+            [scopedAccountIds, unifiedPath]
           );
       total = r.rows[0]?.n ?? 0;
     }
@@ -80,26 +156,20 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
     total = 0;
   }
 
-  if (threaded === 'true' || threaded === true) {
+  if (!isSnoozedView && (threaded === 'true' || threaded === true)) {
     const filterValues = [...values];
     const threadAccountParam = isSpecificAccount ? [resolvedAccountId] : scopedAccountIds;
-    // For INBOX-specific views the thread badge must match the expansion, so scope
-    // thread_totals to that folder. For other folders (All Mail, Sent, etc.) count
-    // across all folders so the badge reflects the true thread size.
-    const threadFolderFilter = threadScope === 'all'
-      ? ''
-      : isSpecificAccount
-        ? (folder === 'INBOX' ? `AND folder = $2` : '')
-        : `AND folder = 'INBOX'`;
 
     const threadResult = await query(`
       WITH paged_threads AS (
-        SELECT m.thread_key AS thread_id
+        SELECT m.thread_key AS thread_id,
+               -- The page's own order, which the rows are returned in at the end.
+               ROW_NUMBER() OVER (ORDER BY ${listOrderSql({ ...order, threaded: true })}) AS pos
         FROM messages m
         WHERE ${where}
         GROUP BY m.thread_key
         -- thread_key breaks exact date ties so paging is stable (see the flat query).
-        ORDER BY MAX(m.date) DESC, m.thread_key
+        ORDER BY ${listOrderSql({ ...order, threaded: true })}
         LIMIT $${p + 1} OFFSET $${p + 2}
       ),
       deduped AS MATERIALIZED (
@@ -107,7 +177,7 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
                m.id, m.uid, m.folder, m.message_id,
                m.thread_key AS thread_id,
                m.subject, m.from_name, m.from_email,
-               m.to_addresses, m.cc_addresses, m.reply_to, m.in_reply_to,
+               m.to_addresses, m.cc_addresses, m.reply_to, m.in_reply_to, m.thread_references,
                m.date, m.snippet, m.is_read, m.is_starred,
                m.has_attachments, m.account_id, m.category,
                m.list_unsubscribe, m.list_unsubscribe_post, m.delivery_addresses,
@@ -136,10 +206,20 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
                -- has to count both or it reads 1 beside a conversation holding 2 (#476).
                COUNT(DISTINCT (m.account_id, m.message_id))::int AS message_count
         FROM messages m
+        -- Every folder, not just the one listed: the badge has to match what expanding the
+        -- row or opening the conversation shows, and the thread route loads the thread from
+        -- all folders. An INBOX-only count left your own replies (in Sent) out, so a received
+        -- message plus your reply counted 1, and the row could neither expand nor open the
+        -- conversation view until a second reply arrived (#576).
+        --
+        -- Except drafts. A count of 2 makes the row a conversation, and deleting or moving a
+        -- conversation takes every message in it; a deleted draft is expunged for good. A saved
+        -- reply must not turn its message into a conversation and be swept away with it. A draft
+        -- is known by its IMAP Draft flag or by its folder (draftMessageSql in mailUtils.js).
         WHERE m.account_id = ANY($${p})
           AND m.is_deleted = false
           AND m.message_id IS NOT NULL
-          ${threadFolderFilter}
+          AND NOT ${draftMessageSql('m')}
           AND m.thread_key IN (SELECT thread_id FROM paged_threads)
         GROUP BY m.thread_key
       ),
@@ -160,7 +240,8 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
       )
       SELECT id, uid, folder, message_id, thread_id, thread_subject AS subject,
              thread_from_name AS from_name, thread_from_email AS from_email,
-             to_addresses, cc_addresses, reply_to, in_reply_to,
+             from_name AS reply_from_name, from_email AS reply_from_email, subject AS reply_subject,
+             to_addresses, cc_addresses, reply_to, in_reply_to, thread_references,
              date, snippet, is_starred, is_read, has_attachments, account_id,
              account_name, account_email, account_color,
              category, list_unsubscribe, list_unsubscribe_post, delivery_addresses,
@@ -168,8 +249,9 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
              message_count, unread_count,
              thread_has_contact_photo AS has_contact_photo
       FROM ranked
+      JOIN paged_threads pt USING (thread_id)
       WHERE rn = 1
-      ORDER BY date DESC, id
+      ORDER BY pt.pos
     `, [...filterValues, threadAccountParam, safeLimit, safeOffset]);
 
     const threadCountResult = await query(`
@@ -192,23 +274,31 @@ export async function listMessages({ userId, accountId, folder = 'INBOX', limit 
 
   const result = await query(`
     SELECT m.id, m.uid, m.folder, m.message_id, m.subject, m.from_name, m.from_email,
-           m.to_addresses, m.cc_addresses, m.reply_to, m.in_reply_to,
+           m.to_addresses, m.cc_addresses, m.reply_to, m.in_reply_to, m.thread_references,
            m.date, m.snippet, m.is_read, m.is_starred,
            m.has_attachments, m.account_id, m.category,
            m.list_unsubscribe, m.list_unsubscribe_post, m.delivery_addresses,
            m.spam_verdict, m.spam_user_override, m.spam_score_ml,
            a.name as account_name, a.email_address as account_email, a.color as account_color,
-           (co.id IS NOT NULL) AS has_contact_photo
+           (co.id IS NOT NULL) AS has_contact_photo${isSnoozedView ? ', sz.snooze_until, sz.snoozed_folder' : ''}
     FROM messages m
     JOIN email_accounts a ON m.account_id = a.id
     LEFT JOIN contacts co ON co.user_id = a.user_id
                           AND co.primary_email = lower(m.from_email)
-                          AND co.photo_data IS NOT NULL
+                          AND co.photo_data IS NOT NULL${isSnoozedView ? `
+    -- When it comes back: its live snooze record (routes/mail.js LIVE_SNOOZE_SQL's match). The
+    -- record's folder tells the client the mail is snoozed where the folder is not named Snoozed.
+    LEFT JOIN LATERAL (
+      SELECT sm.snooze_until, sm.snoozed_folder FROM snoozed_messages sm
+      WHERE sm.account_id = m.account_id AND sm.message_id_header = m.message_id
+        AND sm.snoozed_folder = m.folder
+      ORDER BY sm.snooze_until LIMIT 1
+    ) sz ON true` : ''}
     WHERE ${where}
     -- m.id breaks exact date ties. Without it the sort is unspecified, so LIMIT/OFFSET
     -- paging could show a row twice or skip it entirely, and the client-side duplicate
     -- collapse would receive the two copies of a message in an arbitrary order.
-    ORDER BY m.date DESC, m.id
+    ORDER BY ${isSnoozedView ? 'sz.snooze_until ASC NULLS LAST, m.date DESC, m.id' : listOrderSql(order)}
     LIMIT $${limitParam} OFFSET $${offsetParam}
   `, values);
 

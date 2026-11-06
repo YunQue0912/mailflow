@@ -1,72 +1,259 @@
 import { Router } from 'express';
 import crypto from 'crypto';
-import { query } from '../services/db.js';
+import bcrypt from 'bcryptjs';
+import { query, withTransaction } from '../services/db.js';
 import { requireAdmin } from '../middleware/auth.js';
+import { logAuthEvent } from '../services/authEvents.js';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { validateHost, resolveForConnection } from '../services/hostValidation.js';
 import { createSmtpTransport } from '../services/smtpTransport.js';
 import { getConnectionPolicy, invalidateConnectionPolicyCache } from '../services/connectionPolicy.js';
+import {
+  invalidateApiTokenSettingsCache, revokedTokensNote, revokeProviderTokens, revokeTokensForPolicy,
+} from '../services/apiTokens.js';
 import { reloadAuthSettings } from '../services/authLimiter.js';
 import { imapManager } from '../index.js';
 import { stopCardavUser } from '../services/carddavSync.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import { uuidParam } from '../utils/uuid.js';
+import { destroyUserSessions } from '../services/userSessions.js';
+import { listUserIdentities, removeIdentitiesForPasswordReset, unlinkUserIdentity } from '../services/userIdentities.js';
 
 const router = Router();
 router.use(requireAdmin);
 // Reject a malformed :id (user UUID) with a 400 before it reaches a uuid-typed query.
 router.param('id', uuidParam('id'));
+router.param('identityId', uuidParam('identityId'));
 
 // ── Users ──────────────────────────────────────────────────────────────────────
 
-router.get('/users', async (req, res) => {
+// The profile photo is stored as a data: URL. Only raster image URLs are passed on: the list
+// renders them in an <img>, and anything else a user managed to store (the column takes any text)
+// is dropped rather than handed to an admin's browser.
+const AVATAR_RE = /^data:image\/(?:jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+function safeAvatar(avatar) {
+  return typeof avatar === 'string' && AVATAR_RE.test(avatar) ? avatar : null;
+}
+
+export async function listUsers(req, res) {
   const limit  = Math.min(parseInt(req.query.limit)  || 100, 200);
   const offset = Math.max(parseInt(req.query.offset) || 0,   0);
   const [result, countResult] = await Promise.all([
     query(
-      'SELECT id, username, is_admin, totp_enabled, created_at FROM users ORDER BY created_at ASC LIMIT $1 OFFSET $2',
+      `SELECT id, username, is_admin, totp_enabled, created_at, avatar, last_seen_at, recovery_email,
+              ai_enabled, password_hash IS NOT NULL AS has_password
+         FROM users ORDER BY created_at ASC LIMIT $1 OFFSET $2`,
       [limit, offset],
     ),
     query('SELECT COUNT(*) AS total FROM users'),
   ]);
   res.json({
-    users: result.rows.map(u => ({ ...u, isAdmin: u.is_admin, totpEnabled: u.totp_enabled })),
+    users: result.rows.map(u => ({
+      id: u.id,
+      username: u.username,
+      created_at: u.created_at,
+      avatar: safeAvatar(u.avatar),
+      isAdmin: u.is_admin,
+      totpEnabled: u.totp_enabled,
+      lastSeenAt: u.last_seen_at,
+      recoveryEmail: u.recovery_email,
+      hasPassword: u.has_password,
+      aiEnabled: u.ai_enabled,
+    })),
     total: parseInt(countResult.rows[0].total),
   });
-});
+}
+router.get('/users', listUsers);
 
-router.post('/users/:id/totp/disable', async (req, res) => {
+// An admin can set any user's password and recovery email, and turn off their 2FA, so between
+// them any admin can sign in as any user. Each of those changes, and deleting a user, goes to the
+// security log with the admin who made it, not only to the server log. The admin's name is read from the database
+// rather than the session, which keeps the name they signed in with.
+async function logAdminChange(req, eventType, target) {
+  const actor = await query('SELECT username FROM users WHERE id = $1', [req.session.userId])
+    .then(r => r.rows[0]?.username, () => null);
+  logAuthEvent(eventType, {
+    username: target.username, userId: target.id,
+    actorUsername: actor || req.session.username || null, ip: req.ip, success: true,
+  });
+}
+
+// Usually a recovery, for someone who has lost their authenticator, so their API tokens go too: they
+// may have gone with it, and the user makes new ones once they are back in (#617).
+export async function disableUserTotp(req, res) {
   const { id } = req.params;
   if (id === req.session.userId) {
     return res.status(400).json({ error: 'Use your account settings to manage your own 2FA.' });
   }
   const target = await query('SELECT username FROM users WHERE id = $1', [id]);
   if (!target.rows.length) return res.status(404).json({ error: 'User not found' });
-  await query('UPDATE users SET totp_secret = NULL, totp_enabled = false WHERE id = $1', [id]);
-  console.log(`[admin] ${req.session.username} disabled 2FA for user ${target.rows[0].username} (${id})`);
+  const revoked = await withTransaction(async client => {
+    await client.query('UPDATE users SET totp_secret = NULL, totp_enabled = false WHERE id = $1', [id]);
+    return (await client.query('DELETE FROM api_tokens WHERE user_id = $1', [id])).rowCount;
+  });
+  console.log(`[admin] ${req.session.username} disabled 2FA for user ${target.rows[0].username} (${id})${revokedTokensNote(revoked)}`);
+  await logAdminChange(req, 'admin_totp_disable', { id, username: target.rows[0].username });
   res.json({ ok: true });
-});
+}
+router.post('/users/:id/totp/disable', disableUserTotp);
 
-router.patch('/users/:id', async (req, res) => {
+// The same rules registration applies: stored lower-case, 1-120 characters, no control
+// characters. Returns the normalized name or an error message.
+function normalizeUsername(raw) {
+  if (typeof raw !== 'string') return { error: 'Username required' };
+  const username = raw.toLowerCase().trim();
+  if (username.length < 1 || username.length > 120) {
+    return { error: 'Username must be between 1 and 120 characters' };
+  }
+  // eslint-disable-next-line no-control-regex -- intentionally rejecting control characters
+  if (/[\x00-\x1f\x7f]/.test(username)) return { error: 'Username contains invalid characters' };
+  return { username };
+}
+
+// Changes any of isAdmin, aiEnabled, username and recoveryEmail; fields left out are not touched.
+export async function updateUser(req, res) {
   const { id } = req.params;
-  const { isAdmin } = req.body;
+  const { isAdmin, aiEnabled, username, recoveryEmail } = req.body ?? {};
 
   // Prevent removing your own admin status
   if (id === req.session.userId && isAdmin === false) {
     return res.status(400).json({ error: 'Cannot remove your own admin status' });
   }
 
-  const target = await query('SELECT username FROM users WHERE id = $1', [id]);
-  if (!target.rows.length) return res.status(404).json({ error: 'User not found' });
+  const sets = [];
+  const values = [];
+  const changes = [];
+  if (isAdmin !== undefined) {
+    if (typeof isAdmin !== 'boolean') return res.status(400).json({ error: 'isAdmin must be true or false' });
+    values.push(isAdmin);
+    sets.push(`is_admin = $${values.length}`);
+    changes.push(`is_admin=${isAdmin}`);
+  }
+  // Whether the user may use the instance's AI provider (#644). Takes effect on their next AI
+  // request: the AI routes read it from the database each time.
+  if (aiEnabled !== undefined) {
+    if (typeof aiEnabled !== 'boolean') return res.status(400).json({ error: 'aiEnabled must be true or false' });
+    values.push(aiEnabled);
+    sets.push(`ai_enabled = $${values.length}`);
+    changes.push(`ai_enabled=${aiEnabled}`);
+  }
+  let newUsername;
+  if (username !== undefined) {
+    const normalized = normalizeUsername(username);
+    if (normalized.error) return res.status(400).json({ error: normalized.error });
+    newUsername = normalized.username;
+    values.push(normalized.username);
+    sets.push(`username = $${values.length}`);
+    changes.push(`username=${normalized.username}`);
+  }
+  let email;
+  if (recoveryEmail !== undefined) {
+    email = recoveryEmail ? String(recoveryEmail).trim().toLowerCase() : null;
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Invalid email address' });
+    }
+    values.push(email);
+    sets.push(`recovery_email = $${values.length}`);
+    changes.push('recovery_email');
+  }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to change' });
 
-  await query('UPDATE users SET is_admin = $1 WHERE id = $2', [isAdmin, id]);
-  console.log(`[admin] ${req.session.username} set is_admin=${isAdmin} for user ${target.rows[0].username} (${id})`);
+  const target = await query('SELECT username, recovery_email FROM users WHERE id = $1', [id]);
+  if (!target.rows.length) return res.status(404).json({ error: 'User not found' });
+  const emailChanged = email !== undefined && email !== (target.rows[0].recovery_email ?? null);
+
+  values.push(id);
+  try {
+    await withTransaction(async client => {
+      await client.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${values.length}`, values);
+      // A reset link or login code already sent to the old address must stop working: the
+      // address may be changing because someone else has it.
+      if (emailChanged) {
+        await client.query('DELETE FROM password_reset_tokens WHERE user_id = $1', [id]);
+        await client.query('DELETE FROM email_otp_tokens WHERE user_id = $1', [id]);
+      }
+    });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Username already taken' });
+    throw err;
+  }
+  console.log(`[admin] ${req.session.username} changed ${changes.join(', ')} for user ${target.rows[0].username} (${id})`);
+  const finalUsername = newUsername ?? target.rows[0].username;
+  // An admin renaming themselves: the session keeps the name for the server log lines.
+  if (id === req.session.userId) req.session.username = finalUsername;
+  await logAdminChange(req, 'admin_user_update', { id, username: finalUsername });
 
   // If user is currently logged in, their session isAdmin will be refreshed on next /me call
   res.json({ ok: true });
-});
+}
+router.patch('/users/:id', updateUser);
 
-router.delete('/users/:id', async (req, res) => {
+// Sets a user's password, for someone who has lost theirs and has no recovery email. It takes
+// away what a self-service reset does, and more: every session (an admin setting their own keeps
+// the session they are using), trusted devices, which skip the second factor, API tokens, any reset
+// link or login code already sent, which would otherwise still set a different password or sign
+// in, and, while password sign-in is on, linked single sign-on identities (#714).
+export async function setUserPassword(req, res) {
+  const { id } = req.params;
+  const { password } = req.body ?? {};
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
+  if (Buffer.byteLength(password, 'utf8') > 72) {
+    // bcrypt ignores everything past 72 bytes, so a longer password would not mean what it says.
+    return res.status(400).json({ error: 'Password must be at most 72 bytes' });
+  }
+  const target = await query('SELECT username FROM users WHERE id = $1', [id]);
+  if (!target.rows.length) return res.status(404).json({ error: 'User not found' });
+
+  const hash = await bcrypt.hash(password, 12);
+  const removed = await withTransaction(async client => {
+    await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [id]);
+    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, id]);
+    await client.query('DELETE FROM trusted_devices WHERE user_id = $1', [id]);
+    await client.query('DELETE FROM password_reset_tokens WHERE user_id = $1', [id]);
+    await client.query('DELETE FROM email_otp_tokens WHERE user_id = $1', [id]);
+    // Identities before tokens: removing them reads the sign-in policy row shared, and an admin's
+    // policy change updates that row before it deletes tokens, so the two cannot wait on each other.
+    const removed = await removeIdentitiesForPasswordReset(client, id);
+    await client.query('DELETE FROM api_tokens WHERE user_id = $1', [id]);
+    return removed;
+  });
+  await destroyUserSessions(id, { exceptSessionId: id === req.session.userId ? req.sessionID : undefined });
+  console.log(`[admin] ${req.session.username} set a new password for user ${target.rows[0].username} (${id})`);
+  await logAdminChange(req, 'admin_password_set', { id, username: target.rows[0].username });
+  if (removed.length) console.log(`[admin] the new password removed ${removed.length} linked identity(s) of ${target.rows[0].username}: ${removed.map(i => i.provider_name).join(', ')}`);
+  await Promise.all(removed.map(() => logAdminChange(req, 'identity_unlinked', { id, username: target.rows[0].username })));
+  res.json({ ok: true });
+}
+router.post('/users/:id/password', setUserPassword);
+
+// A user's linked single sign-on identities, so an admin can see one the user didn't add (#714).
+export async function listIdentities(req, res) {
+  const target = await query('SELECT 1 FROM users WHERE id = $1', [req.params.id]);
+  if (!target.rows.length) return res.status(404).json({ error: 'User not found' });
+  res.json({ identities: await listUserIdentities({ query }, req.params.id) });
+}
+router.get('/users/:id/identities', listIdentities);
+
+// Removes one of a user's identities, unless the user could then no longer sign in.
+export async function unlinkIdentity(req, res) {
+  const { id, identityId } = req.params;
+  const target = await query('SELECT username FROM users WHERE id = $1', [id]);
+  if (!target.rows.length) return res.status(404).json({ error: 'User not found' });
+  const result = await withTransaction(client => unlinkUserIdentity(client, id, identityId));
+  if (result.notFound) return res.status(404).json({ error: 'Identity not found' });
+  if (result.lastSignIn) {
+    return res.status(400).json({ error: 'This is the user\'s only way to sign in. Set a password for them first, with password sign-in turned on.' });
+  }
+  await destroyUserSessions(id, { exceptSessionId: id === req.session.userId ? req.sessionID : undefined });
+  console.log(`[admin] ${req.session.username} unlinked ${result.identity.provider_name} identity ${result.identity.id} from user ${target.rows[0].username} (${id})${revokedTokensNote(result.revokedTokens)}`);
+  await logAdminChange(req, 'identity_unlinked', { id, username: target.rows[0].username });
+  res.json({ ok: true });
+}
+router.delete('/users/:id/identities/:identityId', unlinkIdentity);
+
+export async function deleteUser(req, res) {
   const { id } = req.params;
   if (id === req.session.userId) {
     return res.status(400).json({ error: 'Cannot delete your own account' });
@@ -84,8 +271,12 @@ router.delete('/users/:id', async (req, res) => {
   // completed delete as a 500. The hook swallows per-plugin errors.
   await pluginRegistry.runHook('onUserDelete', { userId: id });
   console.log(`[admin] ${req.session.username} deleted user ${target.rows[0].username} (${id})`);
+  // Logged once the delete has happened, and by name only: the event's user_id references
+  // users, and the row it would point at is gone.
+  await logAdminChange(req, 'admin_user_delete', { id: null, username: target.rows[0].username });
   res.json({ ok: true });
-});
+}
+router.delete('/users/:id', deleteUser);
 
 // ── System settings ────────────────────────────────────────────────────────────
 
@@ -96,12 +287,69 @@ router.get('/settings', async (req, res) => {
   res.json({ settings });
 });
 
+// ── Business license notice ────────────────────────────────────────────────────
+
+// Admins of an instance that looks like a business (BUSINESS_NOTICE_MIN_USERS users, or single
+// sign-on configured) are asked once to consider the voluntary business license. Everything is
+// decided here from local data; nothing is sent anywhere. The answer is stored instance-wide, so
+// one admin's choice covers the others.
+const BUSINESS_NOTICE_KEY = 'business_notice';
+const BUSINESS_NOTICE_MIN_USERS = 3;
+const BUSINESS_NOTICE_MIN_AGE_DAYS = 14;
+const BUSINESS_NOTICE_REMIND_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Stored value: 'licensed' | 'not_business' | 'later:<ISO date>' | absent
+export function businessNoticeDue(state, now = new Date()) {
+  if (!state) return true;
+  if (state === 'licensed' || state === 'not_business') return false;
+  const later = /^later:(.+)$/.exec(state);
+  if (later) {
+    const until = new Date(later[1]);
+    return Number.isNaN(until.getTime()) || until <= now;
+  }
+  return true;
+}
+
+export async function getBusinessNotice(req, res) {
+  const [setting, users, oidc] = await Promise.all([
+    query('SELECT value FROM system_settings WHERE key = $1', [BUSINESS_NOTICE_KEY]),
+    query('SELECT COUNT(*) AS total, MIN(created_at) AS first FROM users'),
+    query('SELECT COUNT(*) AS count FROM oidc_providers WHERE enabled = true'),
+  ]);
+  const total = parseInt(users.rows[0].total);
+  const first = users.rows[0].first ? new Date(users.rows[0].first) : null;
+  // A fresh install is still being tried out: wait until it has been in use for a while
+  const settled = first !== null && Date.now() - first.getTime() >= BUSINESS_NOTICE_MIN_AGE_DAYS * DAY_MS;
+  const looksLikeBusiness = total >= BUSINESS_NOTICE_MIN_USERS || parseInt(oidc.rows[0].count) > 0;
+  res.json({ show: looksLikeBusiness && settled && businessNoticeDue(setting.rows[0]?.value) });
+}
+
+const BUSINESS_NOTICE_CHOICES = new Set(['licensed', 'not_business', 'later']);
+
+export async function setBusinessNotice(req, res) {
+  const choice = req.body?.choice;
+  if (!BUSINESS_NOTICE_CHOICES.has(choice)) return res.status(400).json({ error: 'Invalid choice' });
+  const value = choice === 'later'
+    ? `later:${new Date(Date.now() + BUSINESS_NOTICE_REMIND_DAYS * DAY_MS).toISOString()}`
+    : choice;
+  await query(
+    `INSERT INTO system_settings (key, value, updated_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+    [BUSINESS_NOTICE_KEY, value],
+  );
+  res.json({ ok: true });
+}
+
+router.get('/business-notice', getBusinessNotice);
+router.post('/business-notice', setBusinessNotice);
+
 router.get('/auth-events', async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, 500);
   const offset = Math.max(parseInt(req.query.offset) || 0, 0);
   const [eventsResult, countResult] = await Promise.all([
     query(
-      `SELECT id, event_type, username, user_id, ip, success, created_at
+      `SELECT id, event_type, username, user_id, actor_username, ip, success, created_at
        FROM auth_events ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
       [limit, offset]
     ),
@@ -113,7 +361,7 @@ router.get('/auth-events', async (req, res) => {
 router.patch('/settings', async (req, res) => {
   const { registration_open, internal_auth_disabled, auth_max_attempts, auth_window_minutes,
     allow_private_hosts, allow_insecure_tls, allow_nonstandard_ports,
-    mfa_enforcement, mfa_device_trust, custom_css } = req.body;
+    mfa_enforcement, mfa_device_trust, custom_css, backup_include_mail, api_tokens_enabled } = req.body;
   if (typeof registration_open === 'boolean') {
     await query(
       `INSERT INTO system_settings (key, value, updated_at)
@@ -121,6 +369,17 @@ router.patch('/settings', async (req, res) => {
        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
       [registration_open ? 'true' : 'false']
     );
+  }
+  // Turning API tokens off refuses every token at once, and keeps them for when they come back on.
+  if (typeof api_tokens_enabled === 'boolean') {
+    await query(
+      `INSERT INTO system_settings (key, value, updated_at) VALUES ('api_tokens_enabled', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+      [api_tokens_enabled ? 'true' : 'false']
+    );
+    // Here as well as below: a later setting that is refused returns before the end.
+    invalidateApiTokenSettingsCache();
+    console.log(`[admin] ${req.session.username} turned API tokens ${api_tokens_enabled ? 'on' : 'off'}`);
   }
   if (typeof internal_auth_disabled === 'boolean') {
     if (internal_auth_disabled) {
@@ -146,13 +405,18 @@ router.patch('/settings', async (req, res) => {
         });
       }
     }
-    await query(
-      `INSERT INTO system_settings (key, value, updated_at)
-       VALUES ('internal_auth_disabled', $1, NOW())
-       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
-      [internal_auth_disabled ? 'true' : 'false']
-    );
-    console.log(`[admin] ${req.session.username} set internal_auth_disabled=${internal_auth_disabled}`);
+    // With password sign-in off, only the single sign-on provider vouches for anyone, so a token
+    // confirmed any other way goes with the change (#617).
+    const revoked = await withTransaction(async client => {
+      await client.query(
+        `INSERT INTO system_settings (key, value, updated_at)
+         VALUES ('internal_auth_disabled', $1, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+        [internal_auth_disabled ? 'true' : 'false']
+      );
+      return internal_auth_disabled ? revokeTokensForPolicy(client, 'ssoOnly') : 0;
+    });
+    console.log(`[admin] ${req.session.username} set internal_auth_disabled=${internal_auth_disabled}${revokedTokensNote(revoked)}`);
   }
   if (auth_max_attempts != null) {
     const val = parseInt(auth_max_attempts);
@@ -181,6 +445,7 @@ router.patch('/settings', async (req, res) => {
     ['allow_private_hosts', allow_private_hosts],
     ['allow_insecure_tls', allow_insecure_tls],
     ['allow_nonstandard_ports', allow_nonstandard_ports],
+    ['backup_include_mail', backup_include_mail],
   ]) {
     if (typeof val === 'boolean') {
       await query(
@@ -195,12 +460,16 @@ router.patch('/settings', async (req, res) => {
     if (!['off', 'required'].includes(mfa_enforcement)) {
       return res.status(400).json({ error: 'mfa_enforcement must be "off" or "required"' });
     }
-    await query(
-      `INSERT INTO system_settings (key, value, updated_at) VALUES ('mfa_enforcement', $1, NOW())
-       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
-      [mfa_enforcement]
-    );
-    console.log(`[admin] ${req.session.username} set mfa_enforcement=${mfa_enforcement}`);
+    // Once two-factor is required, a token confirmed with only a password goes (#617).
+    const revoked = await withTransaction(async client => {
+      await client.query(
+        `INSERT INTO system_settings (key, value, updated_at) VALUES ('mfa_enforcement', $1, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+        [mfa_enforcement]
+      );
+      return mfa_enforcement === 'required' ? revokeTokensForPolicy(client, 'mfaRequired') : 0;
+    });
+    console.log(`[admin] ${req.session.username} set mfa_enforcement=${mfa_enforcement}${revokedTokensNote(revoked)}`);
   }
   if (mfa_device_trust != null) {
     if (!['never', '7d', '30d', 'permanent'].includes(mfa_device_trust)) {
@@ -225,6 +494,7 @@ router.patch('/settings', async (req, res) => {
     console.log(`[admin] ${req.session.username} updated custom_css (${sanitized.length} chars)`);
   }
   invalidateConnectionPolicyCache();
+  invalidateApiTokenSettingsCache();
   res.json({ ok: true });
 });
 
@@ -329,6 +599,7 @@ router.post('/invites', async (req, res) => {
         transport = createSmtpTransport(acctResolved, {
           port: account.smtp_port,
           secure: account.smtp_port === 465,
+          requireTLS: account.smtp_port !== 465 && !policy.allowInsecureTls,
           auth: smtpAuth,
           tls: acctTls,
         });
@@ -586,7 +857,7 @@ router.patch('/oidc/:id', async (req, res) => {
   const { id } = req.params;
   const { name, slug, issuer_url, client_id, client_secret, scopes, provisioning_mode, allowed_domains, enabled, require_email_verified, allow_insecure, admin_group_claim, admin_group_value, rp_initiated_logout, login_match_claim } = req.body;
 
-  const existingResult = await query('SELECT allow_insecure FROM oidc_providers WHERE id = $1', [id]);
+  const existingResult = await query('SELECT allow_insecure, issuer_url, client_id FROM oidc_providers WHERE id = $1', [id]);
   if (!existingResult.rows.length) return res.status(404).json({ error: 'Provider not found' });
   const existing = existingResult.rows[0];
 
@@ -598,6 +869,9 @@ router.patch('/oidc/:id', async (req, res) => {
     loginMatchClaimParam = c;
   }
 
+  if (enabled !== undefined && typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be true or false' });
+  }
   // Block disabling the last usable auth method.
   if (enabled === false) {
     const lockout = await wouldLockOut(id);
@@ -629,46 +903,57 @@ router.patch('/oidc/:id', async (req, res) => {
     ? encrypt(client_secret)
     : undefined;
   try {
-    const result = await query(
-      `UPDATE oidc_providers SET
-        name = COALESCE($2, name),
-        slug = COALESCE($3, slug),
-        issuer_url = COALESCE($4, issuer_url),
-        client_id = COALESCE($5, client_id),
-        client_secret = COALESCE($6, client_secret),
-        scopes = COALESCE($7, scopes),
-        provisioning_mode = COALESCE($8, provisioning_mode),
-        allowed_domains = CASE WHEN $9::text IS DISTINCT FROM '__keep__' THEN $9::text ELSE allowed_domains END,
-        enabled = COALESCE($10, enabled),
-        require_email_verified = COALESCE($11, require_email_verified),
-        allow_insecure = COALESCE($12, allow_insecure),
-        admin_group_claim = CASE WHEN $13::text IS DISTINCT FROM '__keep__' THEN $13::text ELSE admin_group_claim END,
-        admin_group_value = CASE WHEN $14::text IS DISTINCT FROM '__keep__' THEN $14::text ELSE admin_group_value END,
-        rp_initiated_logout = COALESCE($15, rp_initiated_logout),
-        login_match_claim = COALESCE($16, login_match_claim),
-        updated_at = NOW()
-       WHERE id = $1
-       RETURNING id, name, slug, issuer_url, client_id, scopes, provisioning_mode, allowed_domains, enabled, require_email_verified, allow_insecure, admin_group_claim, admin_group_value, rp_initiated_logout, login_match_claim`,
-      [
-        id,
-        name?.trim() || null,
-        slug?.trim() || null,
-        issuer_url?.trim() || null,
-        client_id?.trim() || null,
-        secretUpdate || null,
-        scopes?.trim() || null,
-        provisioning_mode || null,
-        allowed_domains !== undefined ? (allowed_domains?.trim() || null) : '__keep__',
-        enabled !== undefined ? enabled : null,
-        require_email_verified !== undefined ? require_email_verified : null,
-        allow_insecure !== undefined ? allow_insecure : null,
-        admin_group_claim !== undefined ? (admin_group_claim?.trim() || null) : '__keep__',
-        admin_group_value !== undefined ? (admin_group_value?.trim() || null) : '__keep__',
-        rp_initiated_logout !== undefined ? rp_initiated_logout : null,
-        loginMatchClaimParam,
-      ]
-    );
+    // A provider turned off, or pointed at another issuer or client, no longer vouches for the
+    // users it did, so the API tokens confirmed through it go with the change (#617). Deleting the
+    // provider deletes them by the foreign key.
+    const identityChanged = (!!issuer_url?.trim() && issuer_url.trim() !== existing.issuer_url)
+      || (!!client_id?.trim() && client_id.trim() !== existing.client_id);
+    let revoked = 0;
+    const result = await withTransaction(async client => {
+      const updated = await client.query(
+        `UPDATE oidc_providers SET
+          name = COALESCE($2, name),
+          slug = COALESCE($3, slug),
+          issuer_url = COALESCE($4, issuer_url),
+          client_id = COALESCE($5, client_id),
+          client_secret = COALESCE($6, client_secret),
+          scopes = COALESCE($7, scopes),
+          provisioning_mode = COALESCE($8, provisioning_mode),
+          allowed_domains = CASE WHEN $9::text IS DISTINCT FROM '__keep__' THEN $9::text ELSE allowed_domains END,
+          enabled = COALESCE($10, enabled),
+          require_email_verified = COALESCE($11, require_email_verified),
+          allow_insecure = COALESCE($12, allow_insecure),
+          admin_group_claim = CASE WHEN $13::text IS DISTINCT FROM '__keep__' THEN $13::text ELSE admin_group_claim END,
+          admin_group_value = CASE WHEN $14::text IS DISTINCT FROM '__keep__' THEN $14::text ELSE admin_group_value END,
+          rp_initiated_logout = COALESCE($15, rp_initiated_logout),
+          login_match_claim = COALESCE($16, login_match_claim),
+          updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, name, slug, issuer_url, client_id, scopes, provisioning_mode, allowed_domains, enabled, require_email_verified, allow_insecure, admin_group_claim, admin_group_value, rp_initiated_logout, login_match_claim`,
+        [
+          id,
+          name?.trim() || null,
+          slug?.trim() || null,
+          issuer_url?.trim() || null,
+          client_id?.trim() || null,
+          secretUpdate || null,
+          scopes?.trim() || null,
+          provisioning_mode || null,
+          allowed_domains !== undefined ? (allowed_domains?.trim() || null) : '__keep__',
+          enabled !== undefined ? enabled : null,
+          require_email_verified !== undefined ? require_email_verified : null,
+          allow_insecure !== undefined ? allow_insecure : null,
+          admin_group_claim !== undefined ? (admin_group_claim?.trim() || null) : '__keep__',
+          admin_group_value !== undefined ? (admin_group_value?.trim() || null) : '__keep__',
+          rp_initiated_logout !== undefined ? rp_initiated_logout : null,
+          loginMatchClaimParam,
+        ]
+      );
+      if (updated.rows.length && (enabled === false || identityChanged)) revoked = await revokeProviderTokens(client, id);
+      return updated;
+    });
     if (!result.rows.length) return res.status(404).json({ error: 'Provider not found' });
+    if (revoked) console.log(`[admin] ${req.session.username} ${enabled === false ? 'turned off' : 'changed the issuer or client of'} SSO provider ${result.rows[0].slug}${revokedTokensNote(revoked)}`);
     res.json({ provider: result.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'A provider with this slug already exists' });

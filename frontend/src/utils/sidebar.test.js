@@ -4,10 +4,13 @@ import assert from 'node:assert/strict';
 import {
   activateOnKey,
   buildFolderTree,
+  subtreeUnread,
   collapsedTooltip,
+  existingHiddenPaths,
   FOLDER_ORDER_DRAG_TYPE,
   folderDropPosition,
   hasRenderedInbox,
+  moveHiddenPaths,
   normalizeFolderOrder,
   reorderFolderPaths,
   resolveFolderOrderDrop,
@@ -178,6 +181,24 @@ describe('folder ordering', () => {
     ]);
   });
 
+  it('shows nested special-use mailboxes at the root without changing their paths', () => {
+    const tree = buildFolderTree([
+      { path: 'INBOX', name: 'INBOX', delimiter: '.' },
+      { path: 'INBOX.INBOX', name: 'INBOX', delimiter: '.', special_use: '\\Inbox' },
+      { path: 'INBOX.INBOX.Sent', name: 'Sent', delimiter: '.', special_use: '\\Sent' },
+      { path: 'INBOX.INBOX.Drafts', name: 'Drafts', delimiter: '.', special_use: '\\Drafts' },
+      { path: 'INBOX.Projects', name: 'Projects', delimiter: '.' },
+    ]);
+
+    assert.deepEqual(tree.map(node => node.path), [
+      'INBOX',
+      'INBOX.INBOX',
+      'INBOX.INBOX.Drafts',
+      'INBOX.INBOX.Sent',
+    ]);
+    assert.deepEqual(tree[0].children.map(node => node.path), ['INBOX.Projects']);
+  });
+
   it('puts new folders after ranked folders and ignores stale paths', () => {
     assert.deepEqual(
       normalizeFolderOrder(folders, ['Gone', 'INBOX', 'Archive', 'INBOX']),
@@ -284,5 +305,84 @@ describe('folder ordering', () => {
       ),
       null,
     );
+  });
+});
+
+describe('subtreeUnread (#536)', () => {
+  // Investments has no mail of its own (\\Noselect); its children hold the unread mail.
+  const tree = () => buildFolderTree([
+    { path: 'Investments', name: 'Investments', no_select: true },
+    { path: 'Investments/A', name: 'A', unread_count: 1 },
+    { path: 'Investments/B', name: 'B', unread_count: 0 },
+    { path: 'Investments/C', name: 'C', unread_count: 2 },
+    { path: 'Investments/C/Deep', name: 'Deep', unread_count: 4 },
+    { path: 'Investments/Muted', name: 'Muted', unread_count: 9 },
+  ], []).find(n => n.path === 'Investments');
+
+  it('adds every subfolder at any depth to the folder\'s own count', () => {
+    assert.deepEqual(subtreeUnread(tree()), { count: 16, known: true, stale: false });
+  });
+
+  it('leaves out hidden folders and everything under them', () => {
+    const hidden = new Set(['Investments/Muted', 'Investments/C']);
+    assert.deepEqual(subtreeUnread(tree(), p => hidden.has(p)), { count: 1, known: true, stale: false });
+  });
+
+  it('counts a selectable parent\'s own unread mail too', () => {
+    const [node] = buildFolderTree([
+      { path: 'Banking', name: 'Banking', unread_count: 1 },
+      { path: 'Banking/Cards', name: 'Cards', unread_count: 2 },
+    ], []);
+    assert.equal(subtreeUnread(node).count, 3);
+  });
+
+  it('is unknown until some folder in it has been observed, and stale if a contributing count is', () => {
+    const [unseen] = buildFolderTree([
+      { path: 'P', name: 'P', counts_known: false },
+      { path: 'P/Q', name: 'Q' },
+    ], []);
+    assert.deepEqual(subtreeUnread(unseen), { count: 0, known: false, stale: false });
+    const [stale] = buildFolderTree([
+      { path: 'P', name: 'P', unread_count: 0, counts_stale: true },
+      { path: 'P/Q', name: 'Q', unread_count: 3, counts_stale: true },
+    ], []);
+    assert.deepEqual(subtreeUnread(stale), { count: 3, known: true, stale: true });
+  });
+});
+
+// #694: a hidden folder deleted at the provider kept the sidebar's hidden-folders toggle.
+describe('existingHiddenPaths', () => {
+  const present = [{ path: 'INBOX' }, { path: 'Receipts' }, { path: 'Old/Child' }];
+
+  it('keeps only hidden paths that are still folders of the account', () => {
+    assert.deepEqual(existingHiddenPaths(['Receipts', 'Gone', 'Old/Child'], present), ['Receipts', 'Old/Child']);
+  });
+
+  it('is empty when every hidden folder is gone, so the toggle goes away', () => {
+    assert.deepEqual(existingHiddenPaths(['Gone'], present), []);
+  });
+
+  it('is empty without hidden paths or before the folders load', () => {
+    assert.deepEqual(existingHiddenPaths(undefined, present), []);
+    assert.deepEqual(existingHiddenPaths(['Receipts'], undefined), []);
+  });
+});
+
+describe('moveHiddenPaths', () => {
+  const tree = [{ path: 'Work', delimiter: '.' }, { path: 'Work.Old', delimiter: '.' }];
+
+  it('drops only the folder MailFlow deleted', () => {
+    assert.deepEqual(moveHiddenPaths(['Work', 'Work.Old', 'Other'], 'Work', null, tree), ['Work.Old', 'Other']);
+  });
+
+  it('moves a renamed folder and its subfolders to the new path', () => {
+    assert.deepEqual(
+      moveHiddenPaths(['Work', 'Work.Old', 'Workshop', 'Other'], 'Work', 'Jobs', tree),
+      ['Jobs', 'Jobs.Old', 'Workshop', 'Other'],
+    );
+  });
+
+  it('leaves the list alone when the folder was not hidden', () => {
+    assert.deepEqual(moveHiddenPaths(['Other'], 'Work', 'Jobs', tree), ['Other']);
   });
 });

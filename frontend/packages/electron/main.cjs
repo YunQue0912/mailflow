@@ -2,20 +2,23 @@ const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, shell, dialog, Not
 const { execFileSync, spawn } = require('child_process');
 
 const fs = require('fs');
-const http = require('http');
-const https = require('https');
 const path = require('path');
 const { createNativeUpdater } = require('./native-updater.cjs');
 const { pathToFileURL } = require('url');
+const { sendMailFlowApiRequest } = require('./mailApi.cjs');
 const {
   createNavigationPolicy,
   isSameOrigin,
   normalizeHost,
 } = require('./security.cjs');
+const { createNotificationRetainer } = require('./notificationRetainer.cjs');
+const { configureWindowOpening } = require('./windowOpening.cjs');
+
+// New-mail notifications stay referenced while they can be clicked (#587).
+const newMailNotifications = createNotificationRetainer();
 
 
 const CONFIG_FILE = 'mailflow-host.json';
-const UPDATE_RELEASE_URL = 'https://api.github.com/repos/YunQue0912/mailflow/releases/latest';
 const NATIVE_ACTION_CHANNEL = 'mailflow:native-action';
 const NATIVE_ACTION_ARG = '--mailflow-action=';
 const NEW_MAIL_NOTIFICATION_MAX_LENGTH = 240;
@@ -178,141 +181,6 @@ function clearHost() {
   writeConfig(config);
 }
 
-function requestJson(url) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(url, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        'User-Agent': `MailFlow/${app.getVersion()}`,
-      },
-    }, (response) => {
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        response.resume();
-        requestJson(response.headers.location).then(resolve, reject);
-        return;
-      }
-
-      let body = '';
-      response.setEncoding('utf8');
-      response.on('data', (chunk) => {
-        body += chunk;
-      });
-      response.on('end', () => {
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`Update request failed with status ${response.statusCode}`));
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(body));
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-
-    request.on('error', reject);
-    request.setTimeout(15000, () => {
-      request.destroy(new Error('Update request timed out'));
-    });
-  });
-}
-
-function parseVersion(value) {
-  const match = String(value || '').match(/\d+(?:\.\d+){0,2}/);
-  if (!match) return null;
-  return match[0].split('.').map((part) => Number.parseInt(part, 10));
-}
-
-function isNewerVersion(candidate, current) {
-  const next = parseVersion(candidate);
-  const installed = parseVersion(current);
-  if (!next || !installed) return false;
-
-  for (let index = 0; index < 3; index += 1) {
-    const nextPart = next[index] || 0;
-    const installedPart = installed[index] || 0;
-    if (nextPart > installedPart) return true;
-    if (nextPart < installedPart) return false;
-  }
-
-  return false;
-}
-
-function getLinuxDistributionIds() {
-  if (process.platform !== 'linux') return [];
-
-  try {
-    const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
-    const ids = [];
-
-    for (const key of ['ID', 'ID_LIKE']) {
-      const match = osRelease.match(new RegExp(`^${key}=(.+)$`, 'm'));
-      if (!match) continue;
-
-      const values = match[1]
-        .replace(/^"|"$/g, '')
-        .toLowerCase()
-        .split(/\s+/)
-        .filter(Boolean);
-      ids.push(...values);
-    }
-
-    return ids;
-  } catch {
-    return [];
-  }
-}
-
-function isDebLikeLinuxDistribution(distroIds = getLinuxDistributionIds()) {
-  return distroIds.some((id) => ['debian', 'ubuntu', 'linuxmint', 'pop'].some((match) => id === match || id.includes(match)));
-}
-
-function isRpmLikeLinuxDistribution(distroIds = getLinuxDistributionIds()) {
-  return distroIds.some((id) => ['fedora', 'rhel', 'centos', 'rocky', 'almalinux', 'suse', 'opensuse'].some((match) => id === match || id.includes(match)));
-}
-
-function getInstalledLinuxPackageType() {
-  if (process.platform !== 'linux') return null;
-  if (process.env.APPIMAGE) return 'appimage';
-
-  try {
-    const packageType = fs.readFileSync(path.join(process.resourcesPath, 'package-type'), 'utf8').trim().toLowerCase();
-    if (['deb', 'rpm', 'appimage'].includes(packageType)) return packageType;
-  } catch {}
-
-  if (getLinuxPackageManagerVersion('rpm')) return 'rpm';
-  if (getLinuxPackageManagerVersion('deb')) return 'deb';
-
-  const distroIds = getLinuxDistributionIds();
-  if (isRpmLikeLinuxDistribution(distroIds) || getAvailableCommand(['rpm', 'dnf', 'dnf5', 'yum'])) return 'rpm';
-  if (isDebLikeLinuxDistribution(distroIds) || getAvailableCommand(['dpkg', 'apt', 'apt-get'])) return 'deb';
-
-  return null;
-}
-
-function getLinuxPackageManagerVersion(packageType) {
-  if (process.platform !== 'linux' || !['deb', 'rpm'].includes(packageType)) return null;
-
-  const packageNames = ['mailflow', 'MailFlow', 'mailflow-frontend'];
-  for (const packageName of packageNames) {
-    try {
-      const args = packageType === 'rpm'
-        ? ['-q', '--qf', '%{VERSION}', packageName]
-        : ['-W', '-f=${Version}', packageName];
-      const command = packageType === 'rpm' ? 'rpm' : 'dpkg-query';
-      const output = execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-      if (output) return output;
-    } catch {}
-  }
-
-  return null;
-}
-
-function getInstalledAppVersion(packageType = getInstalledLinuxPackageType()) {
-  return getLinuxPackageManagerVersion(packageType) || app.getVersion();
-}
-
 function getAvailableCommand(commands = []) {
   for (const command of commands) {
     try {
@@ -366,200 +234,6 @@ function setUnreadBadgeCount(count) {
   return emitUnityLauncherBadgeCount(count) || badgeSet;
 }
 
-function getLinuxPackagePatternGroups() {
-  const arch = process.arch === 'arm64'
-    ? '(?:arm64|aarch64)'
-    : '(?:amd64|x64|x86_64)';
-  const deb = [new RegExp(`${arch}\\.deb$`, 'i'), /\.deb$/i];
-  const rpm = [new RegExp(`${arch}\\.rpm$`, 'i'), /\.rpm$/i];
-
-  const installedPackageType = getInstalledLinuxPackageType();
-  if (installedPackageType === 'appimage') return [];
-  if (installedPackageType === 'deb') return [deb];
-  if (installedPackageType === 'rpm') return [rpm];
-
-  const distroIds = getLinuxDistributionIds();
-  if (isDebLikeLinuxDistribution(distroIds)) {
-    return [deb];
-  }
-  if (isRpmLikeLinuxDistribution(distroIds)) {
-    return [rpm];
-  }
-
-  if (getAvailableCommand(['rpm', 'dnf', 'dnf5', 'yum'])) return [rpm];
-  if (getAvailableCommand(['dpkg', 'apt', 'apt-get'])) return [deb];
-
-  return [];
-}
-
-function getUpdateAsset(release) {
-  const assets = Array.isArray(release.assets) ? release.assets : [];
-  const platformAssetPatternGroups = {
-    win32: [[/setup.*\.exe$/i], [/\.exe$/i]],
-    darwin: [[/\.dmg$/i]],
-    linux: getLinuxPackagePatternGroups(),
-  };
-  const patternGroups = platformAssetPatternGroups[process.platform] || [];
-
-  for (const patterns of patternGroups) {
-    for (const pattern of patterns) {
-      const asset = assets.find((item) => pattern.test(item.name || '') && item.browser_download_url);
-      if (asset) return asset;
-    }
-  }
-
-  return null;
-}
-
-function sendUpdateStatus(payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send(UPDATE_STATUS_CHANNEL, payload);
-}
-
-function showInAppNotification({ title = '', message = '', type = 'info', actionLabel = '', action = '', persistent = false }) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-
-  const payload = JSON.stringify({ title, message, type, actionLabel, action, persistent });
-  mainWindow.webContents.executeJavaScript(`
-    (() => {
-      if (window.__mailflowNativeBridgeReady) return;
-
-      const notification = ${payload};
-      const id = 'mailflow-electron-toasts';
-      let root = document.getElementById(id);
-
-      if (!root) {
-        root = document.createElement('div');
-        root.id = id;
-        root.style.position = 'fixed';
-        root.style.right = '24px';
-        root.style.bottom = '24px';
-        root.style.zIndex = '2147483647';
-        root.style.display = 'flex';
-        root.style.flexDirection = 'column-reverse';
-        root.style.gap = '8px';
-        root.style.pointerEvents = 'none';
-        document.documentElement.appendChild(root);
-      }
-
-      const toast = document.createElement('div');
-      toast.style.width = '340px';
-      toast.style.maxWidth = 'calc(100vw - 48px)';
-      toast.style.boxSizing = 'border-box';
-      toast.style.display = 'flex';
-      toast.style.alignItems = 'flex-start';
-      toast.style.gap = '10px';
-      toast.style.padding = '12px 14px';
-      toast.style.borderRadius = '10px';
-      toast.style.border = '1px solid rgba(255,255,255,0.10)';
-      toast.style.background = 'rgba(36,36,41,0.98)';
-      toast.style.boxShadow = '0 4px 20px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04)';
-      toast.style.color = '#e8e8ed';
-      toast.style.font = '13px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-      toast.style.pointerEvents = 'all';
-      toast.style.opacity = '0';
-      toast.style.transform = 'translateX(100%)';
-      toast.style.transition = 'opacity 180ms ease, transform 180ms ease';
-
-      const icon = document.createElement('div');
-      icon.style.width = '32px';
-      icon.style.height = '32px';
-      icon.style.borderRadius = '8px';
-      icon.style.flex = '0 0 auto';
-      icon.style.display = 'grid';
-      icon.style.placeItems = 'center';
-      icon.style.background = notification.type === 'negative' || notification.type === 'error'
-        ? 'rgba(248,113,113,0.15)'
-        : 'rgba(124,106,247,0.28)';
-      icon.style.color = notification.type === 'negative' || notification.type === 'error' ? '#f87171' : '#a99cff';
-      icon.textContent = notification.type === 'positive' ? '✓' : notification.type === 'negative' || notification.type === 'error' ? '!' : 'i';
-
-      const copy = document.createElement('div');
-      copy.style.flex = '1';
-      copy.style.minWidth = '0';
-
-      const heading = document.createElement('div');
-      heading.textContent = notification.title;
-      heading.style.fontWeight = '650';
-      heading.style.marginBottom = '2px';
-      heading.style.whiteSpace = 'nowrap';
-      heading.style.overflow = 'hidden';
-      heading.style.textOverflow = 'ellipsis';
-
-      const body = document.createElement('div');
-      body.textContent = notification.message;
-      body.style.fontSize = '12px';
-      body.style.color = '#9898a8';
-      body.style.whiteSpace = 'pre-wrap';
-      body.style.overflow = 'visible';
-      body.style.textOverflow = 'clip';
-      body.style.lineHeight = '1.35';
-
-      const close = document.createElement('button');
-      close.type = 'button';
-      close.setAttribute('aria-label', 'Dismiss');
-      close.textContent = '×';
-      close.style.border = '0';
-      close.style.background = 'transparent';
-      close.style.color = '#9898a8';
-      close.style.cursor = 'pointer';
-      close.style.font = '20px/1 Inter, ui-sans-serif, system-ui';
-      close.style.padding = '0';
-
-      let action = null;
-      if (notification.actionLabel && notification.action) {
-        action = document.createElement('button');
-        action.type = 'button';
-        action.textContent = notification.actionLabel;
-        action.style.border = '1px solid rgba(255,255,255,0.12)';
-        action.style.borderRadius = '6px';
-        action.style.background = 'rgba(255,255,255,0.08)';
-        action.style.color = '#e8e8ed';
-        action.style.cursor = 'pointer';
-        action.style.font = '600 12px Inter, ui-sans-serif, system-ui';
-        action.style.padding = '5px 10px';
-        action.style.flex = '0 0 auto';
-        action.addEventListener('click', () => {
-          if (notification.action === 'install-update') {
-            window.mailflowNative?.updates?.installDownloaded?.();
-          } else if (notification.action === 'copy-update-command-and-quit') {
-            window.mailflowNative?.updates?.copyInstallCommandAndQuit?.();
-          }
-          dismiss();
-        });
-      }
-
-      const dismiss = () => {
-        toast.style.opacity = '0';
-        toast.style.transform = 'translateX(100%)';
-        window.setTimeout(() => toast.remove(), 190);
-      };
-
-      close.addEventListener('click', dismiss);
-      copy.append(heading, body);
-      toast.append(icon, copy);
-      if (action) toast.appendChild(action);
-      toast.appendChild(close);
-      root.appendChild(toast);
-
-      window.requestAnimationFrame(() => {
-        toast.style.opacity = '1';
-        toast.style.transform = 'translateX(0)';
-      });
-
-      if (!notification.persistent) {
-        window.setTimeout(dismiss, 5000);
-      }
-    })();
-  `).catch(() => {});
-}
-
-function notifyUpdateStatus({ title, message, type = 'info' }) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  showInAppNotification({ title, message, type });
-  mainWindow.webContents.send('mailflow:notifications:push', { title, message, type });
-}
-
 function cleanNotificationText(value, fallback = '') {
   const text = String(value || fallback)
     .replace(/\s+/g, ' ')
@@ -569,33 +243,9 @@ function cleanNotificationText(value, fallback = '') {
   return `${text.slice(0, NEW_MAIL_NOTIFICATION_MAX_LENGTH - 1)}…`;
 }
 
-function requestMailFlowApi(url, { method, body } = {}) {
+function requestMailFlowApi(url, options) {
   return session.defaultSession.cookies.get({ url: readHost() })
-    .then((cookies) => new Promise((resolve, reject) => {
-      const parsedUrl = new URL(url);
-      const request = (parsedUrl.protocol === 'http:' ? http : https).request(parsedUrl, {
-        method,
-        headers: {
-          Accept: 'application/json',
-          Cookie: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
-          ...(body ? { 'Content-Type': 'application/json' } : {}),
-        },
-      }, (response) => {
-        response.resume();
-        response.on('end', () => {
-          if (response.statusCode >= 200 && response.statusCode < 300) {
-            resolve();
-            return;
-          }
-
-          reject(new Error(`Mail action failed with status ${response.statusCode}`));
-        });
-      });
-
-      request.on('error', reject);
-      if (body) request.write(JSON.stringify(body));
-      request.end();
-    }));
+    .then((cookies) => sendMailFlowApiRequest(url, { ...options, cookies }));
 }
 
 function runBackgroundMailAction(action, messageId) {
@@ -674,6 +324,7 @@ function showNewMailNotification({ title, body, count, messageId, accountId, fol
     runBackgroundMailAction(action, messageId)
       .catch((error) => console.error(`Could not ${action} from desktop notification:`, error));
   });
+  newMailNotifications.retain(notification);
   notification.show();
 
   return { shown: true };
@@ -1215,12 +866,10 @@ function createWindow() {
     mainWindow.show();
   });
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isAllowedExternalUrl(url)) {
-      shell.openExternal(url);
-    }
-
-    return { action: 'deny' };
+  configureWindowOpening(mainWindow.webContents, {
+    getHost: readHost,
+    isAllowedExternalUrl,
+    openExternal: (url) => shell.openExternal(url),
   });
 
   mainWindow.webContents.on('context-menu', (_event, params) => {
@@ -1323,25 +972,6 @@ function detectRewriteErrorPage() {
       loadHostUnavailable();
     })
     .catch(() => {});
-}
-
-function scheduleStartupUpdateCheck() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (!readHost()) return;
-
-  const check = () => {
-    setTimeout(() => {
-      if (!mainWindow || mainWindow.isDestroyed()) return;
-      checkForUpdates(false);
-    }, 5000);
-  };
-
-  if (mainWindow.webContents.isLoading()) {
-    mainWindow.webContents.once('did-finish-load', check);
-    return;
-  }
-
-  check();
 }
 
 ipcMain.handle('mailflow:getHost', () => readHost());

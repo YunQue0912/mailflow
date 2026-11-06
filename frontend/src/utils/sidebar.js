@@ -30,12 +30,48 @@ export function hasRenderedInbox(folders, {
   return !isHidden || Boolean(showingHidden);
 }
 
+// Hidden folders are kept per account as a list of paths in the user's preferences. A folder
+// deleted or renamed at the provider leaves its path in that list (#694), so the sidebar counts
+// and reveals only the hidden folders that still exist. The path itself is kept: a folder missing
+// from LIST is not proof it is gone for good (Gmail's "Show in IMAP" setting, a renamed folder
+// renamed back), and when it comes back it stays hidden, as the user left it.
+export function existingHiddenPaths(hiddenPaths, folders) {
+  if (!Array.isArray(hiddenPaths) || !Array.isArray(folders)) return [];
+  const present = new Set(folders.map(folder => folder?.path));
+  return hiddenPaths.filter(path => present.has(path));
+}
+
+// The hidden paths after MailFlow itself renames a folder (its subfolders move with it, as IMAP
+// RENAME moves them) or deletes one (newPath null: only that folder goes, as with IMAP DELETE).
+export function moveHiddenPaths(hiddenPaths, oldPath, newPath, folders = []) {
+  if (!Array.isArray(hiddenPaths)) return [];
+  if (newPath == null) return hiddenPaths.filter(path => path !== oldPath);
+  const prefix = oldPath + delimiterFor(folders);
+  return hiddenPaths.map(path => {
+    if (path === oldPath) return newPath;
+    return path.startsWith(prefix) ? newPath + path.slice(oldPath.length) : path;
+  });
+}
+
 export const FOLDER_ORDER_DRAG_TYPE = 'application/x-mailflow-folder-order';
 
 function delimiterFor(folders) {
   return folderDelimiter(folders.find(folder => (
     typeof folder?.delimiter === 'string' && folder.delimiter
   )));
+}
+
+const ROOT_SPECIAL_USES = new Set([
+  '\\archive',
+  '\\drafts',
+  '\\inbox',
+  '\\junk',
+  '\\sent',
+  '\\trash',
+]);
+
+function isRootSpecialUse(folder) {
+  return ROOT_SPECIAL_USES.has(String(folder?.special_use || '').toLowerCase());
 }
 
 function folderPathsWithAncestors(folders) {
@@ -86,6 +122,31 @@ export function normalizeFolderOrder(folders, savedOrder = []) {
   return [...ranked, ...known.filter(folderPath => !seen.has(folderPath))];
 }
 
+// The unread total a collapsed folder shows (#536): its own count plus every subfolder's, at any
+// depth, so a folder whose new mail sits in its children still says so while they are hidden. A
+// folder the user has hidden is left out with everything under it, as the sidebar leaves it out.
+// Folders without a selectable mailbox (\Noselect, or a parent only implied by a path) have no
+// count of their own. The total is known once any folder in it has been observed, and stale when
+// any count that contributes to it is.
+export function subtreeUnread(node, isHidden = () => false) {
+  let count = 0;
+  let known = false;
+  let stale = false;
+  const visit = (folder, isRoot) => {
+    if (!isRoot && isHidden(folder.path)) return;
+    if (!folder.no_select && folder.counts_known !== false && Number.isFinite(folder.unread_count)) {
+      known = true;
+      if (folder.unread_count > 0) {
+        count += folder.unread_count;
+        if (folder.counts_stale) stale = true;
+      }
+    }
+    for (const child of folder.children || []) visit(child, false);
+  };
+  if (node) visit(node, true);
+  return { count, known, stale };
+}
+
 export function buildFolderTree(folders, savedOrder = []) {
   const safeFolders = Array.isArray(folders) ? folders : [];
   const delimiter = delimiterFor(safeFolders);
@@ -117,7 +178,7 @@ export function buildFolderTree(folders, savedOrder = []) {
   const nodes = Object.values(map).sort((a, b) => a.path.localeCompare(b.path));
   for (const node of nodes) {
     const parentPath = folderParent(node.path, delimiter);
-    if (parentPath && map[parentPath] && parentPath !== node.path) {
+    if (!isRootSpecialUse(node) && parentPath && map[parentPath] && parentPath !== node.path) {
       map[parentPath].children.push(node);
     } else {
       roots.push(node);

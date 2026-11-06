@@ -88,7 +88,11 @@ export function snippetFromBody(text, html) {
       // Strip [image: alt text] placeholders produced by Google's HTML-to-text converter
       // and some ESPs. These appear at the top of text/plain alternatives for image-heavy
       // marketing emails and produce useless "[image: Banner]" previews.
-      .replace(/\[image:[^\]]*\]/gi, '');
+      // Body text is attacker-controlled and this runs synchronously at ingest, so an
+      // unclosed placeholder is matched by the second branch and put back unchanged.
+      // Failing instead would rescan to the end of the body from every later "[image:"
+      // (O(n²)), and none of those could close either.
+      .replace(/\[image:[^\]]*\]|(\[image:[^\]]*)/gi, '$1');
     // A declaration separator distinguishes CSS blocks from prose braces. Body
     // text is attacker-controlled and this runs synchronously at ingest, so the
     // pattern must stay linear: the includes() gate skips brace-free bodies
@@ -109,7 +113,10 @@ export function snippetFromBody(text, html) {
       // by converting HTML anchors to Markdown, so the entire body can be link syntax.
       // Must run before the bare-URL pass below: stripping the URL first would leave
       // a dangling "[label]()" that no longer matches this pattern.
-      .replace(/\[([^\]\r\n]*)\]\([^)\r\n]*\)/g, '$1')
+      // As with the [image: pass, a partial link is matched by the second branch and
+      // put back unchanged. That branch has to consume everything the first one
+      // scanned, URL included, or an unclosed URL is rescanned from every "[" in it.
+      .replace(/\[([^\]\r\n]*)\]\([^)\r\n]*\)|(\[[^\]\r\n]*(?:\](?:\([^)\r\n]*)?)?)/g, '$1$2')
       // Drop raw link targets — they carry no preview value, the link text does.
       // Covers scheme'd URLs and mailto:, plus protocol-less www. hosts. Bare
       // domains without a scheme ("visit example.com") are prose, not unambiguous
@@ -779,6 +786,17 @@ export function detectCategoryFromHeaders(h) {
   return null;
 }
 
+// messages keeps these in VARCHAR(500) columns. One oversized header (a sender name mis-encoded
+// over and over, a runaway Message-ID) made PostgreSQL reject the whole row, so the message never
+// imported and every backfill pass retried it (#584). Cut to 500 characters; JavaScript counts UTF-16
+// units, which is never fewer than PostgreSQL's characters, and the cut never splits a surrogate pair.
+export const MAX_HEADER_FIELD = 500;
+export function capHeaderField(value) {
+  if (typeof value !== 'string' || value.length <= MAX_HEADER_FIELD) return value;
+  const end = value.codePointAt(MAX_HEADER_FIELD - 1) > 0xffff ? MAX_HEADER_FIELD - 1 : MAX_HEADER_FIELD;
+  return value.slice(0, end);
+}
+
 export async function parseMessage(msg) {
   const envelope = msg.envelope || {};
   const flags = msg.flags ? [...msg.flags] : [];
@@ -868,14 +886,15 @@ export async function parseMessage(msg) {
 
   return {
     uid: msg.uid,
-    messageId: envelope.messageId || null,
+    providerMsgid: typeof msg.emailId === 'string' && msg.emailId ? msg.emailId : null,
+    messageId: capHeaderField(envelope.messageId || null),
     subject: resolveSubject(envelope.subject, parsedHeaders),
-    fromName,
-    fromEmail,
-    senderName: hasDistinctSender ? (senderAddr.name || '') : null,
-    senderEmail: hasDistinctSender ? senderEmail : null,
-    forwardedFromName: hasForwardedFrom ? (forwarded.originalName || '') : null,
-    forwardedFromEmail: hasForwardedFrom ? forwarded.originalEmail : null,
+    fromName: capHeaderField(fromName),
+    fromEmail: capHeaderField(fromEmail),
+    senderName: hasDistinctSender ? capHeaderField(senderAddr.name || '') : null,
+    senderEmail: hasDistinctSender ? capHeaderField(senderEmail) : null,
+    forwardedFromName: hasForwardedFrom ? capHeaderField(forwarded.originalName || '') : null,
+    forwardedFromEmail: hasForwardedFrom ? capHeaderField(forwarded.originalEmail) : null,
     forwardedVia: hasForwardedFrom ? forwarded.label : null,
     to: mapAddrs(envelope.to),
     cc: mapAddrs(envelope.cc),

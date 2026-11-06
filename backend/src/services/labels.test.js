@@ -66,6 +66,13 @@ describe('applyLabel', () => {
     expect(imap.copyMessage).not.toHaveBeenCalled();
   });
 
+  it('confirms a fresh COPY for preservation even if a target UID is cached', async () => {
+    query.mockResolvedValue({ rows: [{ uid: 91 }] });
+    const imap = mkImap();
+    await applyLabel(imap, account, { account_id: 'acct-1', uid: 7, folder: 'Reference', message_id: '<m>' }, 'Todo', { forceCopy: true });
+    expect(imap.copyMessage).toHaveBeenCalledWith('acct-1', 7, 'Reference', 'Todo');
+  });
+
   it('is a no-op when a sibling already carries the label', async () => {
     query.mockResolvedValueOnce({ rows: [{ uid: 91 }] });
     const imap = mkImap();
@@ -163,7 +170,7 @@ describe('ensureLabelFolders', () => {
 
 describe('markThreadRead', () => {
   const msg = { account_id: 'acct-1', message_id: '<m>' };
-  const imapMR = () => ({ setFlag: vi.fn() });
+  const imapMR = () => ({ isLabelStore: () => true, setFlag: vi.fn() });
 
   it('fans out read state and sets \\Seen on an unread INBOX copy; returns the copy', async () => {
     query.mockResolvedValueOnce({ rows: [{ id: 'i1', uid: 5, is_read: false }] });

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('imapflow', () => ({ ImapFlow: vi.fn() }));
 vi.mock('./db.js', () => ({ query: vi.fn() }));
-vi.mock('./messageParser.js', () => ({ parseMessage: vi.fn(), buildSnippetFromHtml: vi.fn(), snippetFromBody: vi.fn(), decodeMimeWords: vi.fn(), detectBulkFromParsedHeaders: vi.fn(), parseRawHeaders: vi.fn(), enrichParsedMetadata: vi.fn((parsed) => parsed) }));
+vi.mock('./messageParser.js', () => ({ parseMessage: vi.fn(), parseMailboxList: vi.fn(() => [{ name: 'Hidden', email: 'hidden@example.test' }]), buildSnippetFromHtml: vi.fn(), snippetFromBody: vi.fn(), decodeMimeWords: vi.fn(), detectBulkFromParsedHeaders: vi.fn(), parseRawHeaders: vi.fn(), enrichParsedMetadata: vi.fn((parsed) => parsed), MAX_HEADER_FIELD: 500 }));
 vi.mock('../routes/oauth.js', () => ({ refreshMicrosoftToken: vi.fn(), refreshGoogleToken: vi.fn() }));
 vi.mock('./emailSanitizer.js', () => ({ sanitizeEmail: vi.fn() }));
 vi.mock('./encryption.js', () => ({ decrypt: vi.fn() }));
@@ -14,15 +14,18 @@ vi.mock('./connectionPolicy.js', () => ({ getConnectionPolicy: vi.fn() }));
 vi.mock('./spamPipeline.js', () => ({ classifyAndTagMessage: vi.fn() }));
 vi.mock('./mailAccess.js', () => ({ getAccountAddresses: vi.fn(async () => []) }));
 
-import { ImapManager, PREFETCH_MAX_CONSECUTIVE_ERRORS, hasIdlePooledClient, shouldPrewarmPool, acquirePooledClient, releasePooledClient, MIN_SYNC_INTERVAL_MS, AUTO_IDLE_DELAY_MS, countMissingInboxCopies, fetchBackfillBatch, providerProfile, makeClientCfg, relocateExemptGuard, insertCopiedSibling, deleteMessageCopyRow, emitSectionsChanged, ensureMailbox, createKeyedSemaphore, isConnectionRefusal, connectCooldownMs, effectiveSyncIntervalMs, folderSyncDue, planModseqSync, connectStaggerFor, walkStructure, extractBodyFromMsg, bodyFallbackApplies, parsePersistentCap, resolvePersistentCap, persistentEligible, shouldRetryIPv4, classifyMoveBySearch, computeThreadId } from './imapManager.js';
+import { ImapManager, PREFETCH_MAX_CONSECUTIVE_ERRORS, INLINE_IMAGE_REPEAT_BUDGET, hasIdlePooledClient, shouldPrewarmPool, acquirePooledClient, releasePooledClient, MIN_SYNC_INTERVAL_MS, AUTO_IDLE_DELAY_MS, countMissingInboxCopies, fetchBackfillBatch, providerProfile, makeClientCfg, relocateExemptGuard, insertCopiedSibling, deleteMessageCopyRow, emitSectionsChanged, ensureMailbox, createKeyedSemaphore, isConnectionRefusal, connectCooldownMs, effectiveSyncIntervalMs, folderSyncDue, planModseqSync, connectStaggerFor, walkStructure, extractBodyFromMsg, attachmentsFromStructure, contentLocationFromMimeHeader, bodyFallbackApplies, parsePersistentCap, resolvePersistentCap, persistentEligible, shouldRetryIPv4, classifyMoveBySearch, pairMovedCopies, computeThreadId, noteDraftsChanged } from './imapManager.js';
 import { pluginRegistry } from '../plugins/registry.js';
+import { ensureFreshToken } from './imapManager.js';
+import { clearRefreshFailure, noteFreshToken, noteRefreshFailure, refreshFailureFor } from './accountErrorCode.js';
+import { refreshMicrosoftToken } from '../routes/oauth.js';
 import { EventEmitter } from 'node:events';
 import { ImapFlow } from 'imapflow';
 import { query } from './db.js';
 import { resolveForConnection } from './hostValidation.js';
 import { getConnectionPolicy } from './connectionPolicy.js';
 import { invalidateGtdConfigCache } from '../plugins/gtd/gtdConfig.js';
-import { parseMessage } from './messageParser.js';
+import { parseMessage, decodeMimeWords } from './messageParser.js';
 import { classifyAndTagMessage } from './spamPipeline.js';
 import { getAccountAddresses } from './mailAccess.js';
 
@@ -30,6 +33,146 @@ const account = (imap_host, oauth_provider = null) => ({ imap_host, oauth_provid
 
 const resolved = { host: '127.0.0.1', servername: null };
 const baseAccount = { imap_host: '127.0.0.1', imap_port: 1143, imap_tls: true, imap_skip_tls_verify: false, auth_user: 'user', auth_pass: 'enc' };
+
+describe('live reply draft lookup', () => {
+  it('confirms only the selected UID over an idle pooled connection without another login or search', async () => {
+    const account = { ...baseAccount, id: 'reply-confirm-pooled', user_id: 'user-1', email_address: 'me@example.test' };
+    const client = Object.assign(new EventEmitter(), { usable: true, connect: vi.fn().mockResolvedValue(),
+      close: vi.fn(), logout: vi.fn().mockResolvedValue(), noop: vi.fn().mockResolvedValue(), search: vi.fn() });
+    ImapFlow.mockImplementation(function () { return client; });
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
+    query.mockReset().mockResolvedValue({ rows: [account] });
+    const pooled = await acquirePooledClient(account);
+    releasePooledClient(account, pooled);
+    const manager = Object.create(ImapManager.prototype);
+    const expected = { folder: 'Drafts', uid: 17, message_id: '<reply@test>' };
+    manager._ingestDraftUidWithClient = vi.fn().mockResolvedValue(expected);
+    const logins = ImapFlow.mock.calls.length;
+    expect(await manager.confirmReplyDraft(account, expected)).toEqual(expected);
+    expect(manager._ingestDraftUidWithClient).toHaveBeenCalledWith(account, 'Drafts', 17, pooled);
+    expect(client.search).not.toHaveBeenCalled();
+    expect(ImapFlow.mock.calls.length).toBe(logins);
+  });
+
+  it('preserves saved reply References and attachment presence', async () => {
+    query.mockReset().mockResolvedValue({ rows: [] });
+    const manager = Object.create(ImapManager.prototype);
+    await manager.upsertDraftMessageRecord({ id: 'account-a' }, 'Drafts', 42, {
+      messageId: '<draft@example.test>', references: '<parent@example.test>',
+      threadId: '<parent@example.test>', hasAttachments: true,
+    });
+    const [sql, values] = query.mock.calls.at(-1);
+    expect(sql).toContain('thread_references');
+    expect(values).toContain('<parent@example.test>');
+    expect(values).toContain(true);
+  });
+
+  it('refuses another fresh login during cooldown and releases the lookup slot', async () => {
+    const manager = Object.create(ImapManager.prototype);
+    manager._replyDraftSem = createKeyedSemaphore(1);
+    manager._replyDraftQueries = new Map();
+    manager._connectCooldown = new Map();
+    manager._secondaryCooldown = new Map([['account-a', { until: Date.now() + 30000, failures: 1 }]]);
+    await expect(manager.findReplyDrafts({ id: 'account-a' }, ['Drafts'], ['<parent@example.test>']))
+      .rejects.toMatchObject({ providerRefusing: true });
+    expect(manager._replyDraftSem.activeCount('account-a')).toBe(0);
+  });
+
+  it('waits for the normalized provider-host budget before starting another login', async () => {
+    const manager = Object.create(ImapManager.prototype);
+    manager._replyDraftSem = createKeyedSemaphore(1);
+    manager._replyDraftQueries = new Map();
+    manager._connectCooldown = new Map(); manager._secondaryCooldown = new Map();
+    manager._bgConnSem = { acquire: vi.fn().mockRejectedValue(new Error('budget busy')), release: vi.fn() };
+    ImapFlow.mockClear();
+    await expect(manager.findReplyDrafts({ id: 'account-budget', imap_host: 'IMAP.Example.TEST' },
+      ['Drafts'], ['<parent@example.test>'])).rejects.toThrow('budget busy');
+    expect(manager._bgConnSem.acquire).toHaveBeenCalledWith('imap.example.test', { timeoutMs: 30000 });
+    expect(manager._bgConnSem.release).not.toHaveBeenCalled();
+    expect(ImapFlow).not.toHaveBeenCalled();
+    expect(manager._replyDraftSem.activeCount('account-budget')).toBe(0);
+    expect(manager._replyDraftQueries.size).toBe(0);
+  });
+
+  it.each([false, true])('releases the provider-host budget when lookup fails=%s', async fails => {
+    const account = { id: 'account-budget-release', user_id: 'user-1', imap_host: 'imap.example.test',
+      imap_port: 993, imap_tls: true, auth_user: 'me', auth_pass: 'enc' };
+    const manager = Object.create(ImapManager.prototype);
+    manager._replyDraftSem = createKeyedSemaphore(1); manager._replyDraftQueries = new Map();
+    manager._connectCooldown = new Map(); manager._secondaryCooldown = new Map();
+    manager._bgConnSem = createKeyedSemaphore(2);
+    const client = Object.assign(new EventEmitter(), { usable: true,
+      connect: vi.fn().mockResolvedValue(), close: vi.fn() });
+    ImapFlow.mockImplementation(function () { return client; });
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
+    manager._findReplyDraftsWithClient = vi.fn(async () => {
+      expect(manager._bgConnSem.activeCount('imap.example.test')).toBe(1);
+      if (fails) throw new Error('search incomplete');
+      return [];
+    });
+    const result = manager.findReplyDrafts(account, ['Drafts'], ['<parent@example.test>']);
+    if (fails) await expect(result).rejects.toThrow('search incomplete');
+    else expect(await result).toEqual([]);
+    expect(manager._bgConnSem.activeCount('imap.example.test')).toBe(0);
+    expect(manager._replyDraftSem.activeCount(account.id)).toBe(0);
+    expect(client.close).toHaveBeenCalledOnce();
+  });
+
+  it('uses current headers and structure, replacing stale cache metadata for a reused UID', async () => {
+    const release = vi.fn();
+    const client = { getMailboxLock: vi.fn().mockResolvedValue({ release }), mailbox: { uidValidity: 9n },
+      fetch: vi.fn(async function* () { yield { uid: 1, headers: Buffer.from('Message-ID: <new@example.test>\r\n'), bodyStructure: { type: 'text/plain' } }; }) };
+    parseMessage.mockResolvedValueOnce({ messageId: '<new@example.test>', fromEmail: 'me@example.test',
+      to: [], cc: [], inReplyTo: '<parent@example.test>', references: '<parent@example.test>',
+      parsedHeaders: { 'message-id': '<new@example.test>', bcc: 'Hidden <hidden@example.test>' }, hasAttachments: false });
+    query.mockReset().mockResolvedValue({ rows: [{ id: 'row-1' }] });
+    const manager = Object.create(ImapManager.prototype);
+    const result = await manager._ingestDraftUidWithClient({ id: 'account-a' }, 'Drafts', 1, client);
+    expect(result).toMatchObject({ id: 'row-1', message_id: '<new@example.test>',
+      bcc_addresses: [{ name: 'Hidden', email: 'hidden@example.test' }], uid_validity: '9', attachments_complete: true });
+    const [sql] = query.mock.calls.find(([text]) => text.includes('INSERT INTO messages'));
+    expect(sql).toContain('bcc_addresses = EXCLUDED.bcc_addresses');
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('computes the canonical thread from known ancestors during partial ingestion', async () => {
+    const manager = Object.create(ImapManager.prototype);
+    parseMessage.mockResolvedValueOnce({ messageId: '<draft@example.test>', fromEmail: 'me@example.test',
+      to: [], cc: [], inReplyTo: '<known@example.test>', references: '<known@example.test>', parsedHeaders: {} });
+    query.mockReset().mockImplementation(async sql => sql.includes('SELECT message_id, thread_id')
+      ? { rows: [{ message_id: '<known@example.test>', thread_id: '<canonical@example.test>' }] }
+      : { rows: [{ id: 'row-1', thread_id: '<canonical@example.test>' }] });
+    const result = await manager._ingestDraftUidWithClient({ id: 'account-a', email_address: 'me@example.test' }, 'Drafts', 1,
+      { mailbox: { uidValidity: 9n } }, { headers: Buffer.from('headers'), bodyStructure: { type: 'text/plain' } });
+    expect(result.thread_id).toBe('<canonical@example.test>');
+    const [, values] = query.mock.calls.find(([sql]) => sql.includes('INSERT INTO messages'));
+    expect(values[12]).toBe('<canonical@example.test>');
+  });
+
+  it('returns the effective persisted thread root when a synced root is retained', async () => {
+    const manager = Object.create(ImapManager.prototype);
+    parseMessage.mockResolvedValueOnce({ messageId: '<draft@example.test>', to: [], cc: [],
+      references: '<known@example.test>', parsedHeaders: {} });
+    query.mockReset().mockImplementation(async sql => sql.includes('SELECT message_id, thread_id')
+      ? { rows: [{ message_id: '<known@example.test>', thread_id: '<computed@example.test>' }] }
+      : { rows: [{ id: 'row-1', thread_id: '<retained@example.test>' }] });
+    const result = await manager._ingestDraftUidWithClient({ id: 'account-a' }, 'Drafts', 1,
+      { mailbox: { uidValidity: 9n } }, { headers: Buffer.from('headers'), bodyStructure: { type: 'text/plain' } });
+    expect(result.thread_id).toBe('<retained@example.test>');
+  });
+
+  it('does not ingest incomplete live headers or structure', async () => {
+    const release = vi.fn();
+    const client = { getMailboxLock: vi.fn().mockResolvedValue({ release }),
+      fetch: vi.fn(async function* () { yield { uid: 1 }; }) };
+    const manager = Object.create(ImapManager.prototype);
+    await expect(manager._ingestDraftUidWithClient({ id: 'account-a' }, 'Drafts', 1, client))
+      .rejects.toThrow('Incomplete reply draft');
+    expect(release).toHaveBeenCalledOnce();
+  });
+});
 
 // ── providerProfile — host detection ─────────────────────────────────────────
 
@@ -375,6 +518,8 @@ describe('insertCopiedSibling', () => {
     expect(ins[0]).toContain('delivery_addresses');
     // So is a draft's Bcc (0061), in both the INSERT list and the SELECT.
     expect(ins[0].match(/\bbcc_addresses\b/g)).toHaveLength(2);
+    // A label copy keeps the provider identity alongside the RFC Message-ID.
+    expect(ins[0].match(/\bprovider_msgid\b/g)).toHaveLength(2);
   });
 
   it('increments destination unread only when the copied message is unread', async () => {
@@ -407,7 +552,7 @@ describe('upsertDraftMessageRecord', () => {
     query.mockResolvedValue({ rows: [] });
   });
 
-  const save = (meta) => ImapManager.prototype.upsertDraftMessageRecord.call({}, { id: 'acct-1' }, 'Drafts', 5, {
+  const save = (meta, account = { id: 'acct-1' }) => ImapManager.prototype.upsertDraftMessageRecord.call({}, account, 'Drafts', 5, {
     messageId: '<d1@example.com>', subject: 's', fromName: 'A', fromEmail: 'a@example.com',
     to: [{ name: '', email: 'to@example.com' }], ...meta,
   });
@@ -435,6 +580,28 @@ describe('upsertDraftMessageRecord', () => {
     await save({ bcc: [] });
     const [sql] = findCall('INSERT INTO messages');
     expect(sql).toMatch(/bcc_addresses = EXCLUDED\.bcc_addresses/);
+  });
+
+  it('stores the Gmail provider identity when one is available', async () => {
+    await save({ providerMsgid: '9007199254740993' }, { id: 'acct-1', imap_host: 'imap.gmail.com' });
+    expect(insertedValue('provider_msgid')).toBe('9007199254740993');
+    expect(findCall('INSERT INTO messages')[0]).toMatch(/provider_msgid = COALESCE\(EXCLUDED\.provider_msgid, messages\.provider_msgid\)/);
+  });
+});
+
+describe('upsertSentMessageRecord provider identity', () => {
+  beforeEach(() => {
+    query.mockReset();
+    query.mockResolvedValue({ rows: [] });
+  });
+
+  it('stores the Gmail provider identity when one is available', async () => {
+    await ImapManager.prototype.upsertSentMessageRecord.call({},
+      { id: 'acct-1', email_address: 'me@example.test', imap_host: 'imap.gmail.com' }, 'Sent', 5,
+      { messageId: '<sent@example.test>', providerMsgid: '9007199254740993' });
+    const [sql, params] = findCall('INSERT INTO messages');
+    expect(sql).toMatch(/provider_msgid = COALESCE\(EXCLUDED\.provider_msgid, messages\.provider_msgid\)/);
+    expect(params.at(-1)).toBe('9007199254740993');
   });
 });
 
@@ -561,9 +728,9 @@ describe('ensureMailbox — namespace + already-exists matrix', () => {
 // ── ensureMailbox — case-insensitive casing resolution ────────────────────────
 // On a case-insensitive server an existing "TODO" satisfies a "Todo" CREATE, but imapflow's
 // already-exists result echoes the REQUESTED casing. Persisting that (planGtdFolderPersist)
-// never case-matches the synced rows' folder value. With resolvePath set (only /folders/ensure,
-// which persists), the already-exists branches resolve the real casing from the folder LIST;
-// classify/snooze leave it off so they skip the extra round-trip.
+// never case-matches the synced rows' folder value. With resolvePath set (by the callers that
+// persist the path), the already-exists branches resolve the real casing from the folder LIST;
+// classify leaves it off so it skips the extra round-trip.
 describe('ensureMailbox — case-insensitive casing resolution', () => {
   it('ALREADYEXISTS return + resolvePath: resolves the server casing from LIST', async () => {
     const client = {
@@ -594,6 +761,15 @@ describe('ensureMailbox — case-insensitive casing resolution', () => {
     const res = await ensureMailbox(client, 'Todo');
     expect(res).toEqual({ path: 'Todo', created: false });
     expect(client.list).not.toHaveBeenCalled();
+  });
+
+  it('prefers an exact match to a case variant listed before it (case-sensitive server)', async () => {
+    const client = {
+      mailboxCreate: vi.fn().mockResolvedValue({ path: 'INBOX.Snoozed', created: false }),
+      list: vi.fn().mockResolvedValue([{ path: 'INBOX' }, { path: 'INBOX.snoozed' }, { path: 'INBOX.Snoozed' }]),
+    };
+    const res = await ensureMailbox(client, 'Snoozed', { resolvePath: true });
+    expect(res).toEqual({ path: 'INBOX.Snoozed', created: false });
   });
 
   it('falls back to the known path when the LIST has no case-insensitive match', async () => {
@@ -1091,6 +1267,7 @@ describe('syncMessages — empty local cache vs nonempty server (wiring)', () =>
       imap_host: 'imap.example.com',
     };
     const client = {
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
       mailbox: { exists: 1, uidValidity: 100, highestModseq: 500n },
       fetch: vi.fn(async function* () { yield { uid: 501 }; }),
@@ -1160,6 +1337,7 @@ describe('syncMessages — empty local cache vs nonempty server (wiring)', () =>
       imap_host: 'imap.example.com',
     };
     const client = {
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
       mailbox: { exists: 50, uidValidity: 100, highestModseq: 500n },
       fetch: vi.fn(async function* () {}),
@@ -1201,6 +1379,7 @@ describe('syncMessages — empty local cache vs nonempty server (wiring)', () =>
         gtd_enabled: true, categorization_enabled: false, imap_host: 'imap.example.com',
       };
       const client = {
+        noop: vi.fn(async () => true),
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
         mailbox: { exists: 1, uidValidity: 100, highestModseq: 500n },
         fetch: vi.fn(async function* () { yield { uid: 501 }; }),
@@ -1251,6 +1430,7 @@ describe('syncMessages — empty local cache vs nonempty server (wiring)', () =>
         gtd_enabled: false, categorization_enabled: false, imap_host: 'imap.example.com',
       };
       const client = {
+        noop: vi.fn(async () => true),
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
         mailbox: { exists: 1, uidValidity: 100, highestModseq: 500n },
         fetch: vi.fn(async function* () { yield { uid: 501 }; }),
@@ -1290,6 +1470,7 @@ describe('syncMessages — unread_count recompute ordering (folder badge fix)', 
         gtd_enabled: false, categorization_enabled: false, imap_host: 'imap.example.com',
       };
       const client = {
+        noop: vi.fn(async () => true),
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
         mailbox: { exists: 1, uidValidity: 100, highestModseq: 500n },
         fetch: vi.fn(async function* () { yield { uid: 501 }; }),
@@ -1353,12 +1534,39 @@ describe('_syncSpamFolder — periodic spam poll guards', () => {
   });
 });
 
+// A plain-text message with a photo that is disposed inline and has a Content-ID:
+// there is no HTML body to reference it.
+const textWithInlinePhoto = {
+  type: 'multipart/mixed',
+  childNodes: [
+    { part: '1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } },
+    {
+      part: '2', type: 'image/jpeg', encoding: 'base64', id: '<x@apple>', size: 40000,
+      disposition: 'inline', dispositionParameters: { filename: 'IMG_0001.jpeg' },
+    },
+  ],
+};
+
 describe('walkStructure attachment classification', () => {
   const walk = (node) => {
     const results = { textParts: [], attachments: [] };
     walkStructure(node, results);
     return results;
   };
+
+  it('strips bidi overrides from attachment names, so "invoice<RLO>fdp.exe" cannot pose as a PDF', () => {
+    const results = walk({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } },
+        { part: '2', type: 'application/octet-stream', encoding: 'base64', disposition: 'attachment',
+          dispositionParameters: { filename: 'invoice\u202Efdp.exe' } },
+        { part: '3', type: 'application/octet-stream', encoding: 'base64',
+          parameters: { name: 'a\u2066b\u2069c\u200Fd\u061Ce\u202Af.bin' } },
+      ],
+    });
+    expect(results.attachments.map(a => a.filename)).toEqual(['invoicefdp.exe', 'abcdef.bin']);
+  });
 
   it('treats an attached HTML file as an attachment, not body text', () => {
     const results = walk({
@@ -1508,6 +1716,118 @@ describe('attachment-only messages have no body', () => {
   });
 });
 
+// A forwarded message attached as a file. imapflow gives a message/rfc822 part the embedded
+// message's structure as children, reusing the wrapper's part number (so its parts are 2.1, 2.2).
+describe('walkStructure attached messages', () => {
+  const walk = (node) => {
+    const results = { textParts: [], attachments: [], inlineImages: [], calendarParts: [] };
+    walkStructure(node, results);
+    return results;
+  };
+  const forwarded = (wrapper, innerChildren) => ({
+    type: 'multipart/mixed',
+    childNodes: [
+      { part: '1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } },
+      {
+        part: '2', type: 'message/rfc822', encoding: '7bit', size: 5120,
+        envelope: { subject: 'Quarterly report' },
+        ...wrapper,
+        childNodes: [{ part: '2', type: 'multipart/mixed', childNodes: innerChildren }],
+      },
+    ],
+  });
+  const innerBodyAndPdf = [
+    { part: '2.1', type: 'text/html', encoding: 'quoted-printable', parameters: { charset: 'utf-8' } },
+    { part: '2.2', type: 'application/pdf', encoding: 'base64', size: 900,
+      disposition: 'attachment', dispositionParameters: { filename: 'inner.pdf' } },
+  ];
+
+  it('lists a forward-as-attachment (Gmail style) as one .eml and keeps the outer body (#466)', () => {
+    const results = walk(forwarded(
+      { disposition: 'attachment', dispositionParameters: { filename: 'Fwd.eml' }, parameters: { name: 'Fwd.eml' } },
+      innerBodyAndPdf,
+    ));
+    expect(results.textParts.map(p => p.part)).toEqual(['1']);
+    expect(results.attachments).toEqual([{
+      part: '2', filename: 'Fwd.eml', type: 'message/rfc822', encoding: '7bit', size: 5120,
+      disposition: 'attachment',
+      contains: [{ filename: 'inner.pdf', type: 'application/pdf' }],
+    }]);
+  });
+
+  it('names an unnamed attached message after its subject (Outlook style)', () => {
+    const results = walk(forwarded({ disposition: 'attachment' }, innerBodyAndPdf));
+    expect(results.attachments.map(a => a.filename)).toEqual(['Quarterly report.eml']);
+    expect(results.textParts.map(p => p.part)).toEqual(['1']);
+  });
+
+  it('treats an inline message/rfc822 with a filename as an attachment too', () => {
+    const results = walk(forwarded({ disposition: 'inline', dispositionParameters: { filename: 'x.eml' } }, innerBodyAndPdf));
+    expect(results.attachments.map(a => [a.part, a.filename, a.type])).toEqual([['2', 'x.eml', 'message/rfc822']]);
+  });
+
+  it('keeps walking into an embedded message with no file marker, as a bounce report has', () => {
+    const results = walk({
+      type: 'multipart/report',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } },
+        { part: '2', type: 'message/delivery-status', encoding: '7bit' },
+        { part: '3', type: 'message/rfc822', encoding: '7bit', envelope: { subject: 'Original' },
+          childNodes: [{ part: '3', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } }] },
+      ],
+    });
+    expect(results.attachments).toEqual([]);
+    expect(results.textParts.map(p => p.part)).toEqual(['1', '3']);
+  });
+
+  it('records files nested in a forward of a forward, flattened and capped', () => {
+    const innerForward = {
+      part: '2.2', type: 'message/rfc822', encoding: '7bit', disposition: 'attachment',
+      envelope: { subject: 'Deeper' },
+      childNodes: [{ part: '2.2', type: 'multipart/mixed', childNodes: [
+        { part: '2.2.1', type: 'text/plain', encoding: '7bit' },
+        { part: '2.2.2', type: 'application/octet-stream', encoding: 'base64',
+          disposition: 'attachment', dispositionParameters: { filename: 'invoice.pdf.exe' } },
+      ] }],
+    };
+    const results = walk(forwarded({ disposition: 'attachment' }, [innerBodyAndPdf[0], innerForward]));
+    expect(results.attachments).toHaveLength(1);
+    // Risky files are listed first (see the cap below).
+    expect(results.attachments[0].contains).toEqual([
+      { filename: 'invoice.pdf.exe', type: 'application/octet-stream' },
+      { filename: 'Deeper.eml', type: 'message/rfc822' },
+    ]);
+
+    const many = Array.from({ length: 80 }, (_, i) => ({
+      part: `2.${i + 2}`, type: 'image/png', encoding: 'base64',
+      disposition: 'attachment', dispositionParameters: { filename: `p${i}.png` },
+    }));
+    const capped = walk(forwarded({ disposition: 'attachment' }, [innerBodyAndPdf[0], ...many]));
+    expect(capped.attachments[0].contains).toHaveLength(50);
+
+    // Padding the forward with harmless files must not push a program past the cap.
+    const padded = walk(forwarded({ disposition: 'attachment' }, [innerBodyAndPdf[0], ...many, {
+      part: '2.99', type: 'application/octet-stream', encoding: 'base64',
+      disposition: 'attachment', dispositionParameters: { filename: 'payload.exe' },
+    }]));
+    expect(padded.attachments[0].contains).toHaveLength(50);
+    expect(padded.attachments[0].contains[0]).toEqual({ filename: 'payload.exe', type: 'application/octet-stream' });
+  });
+
+  it('strips bidi overrides and control characters from the derived name', () => {
+    const results = walk(forwarded(
+      { disposition: 'attachment', envelope: { subject: 'Pay\r\nnow \u202Efdp.exe' } },
+      innerBodyAndPdf,
+    ));
+    expect(results.attachments[0].filename).toBe('Pay  now fdp.exe.eml');
+  });
+
+  it('stores the .eml for the attachment list built at sync', () => {
+    const msg = { bodyStructure: forwarded({ disposition: 'attachment' }, innerBodyAndPdf) };
+    expect(attachmentsFromStructure(msg).map(a => a.filename)).toEqual(['Quarterly report.eml']);
+  });
+});
+
 describe('calendar-only messages', () => {
   const calendarRoot = {
     part: '1', type: 'text/calendar', encoding: '7bit',
@@ -1542,6 +1862,802 @@ describe('calendar-only messages', () => {
       bodyParts: new Map([['1', Buffer.from('<p>Invite</p>')], ['2', Buffer.from(ics)]]),
     };
     expect(extractBodyFromMsg(msg).html).toBe('<p>Invite</p>');
+  });
+});
+
+// The body route caches the list fetchMessageBody returns, and every download route
+// resolves parts from that cache, so a part missing from it cannot be opened at all.
+// Most of these drive the real fetchMessageBody and fetchAttachment through the pool
+// against a fake server holding one message; the synced-body cases call
+// extractBodyFromMsg, which lists the same parts.
+describe('inline images the body never shows are listed as attachments', () => {
+  let seq = 700;
+  function serve(structure, parts) {
+    const account = { id: `acct-parts-${++seq}`, user_id: 'u1', imap_host: 'imap.example.test', email_address: 'p@example.test', auth_user: 'p', auth_pass: 'enc' };
+    const requested = [];
+    ImapFlow.mockImplementation(function () {
+      const client = new EventEmitter();
+      client.usable = true;
+      client.connect = vi.fn(() => Promise.resolve());
+      client.logout = vi.fn(() => Promise.resolve());
+      client.close = vi.fn();
+      client.getMailboxLock = vi.fn(async () => ({ release() {} }));
+      client.fetch = vi.fn(async function* (range, fetchQuery) {
+        requested.push(...(fetchQuery.bodyParts || []));
+        yield {
+          uid: 42,
+          bodyStructure: fetchQuery.bodyStructure ? structure : undefined,
+          bodyParts: fetchQuery.bodyParts
+            ? new Map(fetchQuery.bodyParts.filter(p => p in parts).map(p => [p, Buffer.from(parts[p])]))
+            : undefined,
+        };
+      });
+      return client;
+    });
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
+    return { mgr: new ImapManager({ clients: new Set() }), account, requested };
+  }
+
+  it('lists an inline photo in a plain-text message', async () => {
+    const { mgr, account } = serve(textWithInlinePhoto, { '1': 'here is the photo', '2': '/9j/4AAQ' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body.text).toBe('here is the photo');
+    expect(body.attachments).toEqual([{
+      part: '2', filename: 'IMG_0001.jpeg', type: 'image/jpeg', encoding: 'base64', size: 40000, disposition: 'inline',
+    }]);
+  });
+
+  it('lists only the inline images the HTML does not reference', async () => {
+    // Hand-picked Content-IDs, as PHPMailer allows: the HTML references logo-dark in angle
+    // brackets and another case, logo is a prefix of it but is not referenced, and the
+    // third image has an empty Content-ID, which nothing can reference.
+    const image = (part, id, filename) => ({
+      part, type: 'image/png', encoding: 'base64', id, size: 12,
+      disposition: 'inline', dispositionParameters: { filename },
+    });
+    const { mgr, account } = serve({
+      type: 'multipart/related',
+      childNodes: [
+        { part: '1', type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } },
+        image('2', '<logo-dark>', 'logo-dark.png'),
+        image('3', '<logo>', 'logo.png'),
+        image('4', '<>', 'spacer.png'),
+      ],
+    }, { '1': '<p>hi</p><img src="cid:<LOGO-DARK>">', '2': 'iVBORw0KGgo=', '3': 'AAAA', '4': 'BBBB' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body.html).toBe('<p>hi</p><img src="data:image/png;base64,iVBORw0KGgo=">');
+    expect(body.attachments.map(a => a.filename)).toEqual(['logo.png', 'spacer.png']);
+  });
+
+  // #595: whether a cid: reference left in the HTML could resolve on another fetch.
+  const related = (...images) => ({
+    type: 'multipart/related',
+    childNodes: [
+      { part: '1', type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } },
+      ...images.map(([part, id]) => ({ part, type: 'image/png', encoding: 'base64', id, size: 12, disposition: 'inline', dispositionParameters: { filename: `${part}.png` } })),
+    ],
+  });
+
+  it('is complete when a reference names a Content-ID no part has: it can never resolve', async () => {
+    const { mgr, account } = serve(related(['2', '<logo@x>']), { '1': '<img src="cid:logo@x"><img src="cid:missing@x">', '2': 'iVBORw0KGgo=' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body.html).toBe('<img src="data:image/png;base64,iVBORw0KGgo="><img src="cid:missing@x">');
+    expect(body.cidsComplete).toBe(true);
+  });
+
+  it('is not complete when an image the HTML references did not arrive: another fetch may get it', async () => {
+    const { mgr, account } = serve(related(['2', '<logo@x>']), { '1': '<img src="cid:logo@x">' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body.html).toBe('<img src="cid:logo@x">');
+    expect(body.cidsComplete).toBe(false);
+  });
+
+  it('is complete when every referenced image was embedded', async () => {
+    const { mgr, account } = serve(related(['2', '<logo@x>']), { '1': '<img src="cid:logo@x">', '2': 'iVBORw0KGgo=' });
+    expect((await mgr.fetchMessageBody(account, 42, 'INBOX')).cidsComplete).toBe(true);
+  });
+
+  it('lists an inline photo when the body is read from a synced message', () => {
+    const body = extractBodyFromMsg({
+      bodyStructure: textWithInlinePhoto,
+      bodyParts: new Map([['1', Buffer.from('here is the photo')]]),
+    });
+    expect(body.text).toBe('here is the photo');
+    expect(body.attachments.map(a => a.filename)).toEqual(['IMG_0001.jpeg']);
+  });
+
+  it('names an unnamed inline image after its type', () => {
+    const body = extractBodyFromMsg({
+      bodyStructure: {
+        type: 'multipart/mixed',
+        childNodes: [
+          { part: '1', type: 'text/plain', encoding: '7bit' },
+          { part: '2', type: 'image/jpeg', encoding: 'base64', id: '<a@x>' },
+          { part: '3', type: 'image/svg+xml', encoding: '7bit', id: '<b@x>' },
+        ],
+      },
+      bodyParts: new Map([['1', Buffer.from('two pictures')]]),
+    });
+    expect(body.attachments.map(a => a.filename)).toEqual(['image.jpg', 'image.svg']);
+  });
+
+  it('downloads a listed inline image with its own transfer encoding', async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"/>';
+    const { mgr, account } = serve({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit' },
+        {
+          part: '2', type: 'image/svg+xml', encoding: '7bit', id: '<s@x>',
+          disposition: 'inline', dispositionParameters: { filename: 'logo.svg' },
+        },
+      ],
+    }, { '1': 'logo attached', '2': svg });
+    const buf = await mgr.fetchAttachment(account, 42, 'INBOX', '2');
+    expect(buf.toString()).toBe(svg);
+  });
+
+  // #640: newsletters whose layout images are marked as attachments, or referenced inside a
+  // multipart/related by Content-Location or file name rather than cid:. Each structure mirrors
+  // a synthetic .eml: an HTML body with a header image and two badges, and a genuine attachment.
+  describe('images the HTML shows though marked as attachments (#640)', () => {
+    const PNG = 'iVBORw0KGgo=';
+    const html = (part = '1') => ({ part, type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } });
+    const attachedImage = (part, extra) => ({
+      part, type: 'image/png', encoding: 'base64', size: 3000, disposition: 'attachment', ...extra,
+    });
+    const report = { part: '3', type: 'application/pdf', encoding: 'base64', size: 9000, disposition: 'attachment', dispositionParameters: { filename: 'invoice.pdf' } };
+
+    it('shows a cid: image marked Content-Disposition: attachment and drops it from the list', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'multipart/related', childNodes: [
+            html('1.1'),
+            attachedImage('1.2', { id: '<Header@News.Example>', dispositionParameters: { filename: 'header.png' } }),
+            attachedImage('1.3', { id: 'badge%1@news.example', dispositionParameters: { filename: 'badge.png' } }),
+            attachedImage('1.4', { id: '<photo@news.example>', dispositionParameters: { filename: 'photo.png' } }),
+          ] },
+          { ...report, part: '2' },
+        ],
+      }, {
+        // Angle brackets and another case, and the RFC 2392 percent-encoding of a '%'.
+        '1.1': '<img src="cid:<header@news.example>"><img src="cid:badge%251@news.example">',
+        '1.2': PNG, '1.3': 'AAAA', '1.4': 'BBBB', '2': 'JVBERi0=',
+      });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<img src="data:image/png;base64,${PNG}"><img src="data:image/png;base64,AAAA">`);
+      // The image the HTML never references is a genuine attachment and stays listed.
+      expect(body.attachments.map(a => a.filename)).toEqual(['photo.png', 'invoice.pdf']);
+      expect(body.cidsComplete).toBe(true);
+    });
+
+    it('shows images referenced by file name or Content-Location in a multipart/related', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'multipart/alternative', childNodes: [
+            { part: '1.1', type: 'text/plain', encoding: '7bit' },
+            { type: 'multipart/related', childNodes: [
+              html('1.2.1'),
+              { part: '1.2.2', type: 'image/png', encoding: 'base64', size: 2000, parameters: { name: 'header.png' } },
+              // imapflow leaves out a Content-Location that ends the BODYSTRUCTURE, so it comes
+              // from the part's MIME header.
+              attachedImage('1.2.3', { dispositionParameters: { filename: 'app-store.png' } }),
+              { part: '1.2.4', type: 'image/gif', encoding: 'base64', size: 900 },
+              { part: '1.2.5', type: 'image/png', encoding: 'base64', size: 900, id: '<fb@news.example>', disposition: 'inline', location: 'fb.png', dispositionParameters: { filename: 'fb.png' } },
+            ] },
+          ] },
+          { ...report, part: '2' },
+        ],
+      }, {
+        '1.1': 'text',
+        '1.2.1': '<table background="header.png"><tr><td style="background:url( \'social.gif\' )">'
+          + '<img src="https://news.example/img/app-store.png?v=1&amp;w=2"><img src = fb.png></td></tr></table>',
+        '1.2.2': PNG, '1.2.3': 'AAAA', '1.2.4': 'R0lG', '1.2.5': 'CCCC', '2': 'JVBERi0=',
+        '1.2.3.MIME': 'Content-Type: image/png\r\nContent-Location:\r\n https://news.example/img/app-store.png?v=1&w=2\r\n\r\n',
+        '1.2.4.MIME': 'Content-Type: image/gif\r\nCONTENT-LOCATION: social.gif\r\n\r\n',
+      });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<table background="data:image/png;base64,${PNG}"><tr><td style="background:url( 'data:image/gif;base64,R0lG' )">`
+        + '<img src="data:image/png;base64,AAAA"><img src = "data:image/png;base64,CCCC"></td></tr></table>');
+      expect(body.attachments.map(a => a.filename)).toEqual(['invoice.pdf']);
+      expect(body.cidsComplete).toBe(true);
+      // The sanitizer keeps an embedded raster background, or the adopted header vanished.
+      const { sanitizeEmail: realSanitize } = await vi.importActual('./emailSanitizer.js');
+      const shown = realSanitize(body.html);
+      expect(shown).toContain(`background="data:image/png;base64,${PNG}"`);
+      expect(shown).toContain('url(');
+      expect(shown).toContain('data:image/gif;base64,R0lG');
+    });
+
+    it('keeps a file name that is only text, a link or an alt as an attachment', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('2', { dispositionParameters: { filename: 'chart.png' } })],
+      }, { '1': '<p>See chart.png</p><a href="chart.png">chart</a><img alt="chart.png" src="https://x.example/chart.png.jpg">', '2': PNG });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).not.toContain('data:');
+      expect(body.attachments.map(a => a.filename)).toEqual(['chart.png']);
+    });
+
+    it('matches a Content-Location only inside a multipart/related', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [html(), attachedImage('2', { location: 'photo.png', dispositionParameters: { filename: 'IMG_1.png' } })],
+      }, { '1': '<img src="photo.png">', '2': PNG });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<img src="photo.png">');
+      expect(body.attachments.map(a => a.filename)).toEqual(['IMG_1.png']);
+    });
+
+    it('ignores names written as text, in a comment or in a script', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('2', { dispositionParameters: { filename: 'chart.png' } })],
+      }, {
+        '1': '<p>Write src=chart.png or src="chart.png" in your template</p><!-- <img src="chart.png"> -->'
+          + '<script>var i = "<img src=\'chart.png\'>";</script><style>/* chart.png */</style>',
+        '2': PNG,
+      });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).not.toContain('data:');
+      expect(body.html).not.toContain('cid:');
+      expect(body.attachments.map(a => a.filename)).toEqual(['chart.png']);
+    });
+
+    it('matches a file name only on a part named like an image', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [
+          html(),
+          attachedImage('2', { dispositionParameters: { filename: 'report.pdf' } }),
+          attachedImage('3', { dispositionParameters: { filename: 'LOGO' } }),
+        ],
+      }, { '1': '<img src="report.pdf"><img src="LOGO">', '2': PNG, '3': 'AAAA' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<img src="report.pdf"><img src="data:image/png;base64,AAAA">');
+      expect(body.attachments.map(a => a.filename)).toEqual(['report.pdf']);
+    });
+
+    it('keeps an image past the size cap as an attachment', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('2', { id: '<big@x>', size: 6 * 1024 * 1024, dispositionParameters: { filename: 'big.png' } })],
+      }, { '1': '<img src="cid:big@x"><img src="big.png">', '2': PNG });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<img src="cid:big@x"><img src="big.png">');
+      expect(body.attachments.map(a => a.filename)).toEqual(['big.png']);
+    });
+
+    it('cannot be reached through a guessed MailFlow Content-ID', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('2', { dispositionParameters: { filename: 'secret.png' } })],
+      }, { '1': '<img src="cid:part-2@mailflow.invalid"><img src="cid:part-2-000000000000@mailflow.invalid">', '2': PNG });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).not.toContain('data:');
+      expect(body.attachments.map(a => a.filename)).toEqual(['secret.png']);
+    });
+
+    // A signature image and an attached photo sharing one Content-ID, as Outlook's image001.png@01D...
+    // numbering makes happen across a forward: the HTML's reference is the signature's.
+    it('adopts no second image for a Content-ID an inline image already has', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'multipart/related', childNodes: [
+            html('1.1'),
+            { part: '1.2', type: 'image/png', encoding: 'base64', size: 900, id: '<image001.png@01D>', disposition: 'inline', dispositionParameters: { filename: 'image001.png' } },
+          ] },
+          { part: '2', type: 'image/jpeg', encoding: 'base64', size: 90000, id: '<image001.png@01D>', disposition: 'attachment', dispositionParameters: { filename: 'holiday.jpg' } },
+          { part: '3', type: 'image/jpeg', encoding: 'base64', size: 90000, id: '<image001.png@01D>', disposition: 'attachment', dispositionParameters: { filename: 'beach.jpg' } },
+        ],
+      }, { '1.1': '<p>Regards</p><img src="cid:image001.png@01D">', '1.2': PNG, '2': 'AAAA', '3': 'BBBB' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<p>Regards</p><img src="data:image/png;base64,${PNG}">`);
+      expect(body.attachments.map(a => a.filename)).toEqual(['holiday.jpg', 'beach.jpg']);
+    });
+
+    it('adopts only the first of two attached images with one Content-ID', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [
+          html(),
+          attachedImage('2', { id: '<dup@x>', dispositionParameters: { filename: 'first.png' } }),
+          attachedImage('3', { id: '<dup@x>', dispositionParameters: { filename: 'second.png' } }),
+        ],
+      }, { '1': '<img src="cid:dup@x">', '2': PNG, '3': 'AAAA' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<img src="data:image/png;base64,${PNG}">`);
+      expect(body.attachments.map(a => a.filename)).toEqual(['second.png']);
+    });
+
+    it('shows a photo attached outside a multipart/related that the text cites, and keeps it listed', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [
+          html(),
+          attachedImage('2', { id: '<photo@x>', type: 'image/jpeg', dispositionParameters: { filename: 'photo.jpg' } }),
+        ],
+      }, { '1': '<p>Here it is:</p><img src="cid:photo@x">', '2': '/9j/' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<p>Here it is:</p><img src="data:image/jpeg;base64,/9j/">');
+      expect(body.attachments).toEqual([expect.objectContaining({ part: '2', filename: 'photo.jpg', shownInline: true })]);
+      expect(body.inlineParts).toEqual(['2']);
+    });
+
+    // sanitizeEmail drops <body> and keeps a data: background on table tags only, so an image named
+    // only there would leave the list and then vanish from the message.
+    it('does not adopt an image named only where the sanitizer drops it', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('2', { id: '<bg@x>', dispositionParameters: { filename: 'bg.png' } })],
+      }, {
+        '1': '<body background="cid:bg@x" style="background:url(cid:bg@x)"><div background="cid:bg@x"><iframe src="cid:bg@x"></iframe><p>Hi</p></div></body>',
+        '2': PNG,
+      });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.attachments.map(a => a.filename)).toEqual(['bg.png']);
+      expect(body.inlineParts).toEqual([]);
+    });
+
+    it('ignores references inside raw-text and never-rendered elements, declarations and processing instructions', async () => {
+      const hidden = [
+        '<textarea><img src="cid:a@x"></textarea>',
+        '<title><img src="cid:a@x"></title>',
+        '<xmp><img src="cid:a@x"></xmp>',
+        '<noscript><img src="cid:a@x"></noscript>',
+        '<noembed><img src="cid:a@x"></noembed>',
+        '<noframes><img src="cid:a@x"></noframes>',
+        '<iframe srcdoc="x"><img src="cid:a@x"></iframe>',
+        '<!x <img src="cid:a@x">',
+        '<?php <img src="cid:a@x"> ?>',
+        '<plaintext></plaintext><img src="cid:a@x">',
+        '<TEXTAREA>a</textarea >b<img src="cid:b@x"></TEXTAREA><img src="cid:b@x">',
+      ];
+      for (const doc of hidden) {
+        const { mgr, account } = serve({
+          type: 'multipart/related',
+          childNodes: [html(), attachedImage('2', { id: '<a@x>', dispositionParameters: { filename: 'a.png' } })],
+        }, { '1': doc, '2': PNG });
+        const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+        expect(body.attachments.map(a => a.filename), doc).toEqual(['a.png']);
+      }
+      // After the raw text ends, markup counts again.
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('2', { id: '<a@x>', dispositionParameters: { filename: 'a.png' } })],
+      }, { '1': '<textarea><img src="cid:a@x"></textarea><img src="cid:a@x">', '2': PNG });
+      expect((await mgr.fetchMessageBody(account, 42, 'INBOX')).attachments).toEqual([]);
+    });
+
+    it('marks a listed photo shown inline only where an <img> shows it, not a background', async () => {
+      const structure = (doc) => serve({
+        type: 'multipart/mixed',
+        childNodes: [html(), attachedImage('2', { id: '<photo@x>', type: 'image/jpeg', dispositionParameters: { filename: 'photo.jpg' } })],
+      }, { '1': doc, '2': '/9j/' });
+      let { mgr, account } = structure('<table background="cid:photo@x"><tr><td>Look</td></tr></table>');
+      let body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<table background="data:image/jpeg;base64,/9j/"><tr><td>Look</td></tr></table>');
+      expect(body.attachments).toEqual([expect.objectContaining({ filename: 'photo.jpg' })]);
+      expect(body.attachments[0].shownInline).toBeUndefined();
+      expect(body.inlineParts).toEqual([]);
+      ({ mgr, account } = structure('<table background="cid:photo@x"><tr><td><img src=" cid:photo@x"></td></tr></table>'));
+      body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.attachments[0].shownInline).toBe(true);
+      expect(body.inlineParts).toEqual(['2']);
+    });
+
+    it('caps by the size the server reports, not the size= the sender wrote', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [
+          html(),
+          attachedImage('2', { size: 6 * 1024 * 1024, dispositionParameters: { filename: 'big.png', size: '1' } }),
+          attachedImage('3', { size: 900, dispositionParameters: { filename: 'small.png', size: '99999999' } }),
+        ],
+      }, { '1': '<img src="big.png"><img src="small.png">', '2': PNG, '3': 'AAAA' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<img src="big.png"><img src="data:image/png;base64,AAAA">');
+      expect(body.attachments.map(a => a.filename)).toEqual(['big.png']);
+    });
+
+    it('adopts an image of unknown size only by cid: from inside its multipart/related', async () => {
+      const unsized = (part, extra) => ({ part, type: 'image/png', encoding: 'base64', disposition: 'attachment', ...extra });
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'multipart/related', childNodes: [
+            html('1.1'),
+            unsized('1.2', { id: '<logo@x>', dispositionParameters: { filename: 'logo.png' } }),
+            unsized('1.3', { dispositionParameters: { filename: 'badge.png' } }),
+          ] },
+          unsized('2', { id: '<photo@x>', dispositionParameters: { filename: 'photo.png' } }),
+        ],
+      }, { '1.1': '<img src="cid:logo@x"><img src="badge.png"><img src="cid:photo@x">', '1.2': PNG, '1.3': 'AAAA', '2': 'BBBB' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<img src="data:image/png;base64,${PNG}"><img src="badge.png"><img src="cid:photo@x">`);
+      expect(body.attachments.map(a => a.filename)).toEqual(['badge.png', 'photo.png']);
+    });
+
+    it('looks up malformed percent-encoded references quickly', () => {
+      const structure = {
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('2', { id: '<a@x>', dispositionParameters: { filename: 'a.png' } })],
+      };
+      // Against the same number of plain references on the same machine, not a fixed time: a busy
+      // CI runner is several times slower across the board. Decoding every reference made these
+      // about 40 times slower than plain ones.
+      const time = (doc) => {
+        const started = performance.now();
+        extractBodyFromMsg({ bodyStructure: structure, bodyParts: new Map([['1', Buffer.from(doc)]]) });
+        return performance.now() - started;
+      };
+      const plain = time('<img src="cid:zz@x">'.repeat(80_000));
+      for (const doc of ['<img src="cid:%E0%A4%A">'.repeat(80_000), Array.from({ length: 80_000 }, (_, i) => `<img src="cid:%E0%A4%41${i}">`).join('')]) {
+        expect(time(doc)).toBeLessThan(plain * 8 + 100);
+      }
+    });
+
+    it('fetches an attached image only once the HTML is known to show it', async () => {
+      const { mgr, account, requested } = serve({
+        type: 'multipart/related',
+        childNodes: [
+          html(),
+          attachedImage('7', { id: '<a@x>', dispositionParameters: { filename: 'a.png' } }),
+          attachedImage('8', { id: '<b@x>', dispositionParameters: { filename: 'b.png' } }),
+        ],
+      }, { '1': '<img src="cid:a@x">', '7': PNG, '8': 'AAAA' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<img src="data:image/png;base64,${PNG}">`);
+      expect(body.attachments.map(a => a.filename)).toEqual(['b.png']);
+      expect(requested).toContain('7');
+      expect(requested).not.toContain('8');
+    });
+
+    it('is not complete when an adopted image did not arrive', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), attachedImage('7', { location: 'a.png' })],
+      }, { '1': '<img src="a.png">' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toMatch(/^<img src="cid:part-7-[0-9a-f]{12}@mailflow\.invalid">$/);
+      expect(body.cidsComplete).toBe(false);
+      expect(body.attachments).toEqual([]);
+    });
+
+    it('turns references by name into cid: in a synced body, so opening it embeds them', () => {
+      const body = extractBodyFromMsg({
+        bodyStructure: {
+          type: 'multipart/related',
+          childNodes: [
+            html(),
+            { part: '2', type: 'image/png', encoding: 'base64', size: 900, parameters: { name: 'logo.png' } },
+            attachedImage('3', { id: '<x@y>', dispositionParameters: { filename: 'x.png' } }),
+          ],
+        },
+        bodyParts: new Map([['1', Buffer.from('<img src="logo.png"><img src="cid:x@y">')]]),
+      });
+      expect(body.html).toMatch(/^<img src="cid:part-2-[0-9a-f]{12}@mailflow\.invalid"><img src="cid:x@y">$/);
+      expect(body.attachments).toEqual([]);
+    });
+
+    it('leaves a synced body whose related image has no known Content-Location to the body fetch', () => {
+      const structure = {
+        type: 'multipart/related',
+        childNodes: [html(), { part: '2', type: 'image/png', encoding: 'base64' }],
+      };
+      const body = extractBodyFromMsg({ bodyStructure: structure, bodyParts: new Map([['1', Buffer.from('<img src="https://x.example/a.png">')]]) });
+      expect(body.deferred).toBe(true);
+      const known = extractBodyFromMsg({
+        bodyStructure: { ...structure, childNodes: [html(), { part: '2', type: 'image/png', encoding: 'base64', size: 900, location: 'https://x.example/a.png' }] },
+        bodyParts: new Map([['1', Buffer.from('<img src="https://x.example/a.png">')]]),
+      });
+      expect(known.deferred).toBe(false);
+      expect(known.html).toMatch(/^<img src="cid:part-2-[0-9a-f]{12}@mailflow\.invalid">$/);
+      // Nothing for a Content-Location to answer: no image URL, or only resolved ones.
+      for (const doc of ['<p>No images</p>', '<img src="data:image/png;base64,AA"><img src="cid:x@y">', '<p>src="a.png"</p>']) {
+        expect(extractBodyFromMsg({ bodyStructure: structure, bodyParts: new Map([['1', Buffer.from(doc)]]) }).deferred).toBe(false);
+      }
+    });
+
+    it('reads a Content-Location from a MIME header, folded or not', () => {
+      expect(contentLocationFromMimeHeader(Buffer.from('Content-Type: image/png\r\ncontent-location:   a/b.png  \r\n\r\n'))).toBe('a/b.png');
+      expect(contentLocationFromMimeHeader(Buffer.from('Content-Location:\r\n\thttps://x.example/a.png\r\n'))).toBe('https://x.example/a.png');
+      expect(contentLocationFromMimeHeader(Buffer.from('Content-Type: image/png\r\n'))).toBe('');
+      expect(contentLocationFromMimeHeader(undefined)).toBe('');
+    });
+
+    it('leaves the sync-time attachment list as before: the body is not known there', () => {
+      const atts = attachmentsFromStructure({
+        bodyStructure: {
+          type: 'multipart/related',
+          childNodes: [html(), attachedImage('2', { id: '<x@y>', dispositionParameters: { filename: 'x.png' } })],
+        },
+      });
+      expect(atts.map(a => a.filename)).toEqual(['x.png']);
+    });
+
+    // Shapes still broken in 4.0.3 (#640): a layout image outside any multipart/related named by
+    // file name, sent as application/octet-stream or with no type, cited as cid: with its file
+    // name, or typed image/x-png or another alias.
+    it('shows an attached image outside a multipart/related that the HTML names by file name, and keeps it listed', async () => {
+      for (const extra of [{ disposition: 'attachment' }, { disposition: 'inline' }, { disposition: undefined }]) {
+        const { mgr, account } = serve({
+          type: 'multipart/mixed',
+          childNodes: [
+            html(),
+            attachedImage('2', { type: 'image/jpeg', ...extra, dispositionParameters: { filename: 'hdr.jpg' } }),
+            { ...report },
+          ],
+        }, { '1': '<table><tr><td background="hdr.jpg"><img src="HDR.JPG"><img src=hdr.jpg></td></tr></table>', '2': '/9j/', '3': 'JVBERi0=' });
+        const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+        // A file name is matched exactly, as a URL: HDR.JPG is another file.
+        expect(body.html).toBe('<table><tr><td background="data:image/jpeg;base64,/9j/"><img src="HDR.JPG"><img src="data:image/jpeg;base64,/9j/"></td></tr></table>');
+        expect(body.attachments).toEqual([
+          expect.objectContaining({ part: '2', filename: 'hdr.jpg', shownInline: true }),
+          expect.objectContaining({ filename: 'invoice.pdf' }),
+        ]);
+        expect(body.attachments[1].shownInline).toBeUndefined();
+        expect(body.inlineParts).toEqual(['2']);
+        expect(body.cidsComplete).toBe(true);
+      }
+    });
+
+    it('leaves an attached image the HTML outside a multipart/related never names listed and unshown', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [html(), attachedImage('2', { type: 'image/jpeg', dispositionParameters: { filename: 'holiday.jpg' } })],
+      }, { '1': '<p>See holiday.jpg</p><img src="https://x.example/holiday.jpg">', '2': '/9j/' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).not.toContain('data:');
+      expect(body.attachments).toEqual([expect.objectContaining({ filename: 'holiday.jpg' })]);
+      expect(body.attachments[0].shownInline).toBeUndefined();
+      expect(body.inlineParts).toEqual([]);
+    });
+
+    it('shows an application/octet-stream or untyped part named like an image, typed by its bytes', async () => {
+      const octet = (part, extra) => ({ part, type: 'application/octet-stream', encoding: 'base64', size: 3000, ...extra });
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'multipart/related', childNodes: [
+            html('1.1'),
+            // Inline, with a Content-ID: an inline image.
+            octet('1.2', { id: '<hdr@x>', disposition: 'inline', dispositionParameters: { filename: 'hdr.JPG' } }),
+            // Marked as an attachment, with a Content-ID.
+            octet('1.3', { id: '<badge@x>', disposition: 'attachment', dispositionParameters: { filename: 'badge.png' } }),
+            // No type at all.
+            octet('1.4', { type: '', id: '<icon@x>', disposition: 'attachment', parameters: { name: 'icon.gif' } }),
+          ] },
+          // A real file sent as application/octet-stream is still a file.
+          octet('2', { id: '<doc@x>', disposition: 'attachment', dispositionParameters: { filename: 'notes.bin' } }),
+          octet('3', { disposition: 'attachment', dispositionParameters: { filename: 'scan.webp' } }),
+        ],
+      }, {
+        '1.1': '<img src="cid:hdr@x"><table background="cid:badge@x"><tr><td style="background:url(cid:icon@x)"><img src="cid:doc@x"></td></tr></table>',
+        '1.2': '/9j/', '1.3': PNG, '1.4': 'R0lGODlh', '2': 'AAAA', '3': 'UklGRgAAAABXRUJQ',
+      });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<img src="data:image/jpeg;base64,/9j/"><table background="data:image/png;base64,${PNG}">`
+        + '<tr><td style="background:url(data:image/gif;base64,R0lGODlh)"><img src="cid:doc@x"></td></tr></table>');
+      expect(body.attachments.map(a => a.filename)).toEqual(['notes.bin', 'scan.webp']);
+      expect(body.cidsComplete).toBe(true);
+      const { sanitizeEmail: realSanitize } = await vi.importActual('./emailSanitizer.js');
+      expect(realSanitize(body.html)).toContain(`background="data:image/png;base64,${PNG}"`);
+    });
+
+    it('lists an inline application/octet-stream image the HTML never references', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [html(), { part: '2', type: 'application/octet-stream', encoding: 'base64', size: 3000, id: '<p@x>', disposition: 'inline', dispositionParameters: { filename: 'photo.jpeg' } }],
+      }, { '1': '<p>Hi</p>', '2': '/9j/' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.attachments).toEqual([expect.objectContaining({ part: '2', filename: 'photo.jpeg', type: 'application/octet-stream' })]);
+    });
+
+    it('resolves a cid: that is an image part\'s file name rather than its Content-ID', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'multipart/related', childNodes: [
+            html('1.1'),
+            // M: another Content-ID, inline.
+            { part: '1.2', type: 'image/jpeg', encoding: 'base64', size: 900, id: '<0123@mailer>', disposition: 'inline', dispositionParameters: { filename: 'hdr.jpg' } },
+            // M: another Content-ID, marked as an attachment.
+            attachedImage('1.3', { id: '<4567@mailer>', dispositionParameters: { filename: 'Badge.png' } }),
+            // N: no Content-ID.
+            { part: '1.4', type: 'image/gif', encoding: 'base64', size: 900, disposition: 'inline', dispositionParameters: { filename: 'spacer gif.gif' } },
+          ] },
+          // N, outside a multipart/related: shown and still listed.
+          attachedImage('2', { type: 'image/jpeg', dispositionParameters: { filename: 'photo.jpg' } }),
+        ],
+      }, {
+        // Case, angle brackets and percent-encoding as for a Content-ID.
+        '1.1': '<img src="cid:HDR.jpg"><img src="cid:<badge.png>"><img src="cid:spacer%20gif.gif"><img src="cid:photo.jpg">',
+        '1.2': '/9j/', '1.3': PNG, '1.4': 'R0lG', '2': 'BBBB',
+      });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe(`<img src="data:image/jpeg;base64,/9j/"><img src="data:image/png;base64,${PNG}">`
+        + '<img src="data:image/gif;base64,R0lG"><img src="data:image/jpeg;base64,BBBB">');
+      expect(body.attachments).toEqual([expect.objectContaining({ part: '2', filename: 'photo.jpg', shownInline: true })]);
+      expect(body.cidsComplete).toBe(true);
+    });
+
+    it('leaves a cid: file name two image parts share, or one a Content-ID answers, as it is', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [
+          html(),
+          attachedImage('2', { id: '<a@x>', dispositionParameters: { filename: 'logo.png' } }),
+          attachedImage('3', { id: '<b@x>', dispositionParameters: { filename: 'LOGO.png' } }),
+          // Its Content-ID is another image's file name: the Content-ID wins.
+          attachedImage('4', { id: '<pic.png>', dispositionParameters: { filename: 'one.png' } }),
+          attachedImage('5', { id: '<c@x>', dispositionParameters: { filename: 'pic.png' } }),
+        ],
+      }, { '1': '<img src="cid:logo.png"><img src="cid:pic.png">', '2': PNG, '3': 'AAAA', '4': 'BBBB', '5': 'CCCC' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<img src="cid:logo.png"><img src="data:image/png;base64,BBBB">');
+      expect(body.attachments.map(a => a.filename)).toEqual(['logo.png', 'LOGO.png', 'pic.png']);
+    });
+
+    it('builds a data: URI the sanitizer keeps from image/jpg, image/x-png and other aliases', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [
+          html(),
+          { part: '2', type: 'IMAGE/JPG', encoding: 'base64', size: 900, id: '<a@x>', disposition: 'inline' },
+          { part: '3', type: 'image/x-png', encoding: 'base64', size: 900, id: '<b@x>' },
+          attachedImage('4', { type: 'image/pjpeg', id: '<c@x>', dispositionParameters: { filename: 'c.jpg' } }),
+          attachedImage('5', { type: 'image/x-ms-bmp', id: '<d@x>', dispositionParameters: { filename: 'd.bmp' } }),
+        ],
+      }, {
+        '1': '<table background="cid:a@x"><tr><td background="cid:b@x"></td><td background="cid:c@x"></td><th background="cid:d@x"></th></tr></table>',
+        '2': '/9j/', '3': PNG, '4': 'AAAA', '5': 'Qk0=',
+      });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      const { sanitizeEmail: realSanitize } = await vi.importActual('./emailSanitizer.js');
+      const shown = realSanitize(body.html);
+      for (const uri of ['data:image/jpeg;base64,/9j/', `data:image/png;base64,${PNG}`, 'data:image/jpeg;base64,AAAA', 'data:image/bmp;base64,Qk0=']) {
+        expect(shown).toContain(`background="${uri}"`);
+      }
+      expect(body.attachments).toEqual([]);
+    });
+
+    it('still matches a file name in a synced body outside a multipart/related only once its size is known', () => {
+      const structure = (size) => ({
+        type: 'multipart/mixed',
+        childNodes: [html(), { part: '2', type: 'application/octet-stream', encoding: 'base64', size, disposition: 'attachment', dispositionParameters: { filename: 'hdr.jpg' } }],
+      });
+      const doc = new Map([['1', Buffer.from('<img src="hdr.jpg">')]]);
+      expect(extractBodyFromMsg({ bodyStructure: structure(900), bodyParts: doc }).html).toMatch(/^<img src="cid:part-2-[0-9a-f]{12}@mailflow\.invalid">$/);
+      expect(extractBodyFromMsg({ bodyStructure: structure(0), bodyParts: doc }).html).toBe('<img src="hdr.jpg">');
+    });
+
+    // An HTML page, an SVG and a PDF, each sent as application/octet-stream (or untyped) and named
+    // like a PNG: what the HTML names them is not shown, and they stay files to download.
+    it('keeps a part named like an image whose bytes are not one a file, in a multipart/related or not', async () => {
+      const notImages = {
+        html: Buffer.from('<html><body>Hi</body></html>').toString('base64'),
+        svg: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>x()</script></svg>').toString('base64'),
+        pdf: Buffer.from('%PDF-1.4\n%x\n').toString('base64'),
+      };
+      const octet = (part, name, extra) => ({ part, type: 'application/octet-stream', encoding: 'base64', size: 900, disposition: 'attachment', dispositionParameters: { filename: name }, ...extra });
+      for (const [kind, bytes] of Object.entries(notImages)) {
+        for (const related of [true, false]) {
+          const parts = [
+            html(related ? '1.1' : '1'),
+            octet(related ? '1.2' : '2', 'scan.png'),
+            octet(related ? '1.3' : '3', 'logo.png', { id: '<logo@x>' }),
+            // Inline with a Content-ID: walked as an inline image, so it is listed again.
+            octet(related ? '1.4' : '4', 'icon.png', { id: '<icon@x>', disposition: 'inline', type: '' }),
+          ];
+          const n = (p) => (related ? `1.${p}` : String(p));
+          const { mgr, account } = serve(related ? { type: 'multipart/related', childNodes: parts } : { type: 'multipart/mixed', childNodes: parts }, {
+            [n(1)]: '<img src="scan.png"><img src="cid:logo@x"><img src="cid:icon@x">',
+            [n(2)]: bytes, [n(3)]: bytes, [n(4)]: bytes,
+          });
+          const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+          const label = `${kind} ${related ? 'related' : 'mixed'}`;
+          expect(body.html, label).not.toContain('data:');
+          expect(body.attachments.map(a => a.filename).sort(), label).toEqual(['icon.png', 'logo.png', 'scan.png']);
+          expect(body.attachments.every(a => !a.shownInline && a.type === 'application/octet-stream'), label).toBe(true);
+          expect(body.inlineParts, label).toEqual([]);
+          // A part that will never be an image is no reason to fetch the body again.
+          expect(body.cidsComplete, label).toBe(true);
+        }
+      }
+    });
+
+    it('drops a related part named like an image from the list only once its bytes are one', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), { part: '2', type: 'application/octet-stream', encoding: 'base64', size: 900, disposition: 'attachment', dispositionParameters: { filename: 'hdr.png' } }, report],
+      }, { '1': '<img src="hdr.png">', '2': 'R0lGODlhAQABAAAAACw=', '3': 'JVBERi0=' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      // Named .png, but a GIF: shown as what it is.
+      expect(body.html).toBe('<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">');
+      expect(body.attachments.map(a => a.filename)).toEqual(['invoice.pdf']);
+    });
+
+    // Quoted-printable image bytes read like QP text (=3D, =D0), which counted the image as missing:
+    // the body was never marked settled and every view fetched it again.
+    it('embeds a quoted-printable image as its decoded bytes, and counts the fetch complete', async () => {
+      const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('=\u00d0\u00d1 rest of a picture')]);
+      const qp = [...png].map(b => (b >= 33 && b <= 126 && b !== 61 ? String.fromCharCode(b) : `=${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
+      for (const type of ['image/png', 'application/octet-stream']) {
+        const { mgr, account } = serve({
+          type: 'multipart/related',
+          childNodes: [html(), { part: '2', type, encoding: 'quoted-printable', size: 900, id: '<q@x>', disposition: 'inline', dispositionParameters: { filename: 'q.png' } }],
+        }, { '1': '<img src="cid:q@x">', '2': qp });
+        const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+        expect(body.html, type).toBe(`<img src="data:image/png;base64,${png.toString('base64')}">`);
+        expect(body.cidsComplete, type).toBe(true);
+        expect(body.attachments, type).toEqual([]);
+      }
+    });
+
+    it('settles a body whose image part holds text, rather than fetching it again on every view', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/related',
+        childNodes: [html(), { part: '2', type: 'image/svg+xml', encoding: 'quoted-printable', size: 900, id: '<s@x>', disposition: 'inline' }],
+      }, { '1': '<img src="cid:s@x">', '2': '<svg xmlns=3D"http://www.w3.org/2000/svg"></svg>' });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.html).toBe('<img src="cid:s@x">');
+      expect(body.cidsComplete).toBe(true);
+    });
+
+    it('lists an unreferenced inline part named like an image but holding a PDF once', async () => {
+      const { mgr, account } = serve({
+        type: 'multipart/mixed',
+        childNodes: [html(), { part: '2', type: 'application/octet-stream', encoding: 'base64', size: 900, id: '<s@x>', disposition: 'inline', dispositionParameters: { filename: 'scan.png' } }],
+      }, { '1': '<p>Scan attached</p>', '2': Buffer.from('%PDF-1.4').toString('base64') });
+      const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+      expect(body.attachments.map(a => a.filename)).toEqual(['scan.png']);
+    });
+
+    it('stays fast on cid: file name references', () => {
+      const structure = {
+        type: 'multipart/mixed',
+        childNodes: [html(), ...Array.from({ length: 200 }, (_, i) => attachedImage(String(i + 2), { dispositionParameters: { filename: `${'n'.repeat(2000)}${i}.png` } }))],
+      };
+      const time = (doc) => {
+        const started = performance.now();
+        extractBodyFromMsg({ bodyStructure: structure, bodyParts: new Map([['1', Buffer.from(doc)]]) });
+        return performance.now() - started;
+      };
+      // Against plain image URLs of the same size on the same machine.
+      const plain = time('<img src="https://x.example/a.png">'.repeat(10_000));
+      for (const doc of [
+        '<img src="cid:nnnnnnnnnnnnnnnnnnnnnnnnn.png">'.repeat(10_000),
+        `<img src="cid:${'%41'.repeat(100_000)}">`,
+        Array.from({ length: 10_000 }, (_, i) => `<img src="cid:${i}.png">`).join(''),
+        `<img src="cid:${' '.repeat(300_000)}`,
+      ]) {
+        expect(time(doc)).toBeLessThan(plain * 8 + 100);
+      }
+    });
+
+    it('stays fast on hostile HTML and names', () => {
+      const names = Array.from({ length: 200 }, (_, i) => `${'a'.repeat(2000)}${i}`);
+      const structure = {
+        type: 'multipart/related',
+        childNodes: [html(), ...names.map((name, i) => attachedImage(String(i + 2), { location: `b${'a'.repeat(1999)}`, dispositionParameters: { filename: name } }))],
+      };
+      const hostile = [
+        'a'.repeat(1_000_000),
+        `src=${' '.repeat(500_000)}"${'a'.repeat(500_000)}`,
+        `src="${'src="'.repeat(200_000)}`,
+        `url(${'('.repeat(500_000)}`,
+      ];
+      for (const doc of hostile) {
+        const started = performance.now();
+        extractBodyFromMsg({ bodyStructure: structure, bodyParts: new Map([['1', Buffer.from(doc)]]) });
+        expect(performance.now() - started).toBeLessThan(2000);
+      }
+    });
   });
 });
 
@@ -1631,6 +2747,67 @@ describe("connectAccount attaches 'error' before connect (#360)", () => {
     expect(ImapFlow).toHaveBeenCalledTimes(1);
     expect(errorListenersAtConnect).toBeGreaterThanOrEqual(1);
     expect(emitThrew).toBe(false);
+  });
+});
+
+// An OAuth account whose refresh failed for good retries a stale token on every tick. With the
+// refresh failure remembered, the rejection takes the long auth backoff (#674); without it,
+// a rejection right after a new token stays on the short path, as before.
+describe('connectAccount: the auth backoff for an OAuth account with a dead refresh', () => {
+  const setup = () => {
+    resolveForConnection.mockReset().mockRejectedValue(new Error('AUTHENTICATE failed.'));
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: false });
+    query.mockReset().mockResolvedValue({ rows: [] });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const mgr = new ImapManager(null);
+    clearInterval(mgr._healthCheckTimer);
+    clearInterval(mgr._snippetSchedulerTimer);
+    mgr.disconnectAccount = vi.fn(() => Promise.resolve());
+    mgr.broadcast = vi.fn();
+    return mgr;
+  };
+  const acct = { id: 'acct-dead-refresh', user_id: 'u1', email_address: 'me@outlook.com', oauth_provider: 'microsoft', imap_host: 'outlook.office365.com', imap_port: 993, imap_tls: true, auth_user: 'me@outlook.com' };
+  afterEach(() => { clearRefreshFailure(acct.id); vi.restoreAllMocks(); });
+
+  it('arms the long auth backoff when the refresh is known to be dead', async () => {
+    const mgr = setup();
+    noteRefreshFailure(acct.id, { code: 'oauth_reauth', detail: 'AADSTS70008: expired' });
+    const before = Date.now();
+    expect(await mgr.connectAccount(acct)).toBe(false);
+    expect(mgr._connectCooldown.get(acct.id)?.until).toBeGreaterThanOrEqual(before + 5 * 60 * 1000);
+  });
+
+  it('does not, for the same rejection with no refresh failure remembered', async () => {
+    const mgr = setup();
+    expect(await mgr.connectAccount(acct)).toBe(false);
+    expect(mgr._connectCooldown.has(acct.id)).toBe(false);
+  });
+});
+
+// A host the address check refuses (or an OAuth refresh that fails) used to throw before the
+// try that releases the in-progress lock: the account stayed "connecting" until a restart.
+describe('connectAccount when the host is refused', () => {
+  it('releases the lock and records the error, so the next attempt runs', async () => {
+    resolveForConnection.mockReset().mockRejectedValue(new Error('Host cannot be a private or reserved IP address'));
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: false, allowInsecureTls: false });
+    query.mockReset().mockResolvedValue({ rows: [] });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const mgr = new ImapManager(null);
+    clearInterval(mgr._healthCheckTimer);
+    clearInterval(mgr._snippetSchedulerTimer);
+    mgr.disconnectAccount = vi.fn(() => Promise.resolve());
+    mgr.broadcast = vi.fn();
+    const acct = { id: 'acct-refused', user_id: 'u1', imap_host: '2130706433', imap_port: 993, imap_tls: true, auth_user: 'u', auth_pass: 'enc' };
+
+    expect(await mgr.connectAccount(acct)).toBe(false);
+    expect(mgr.connectingAccounts.has(acct.id)).toBe(false);
+    expect(query.mock.calls.some(([sql, params]) => /SET sync_error/.test(sql) && /private or reserved/.test(params[0]))).toBe(true);
+    // Not "Already connecting": the second attempt reaches the host check again.
+    expect(await mgr.connectAccount(acct)).toBe(false);
+    expect(resolveForConnection).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -1920,16 +3097,14 @@ describe('classifyMoveBySearch (#407 empty-uidMap reconciliation)', () => {
       expect(r.succeeded).toEqual([]);
       expect(r.failed).toEqual([4, 5, 6]);
       expect(r.staleCount).toBeNull();
-      expect(r.mappable).toBe(false);
     }
   });
 
-  it('clean move: all left source, all arrived -> succeeded + mappable', () => {
+  it('clean move: all left source, all arrived -> succeeded', () => {
     const r = classifyMoveBySearch([4, 5, 6], /*remaining*/ [], /*destArrived*/ 3);
     expect(r.succeeded).toEqual([4, 5, 6]);
     expect(r.failed).toEqual([]);
     expect(r.staleCount).toBe(0);
-    expect(r.mappable).toBe(true);
   });
 
   it('stale UID in batch: fewer arrived than left -> ALL failed, no wrong-deletion', () => {
@@ -1939,7 +3114,6 @@ describe('classifyMoveBySearch (#407 empty-uidMap reconciliation)', () => {
     expect(r.succeeded).toEqual([]);
     expect(r.failed).toEqual([2, 3, 4, 5, 6]);
     expect(r.staleCount).toBe(2);
-    expect(r.mappable).toBe(false);
   });
 
   it('partial move failure: some still in source -> those are failed, the rest succeeded', () => {
@@ -1948,7 +3122,6 @@ describe('classifyMoveBySearch (#407 empty-uidMap reconciliation)', () => {
     expect(r.succeeded).toEqual([4]);
     expect(r.failed).toEqual([5, 6]);
     expect(r.staleCount).toBe(0);
-    expect(r.mappable).toBe(true);
   });
 
   it('nothing left the source -> all failed (move did not happen)', () => {
@@ -1958,16 +3131,197 @@ describe('classifyMoveBySearch (#407 empty-uidMap reconciliation)', () => {
     expect(r.staleCount).toBe(0);
   });
 
-  it('destination not verifiable (null) -> trust source-absence, not mappable, stale unknown', () => {
+  it('destination not verifiable (null) -> trust source-absence, stale unknown', () => {
     const r = classifyMoveBySearch([4, 5, 6], /*remaining*/ [], /*destArrived*/ null);
     expect(r.succeeded).toEqual([4, 5, 6]);
     expect(r.failed).toEqual([]);
     expect(r.staleCount).toBeNull();
-    expect(r.mappable).toBe(false);
+  });
+
+  // What else reaches the destination meanwhile arrives in the same UID range, so the count can
+  // make up for a stale UID. The source as a FETCH found it before the move says which one it was.
+  it('with the source as it was before the move: a UID that was not there is stale, whatever arrived', () => {
+    const r = classifyMoveBySearch([5, 9], /*remaining*/ [], /*destArrived*/ 2, /*presentBefore*/ new Set([5]));
+    expect(r.succeeded).toEqual([5]);
+    expect(r.failed).toEqual([9]);
+    expect(r.staleCount).toBe(1);
+  });
+
+  it('with the source as it was before the move: one still there failed, one that left moved', () => {
+    const r = classifyMoveBySearch([4, 5, 6], /*remaining*/ [6], /*destArrived*/ null, new Set([4, 5, 6]));
+    expect(r.succeeded).toEqual([4, 5]);
+    expect(r.failed).toEqual([6]);
+    expect(r.staleCount).toBe(0);
+  });
+});
+
+// pairMovedCopies finds a moved message among the destination's arrivals by its content: the
+// Message-ID, sender, subject, Date header and size together. Each case below differs in one part
+// only, so it fails when that part is left out of the match.
+describe('pairMovedCopies', () => {
+  const copy = (uid, { size = 100, ...envelope } = {}) => ({
+    uid, size,
+    envelope: { messageId: '<a@example.com>', subject: 'Subject', from: [{ address: 'sender@example.com' }], date: new Date('2026-10-01T10:00:00Z'), ...envelope },
+  });
+  const pairs = (moved, arrivals) => [...pairMovedCopies(moved, arrivals)];
+
+  it.each([
+    ['size', { size: 200 }],
+    ['Date header', { date: new Date('2026-10-01T10:00:01Z') }],
+    ['subject', { subject: 'Re: Subject' }],
+    ['sender', { from: [{ address: 'other@example.com' }] }],
+    ['Message-ID', { messageId: '<b@example.com>' }],
+  ])('tells apart an arrival that differs only in its %s', (_part, other) => {
+    expect(pairs([copy(5)], [copy(40, other), copy(41)])).toEqual([[5, 41]]);
+  });
+
+  it('pairs a message with no Message-ID by the rest of its content', () => {
+    const none = { messageId: undefined };
+    expect(pairs([copy(5, none)], [copy(40), copy(41, none)])).toEqual([[5, 41]]);
+    expect(pairs([copy(5, { messageId: '<>' })], [copy(40), copy(41, none)])).toEqual([[5, 41]]);
+  });
+
+  it('pairs nothing when two arrivals carry the same content', () => {
+    expect(pairs([copy(5)], [copy(40), copy(41)])).toEqual([]);
+  });
+
+  it('pairs nothing for several identical moved messages, even when only one copy arrived', () => {
+    expect(pairs([copy(5), copy(6)], [copy(40)])).toEqual([]);
+    expect(pairs([copy(5), copy(6)], [copy(40), copy(41)])).toEqual([]);
+  });
+
+  it('pairs each of several different messages with its own arrival, whatever the order', () => {
+    expect(pairs([copy(5, { subject: 'A' }), copy(6, { subject: 'B' })], [copy(40, { subject: 'B' }), copy(41), copy(42, { subject: 'A' })]))
+      .toEqual([[5, 42], [6, 40]]);
   });
 });
 
 // ── sync_error recording — every path that gives up records, every success clears ──────────
+
+// What the UI is told to do about a failure (#674): every recording site goes through
+// _recordAccountError, so the code is decided there, next to the text.
+describe('_recordAccountError: sync_error_code', () => {
+  const ctx = () => ({ _syncErrorState: new Map(), _accountErrorStreak: new Map(), broadcast: vi.fn() });
+  const outlook = { id: 'ms-1', user_id: 'u1', email_address: 'maria.lopez@outlook.com', oauth_provider: 'microsoft', oauth_tenant_id: 'consumers' };
+  const work = { id: 'ms-2', user_id: 'u1', email_address: 'maria@contoso.example', oauth_provider: 'microsoft', oauth_tenant_id: 'common' };
+  const pw = { id: 'pw-1', user_id: 'u1', email_address: 'maria@example.com', oauth_provider: null };
+  const written = () => query.mock.calls.find(([sql]) => /SET sync_error = \$1/.test(sql))?.[1];
+
+  beforeEach(() => { query.mockReset(); query.mockResolvedValue({ rows: [] }); });
+  afterEach(() => { for (const a of [outlook, work, pw]) clearRefreshFailure(a.id); });
+
+  it.each([
+    [outlook, 'User is authenticated but not connected.', 'ms_imap_disabled_personal'],
+    [work, 'User is authenticated but not connected.', 'ms_imap_disabled_work'],
+    [outlook, 'AUTHENTICATE failed.', 'oauth_reauth'],
+    [pw, '[AUTHENTICATIONFAILED] Invalid credentials', 'auth_failed'],
+    [pw, 'getaddrinfo ENOTFOUND imap.example.com', 'connection'],
+  ])('records %#: %s as %s, in the row and to the client', async (account, detail, code) => {
+    const self = ctx();
+    await ImapManager.prototype._recordAccountError.call(self, account, detail);
+    expect(written()).toEqual([detail, account.id, code]);
+    expect(self.broadcast).toHaveBeenCalledWith({ type: 'account_error', accountId: account.id, error: detail, code }, 'u1');
+  });
+
+  it('records a refresh that failed for good instead of the AUTHENTICATE failure it caused', async () => {
+    const self = ctx();
+    noteRefreshFailure(outlook.id, { code: 'oauth_reauth', detail: 'AADSTS700082: The refresh token has expired due to inactivity.' });
+    await ImapManager.prototype._recordAccountError.call(self, outlook, 'AUTHENTICATE failed.');
+    expect(written()).toEqual(['AADSTS700082: The refresh token has expired due to inactivity.', outlook.id, 'oauth_reauth']);
+  });
+
+  it('rewrites the same text when its code changes', async () => {
+    const self = ctx();
+    const acct = { ...outlook, id: 'ms-dedup' };
+    noteFreshToken(acct.id);
+    await ImapManager.prototype._recordAccountError.call(self, acct, 'AUTHENTICATE failed.');
+    expect(written()).toEqual(['AUTHENTICATE failed.', acct.id, 'connection']);
+    // The token is no longer fresh: same text, now "sign in again".
+    noteFreshToken(acct.id, Date.now() - 60 * 60 * 1000);
+    query.mockClear();
+    await ImapManager.prototype._recordAccountError.call(self, acct, 'AUTHENTICATE failed.');
+    expect(written()).toEqual(['AUTHENTICATE failed.', acct.id, 'oauth_reauth']);
+    // And unchanged, it is not written again.
+    query.mockClear();
+    await ImapManager.prototype._recordAccountError.call(self, acct, 'AUTHENTICATE failed.');
+    expect(written()).toBeUndefined();
+  });
+
+  it('clears the code with the text', async () => {
+    const self = ctx();
+    await ImapManager.prototype._recordAccountError.call(self, outlook, 'User is authenticated but not connected.');
+    await ImapManager.prototype._clearAccountError.call(self, outlook);
+    expect(query).toHaveBeenLastCalledWith('UPDATE email_accounts SET sync_error = NULL, sync_error_code = NULL WHERE id = $1', [outlook.id]);
+    expect(self.broadcast).toHaveBeenLastCalledWith({ type: 'account_connected', accountId: outlook.id }, 'u1');
+  });
+});
+
+describe('ensureFreshToken: a refresh that cannot succeed is remembered, not swallowed', () => {
+  const soon = () => new Date(Date.now() + 60 * 1000).toISOString();
+  const account = () => ({ id: 'ms-9', email_address: 'me@outlook.com', oauth_provider: 'microsoft', oauth_token_expiry: soon() });
+
+  beforeEach(() => { vi.spyOn(console, 'error').mockImplementation(() => {}); vi.spyOn(console, 'log').mockImplementation(() => {}); });
+  afterEach(() => { clearRefreshFailure('ms-9'); vi.restoreAllMocks(); refreshMicrosoftToken.mockReset(); });
+
+  it('notes a terminal failure and goes on with the stored token', async () => {
+    const err = Object.assign(new Error('AADSTS70008: The refresh token has expired due to inactivity.'), { accountErrorCode: 'oauth_reauth' });
+    refreshMicrosoftToken.mockRejectedValueOnce(err);
+    const a = account();
+    await expect(ensureFreshToken(a)).resolves.toBe(a);
+    expect(refreshFailureFor('ms-9')).toEqual({ code: 'oauth_reauth', detail: err.message });
+  });
+
+  it('does not note a failure that may pass by itself', async () => {
+    refreshMicrosoftToken.mockRejectedValueOnce(new Error('fetch failed'));
+    await ensureFreshToken(account());
+    expect(refreshFailureFor('ms-9')).toBeNull();
+  });
+
+  it('forgets the failure once a refresh succeeds', async () => {
+    noteRefreshFailure('ms-9', { code: 'oauth_reauth', detail: 'old' });
+    refreshMicrosoftToken.mockImplementationOnce(async (a) => ({ ...a, oauth_access_token: 'new' }));
+    await ensureFreshToken(account());
+    expect(refreshFailureFor('ms-9')).toBeNull();
+  });
+});
+
+describe('forgetAccountError', () => {
+  beforeEach(() => { query.mockReset(); query.mockResolvedValue({ rows: [] }); });
+
+  it('clears the row and the cache, so the same failure after a retry is written again', async () => {
+    const acct = { id: 'f1', user_id: 'u1', email_address: 'x@example.com' };
+    const self = { _syncErrorState: new Map(), _accountErrorStreak: new Map(), _errorForgets: new Map(), broadcast: vi.fn(), forgetAccountError: ImapManager.prototype.forgetAccountError };
+    await ImapManager.prototype._recordAccountError.call(self, acct, 'Invalid credentials');
+    await self.forgetAccountError('f1');
+    expect(query).toHaveBeenLastCalledWith('UPDATE email_accounts SET sync_error = NULL, sync_error_code = NULL WHERE id = $1', ['f1']);
+    query.mockClear();
+    await ImapManager.prototype._recordAccountError.call(self, acct, 'Invalid credentials');
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('tells open account lists the error is gone', async () => {
+    const self = { _syncErrorState: new Map(), _errorForgets: new Map(), broadcast: vi.fn() };
+    await ImapManager.prototype.forgetAccountError.call(self, 'f2', 'u1');
+    expect(self.broadcast).toHaveBeenCalledWith({ type: 'account_connected', accountId: 'f2' }, 'u1');
+  });
+
+  it('a record in flight during the forget does not cache its text, so the next identical failure is written', async () => {
+    const acct = { id: 'f3', user_id: 'u1', email_address: 'x@example.com' };
+    const self = { _syncErrorState: new Map(), _accountErrorStreak: new Map(), _errorForgets: new Map(), broadcast: vi.fn() };
+    let release;
+    query.mockImplementationOnce(() => new Promise(r => { release = () => r({ rows: [] }); }));
+    const inFlight = ImapManager.prototype._recordAccountError.call(self, acct, 'Invalid credentials');
+    await new Promise(r => setTimeout(r, 0));
+    // The forget's UPDATE lands, then the in-flight record's write completes.
+    await ImapManager.prototype.forgetAccountError.call(self, 'f3', 'u1');
+    release();
+    await inFlight;
+    expect(self._syncErrorState.has('f3')).toBe(false);
+    query.mockClear();
+    await ImapManager.prototype._recordAccountError.call(self, acct, 'Invalid credentials');
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('_recordAccountError / _clearAccountError', () => {
   const acct = { id: 'a1', user_id: 'u1', email_address: 'x@example.com' };
@@ -1998,11 +3352,11 @@ describe('_recordAccountError / _clearAccountError', () => {
     expect(m.broadcast).not.toHaveBeenCalled();
     await m._recordAccountError(acct, 'IMAP connect timeout (30000ms)');
     expect(query).toHaveBeenCalledWith(
-      'UPDATE email_accounts SET sync_error = $1 WHERE id = $2',
-      ['IMAP connect timeout (30000ms)', 'a1'],
+      'UPDATE email_accounts SET sync_error = $1, sync_error_code = $3 WHERE id = $2',
+      ['IMAP connect timeout (30000ms)', 'a1', 'connection'],
     );
     expect(m.broadcast).toHaveBeenCalledWith(
-      { type: 'account_error', accountId: 'a1', error: 'IMAP connect timeout (30000ms)' }, 'u1',
+      { type: 'account_error', accountId: 'a1', error: 'IMAP connect timeout (30000ms)', code: 'connection' }, 'u1',
     );
   });
 
@@ -2026,7 +3380,7 @@ describe('_recordAccountError / _clearAccountError', () => {
     m.broadcast.mockClear();
     await m._clearAccountError(acct);
     expect(query).toHaveBeenLastCalledWith(
-      'UPDATE email_accounts SET sync_error = NULL WHERE id = $1', ['a1'],
+      'UPDATE email_accounts SET sync_error = NULL, sync_error_code = NULL WHERE id = $1', ['a1'],
     );
     expect(m.broadcast).toHaveBeenCalledWith({ type: 'account_connected', accountId: 'a1' }, 'u1');
   });
@@ -2076,6 +3430,7 @@ describe('syncMessages — empty mailbox still stamps last_sync', () => {
 
   it('stamps last_sync when the server reports an empty mailbox', async () => {
     const client = {
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
       mailbox: { exists: 0 },
     };
@@ -2089,7 +3444,7 @@ describe('syncMessages — empty mailbox still stamps last_sync', () => {
   it('invalidates a previous UID epoch even when the rebuilt mailbox is empty', async () => {
     query.mockImplementation(async sql => ({ rows: sql.includes('SELECT uid_validity') ? [{ uid_validity: '7' }] : [], rowCount: 0 }));
     const mgr = { _bgConnSem: createKeyedSemaphore(2), backfillMessages: vi.fn().mockResolvedValue() };
-    const client = { getMailboxLock: async () => ({ release() {} }), mailbox: { exists: 0, uidValidity: 8n } };
+    const client = { noop: async () => true, getMailboxLock: async () => ({ release() {} }), mailbox: { exists: 0, uidValidity: 8n } };
     await ImapManager.prototype.syncMessages.call(mgr, account, client, 'INBOX', 50, false, true);
     await new Promise(resolve => setImmediate(resolve));
     const purge = query.mock.calls.findIndex(([sql]) => sql.startsWith('DELETE FROM messages'));
@@ -2101,17 +3456,82 @@ describe('syncMessages — empty mailbox still stamps last_sync', () => {
 
   it('still releases the mailbox lock on the empty path', async () => {
     const release = vi.fn();
-    const client = { getMailboxLock: vi.fn().mockResolvedValue({ release }), mailbox: { exists: 0 } };
+    const client = { noop: async () => true, getMailboxLock: vi.fn().mockResolvedValue({ release }), mailbox: { exists: 0 } };
     await ImapManager.prototype.syncMessages.call({}, account, client, 'INBOX', 50, false, true);
     expect(release).toHaveBeenCalledTimes(1);
   });
 
   it('does NOT stamp when the mailbox object is missing — unknown state, not a confirmed sync', async () => {
-    const client = { getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }), mailbox: null };
+    const client = { noop: async () => true, getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }), mailbox: null };
     await expect(
       ImapManager.prototype.syncMessages.call({}, account, client, 'INBOX', 50, false, true)
     ).resolves.toEqual({ insertedCount: 0, broadcastedNewMessages: false });
     expect(query.mock.calls.filter(c => /UPDATE email_accounts SET last_sync/.test(c[0]))).toHaveLength(0);
+  });
+});
+
+// ── Frozen mailbox view on a long-lived session ──────────────────────────────────────────
+//
+// Yahoo only catches a session's view of its selected mailbox up when the client sends a
+// command that lets it: a session holding INBOX kept its SELECT-time counts through new mail,
+// and a UID STORE naming a message delivered since answered OK and changed nothing. The
+// persistent connection is such a session, so a sync that re-uses its selected mailbox
+// must NOOP before trusting the view.
+describe('syncMessages refreshes a selected mailbox it did not re-select', () => {
+  const account = { id: 'acct-frozen', user_id: 'u1', imap_host: 'imap.mail.yahoo.com' };
+  beforeEach(() => {
+    query.mockReset();
+    query.mockResolvedValue({ rows: [], rowCount: 0 });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('acts on the view the NOOP delivered, not the frozen one', async () => {
+    // Frozen view: 3 messages. The NOOP reports the mailbox is now empty, so the sync must
+    // take the empty path. Skipping the NOOP would sync against the stale count.
+    const mailbox = { exists: 3, uidValidity: 8n };
+    const client = {
+      mailbox,
+      noop: vi.fn(async () => { mailbox.exists = 0; return true; }),
+      getMailboxLock: vi.fn(async () => ({ release() {} })),
+    };
+    await ImapManager.prototype.syncMessages.call({}, account, client, 'INBOX', 50, false, true);
+    expect(client.noop).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls.some(([sql]) => sql.includes('total_count=0'))).toBe(true);
+  });
+
+  it('sends no NOOP when the lock ran a fresh SELECT', async () => {
+    const client = {
+      mailbox: { exists: 5 },
+      noop: vi.fn(async () => true),
+      getMailboxLock: vi.fn(async () => { client.mailbox = { exists: 0 }; return { release() {} }; }),
+    };
+    await ImapManager.prototype.syncMessages.call({}, account, client, 'INBOX', 50, false, true);
+    expect(client.noop).not.toHaveBeenCalled();
+  });
+
+  it('sends no NOOP when nothing was selected before the lock', async () => {
+    const client = {
+      mailbox: false,
+      noop: vi.fn(async () => true),
+      getMailboxLock: vi.fn(async () => { client.mailbox = { exists: 0 }; return { release() {} }; }),
+    };
+    await ImapManager.prototype.syncMessages.call({}, account, client, 'INBOX', 50, false, true);
+    expect(client.noop).not.toHaveBeenCalled();
+  });
+
+  it('a failed refresh aborts the sync, releases the lock, and writes nothing', async () => {
+    const release = vi.fn();
+    const client = {
+      mailbox: { exists: 0 },
+      noop: vi.fn(async () => false),   // imapflow reports a failed NOOP as false, not a throw
+      getMailboxLock: vi.fn(async () => ({ release })),
+    };
+    await expect(
+      ImapManager.prototype.syncMessages.call({}, account, client, 'INBOX', 50, false, true)
+    ).rejects.toThrow(/NOOP/);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(query).not.toHaveBeenCalled();
   });
 });
 
@@ -2193,6 +3613,7 @@ describe('staleness probe connection recovery', () => {
       const client = Object.assign(new EventEmitter(), {
         connect: vi.fn(() => clients.length === 1 ? new Promise(() => {}) : Promise.resolve()),
         close: vi.fn(),
+        noop: vi.fn(async () => true),
         getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
         search: vi.fn().mockResolvedValue([]),
       });
@@ -2223,6 +3644,7 @@ describe('Gmail label memberships (#418)', () => {
     return Object.assign(new EventEmitter(), {
       mailbox: { exists: serverUids.length, uidValidity: 1 },
       connect: vi.fn().mockResolvedValue(), close: vi.fn(), logout: vi.fn().mockResolvedValue(),
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
       search: vi.fn(async () => serverUids),
       fetch: vi.fn(async function* (range) {
@@ -2269,6 +3691,7 @@ describe('Gmail label memberships (#418)', () => {
   });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
   const manager = () => ({ backfillRunning: new Set(), broadcast: vi.fn(), pluginFacade: {}, _secondaryConnectBlocked: () => null, _noteSecondaryRefusal: vi.fn(),
+    maybeClassifyNewMessage: vi.fn(),
     // A re-sync of cached rows now routes flags through the bulk path (#495) instead of
     // re-upserting each row, so the bare-object manager needs the real method.
     _applyFlagUpdates: ImapManager.prototype._applyFlagUpdates });
@@ -2290,6 +3713,19 @@ describe('Gmail label memberships (#418)', () => {
         expect(rows.map(r => r.folder).sort()).toEqual([...order].sort());
         for (const folder of order) await run(mgr, folder);
         expect(rows).toHaveLength(2);
+      });
+    }
+  }
+  for (const mode of ['sync', 'backfill']) {
+    for (const [host, expected] of [['imap.gmail.com', '9007199254740993'], ['imap.example.test', null]]) {
+      it(`${mode} scopes provider identity to Gmail on ${host}`, async () => {
+        acct.imap_host = host;
+        parseMessage.mockImplementation(async m => ({ ...parsed(m.uid), providerMsgid: '9007199254740993' }));
+        await (mode === 'sync' ? sync : backfill)(manager(), 'INBOX');
+        const [sql, values] = query.mock.calls.find(([sql]) => sql.includes('INSERT INTO messages'));
+        const columns = sql.match(/INSERT INTO messages\s*\(([^)]*)\)/)[1].split(',').map(c => c.trim());
+        expect(columns).toContain('provider_msgid');
+        expect(values[columns.indexOf('provider_msgid')]).toBe(expected);
       });
     }
   }
@@ -2360,7 +3796,7 @@ describe('folder integrity reconciliation safety', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
   function setup(uids, exists = uids.length) {
     const lock = { release: vi.fn() };
-    const client = { mailbox: { exists, uidValidity: 8n }, getMailboxLock: async () => lock, search: async () => uids,
+    const client = { mailbox: { exists, uidValidity: 8n }, noop: async () => true, getMailboxLock: async () => lock, search: async () => uids,
       fetch: async function* () { for (const uid of uids) yield { uid, flags: new Set() }; } };
     const mgr = Object.assign(Object.create(ImapManager.prototype), {
       _withCountClient: async (_a, fn) => fn(client), syncMessages: vi.fn().mockResolvedValue({}),
@@ -2675,7 +4111,7 @@ describe('computeThreadId subject fallback requires a shared correspondent (#468
       ],
     });
 
-    const id = await computeThreadId(ACCOUNT, '<y@partner.com>', ...noHeaders, 'Status', {
+    const id = await computeThreadId(ACCOUNT, '<y@partner.com>', ...noHeaders, 'Re: Status', {
       fromEmail: 'anna@partner.com',
       to: [{ email: OWNER }],
       cc: [],
@@ -2690,7 +4126,7 @@ describe('computeThreadId subject fallback requires a shared correspondent (#468
       rows: [{ thread_id: 't', from_email: 'Anna@Partner.com', to_addresses: [{ email: OWNER }], cc_addresses: [] }],
     });
 
-    const id = await computeThreadId(ACCOUNT, '<z@partner.com>', ...noHeaders, 'Status', {
+    const id = await computeThreadId(ACCOUNT, '<z@partner.com>', ...noHeaders, 'Re: Status', {
       fromEmail: 'anna@PARTNER.COM', to: [], cc: [], own: OWNER.toUpperCase(),
     });
 
@@ -2707,7 +4143,7 @@ describe('computeThreadId subject fallback requires a shared correspondent (#468
       }],
     });
 
-    const id = await computeThreadId(ACCOUNT, '<w@partner.com>', ...noHeaders, 'Status', {
+    const id = await computeThreadId(ACCOUNT, '<w@partner.com>', ...noHeaders, 'Re: Status', {
       fromEmail: 'anna@partner.com', to: [], cc: [], own: OWNER,
     });
 
@@ -2758,21 +4194,21 @@ describe('computeThreadId subject fallback requires a shared correspondent (#468
     // Two unrelated senders writing to it have it in common, which is not correspondence:
     // forwarded mail, catch-all domains, mailing lists and BCC all produce this.
     const FWD_ACCOUNT = 'acct-forwarded';
-    getAccountAddresses.mockResolvedValue(['simanoom@gmail.com']);
+    getAccountAddresses.mockResolvedValue(['forward@example.com']);
     query.mockResolvedValueOnce({
       rows: [{
         thread_id: 'storage-alert-thread',
         from_email: 'alert-3385@lxisa.zub',
-        to_addresses: [{ email: 'me@aol.com' }],
+        to_addresses: [{ email: 'me@example.com' }],
         cc_addresses: [],
       }],
     });
 
     const id = await computeThreadId(FWD_ACCOUNT, '<second@yxcoi.isj>', ...noHeaders, 'Action required: storage 100% full', {
       fromEmail: 'alert-6476@yxcoi.isj',
-      to: [{ email: 'me@aol.com' }],
+      to: [{ email: 'me@example.com' }],
       cc: [],
-      own: 'simanoom@gmail.com',
+      own: 'forward@example.com',
     });
 
     expect(id).toBe('<second@yxcoi.isj>'); // its own thread, not the first sender's
@@ -2809,6 +4245,280 @@ describe('computeThreadId subject fallback requires a shared correspondent (#468
     });
 
     expect(id).toBe('header-thread');
+  });
+});
+
+describe('computeThreadId subject fallback needs evidence of a reply (#649)', () => {
+  const ACCOUNT = 'acct-649';
+  const OWNER = 'me@example.com';
+  const noHeaders = [null, null];
+  const SUBJECT = 'Order Confirmation for Eldridge from King David';
+
+  beforeEach(() => {
+    query.mockReset();
+    getAccountAddresses.mockReset();
+    getAccountAddresses.mockResolvedValue([OWNER]);
+  });
+
+  it('starts a new thread for the same sender and subject without a reply prefix', async () => {
+    // The report: every receipt for the same restaurant joined the one before it. A sender
+    // that is not obviously no-reply, so this is the same-sender rule on its own.
+    query.mockResolvedValueOnce({
+      rows: [{ thread_id: 'first-receipt', from_email: 'orders@shop.example', to_addresses: [{ email: OWNER }], cc_addresses: [] }],
+    });
+
+    const id = await computeThreadId(ACCOUNT, '<receipt-2@shop.example>', ...noHeaders, SUBJECT, {
+      fromEmail: 'orders@shop.example', to: [{ email: OWNER }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('<receipt-2@shop.example>');
+  });
+
+  it('still joins the same sender when the subject carries a reply prefix', async () => {
+    // Someone following up on their own earlier message from a client that drops headers.
+    query.mockResolvedValueOnce({
+      rows: [{ thread_id: 'anna-thread', from_email: 'anna@partner.com', to_addresses: [{ email: OWNER }], cc_addresses: [] }],
+    });
+
+    const id = await computeThreadId(ACCOUNT, '<again@partner.com>', ...noHeaders, 'AW: Lunch on Friday', {
+      fromEmail: 'anna@partner.com', to: [{ email: OWNER }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('anna-thread');
+  });
+
+  it('joins an exchange between two parties even without a prefix', async () => {
+    // Bob answers a message he was copied on, keeping the subject as it was.
+    query.mockResolvedValueOnce({
+      rows: [{
+        thread_id: 'numbers-thread',
+        from_email: 'anna@partner.com',
+        to_addresses: [{ email: OWNER }],
+        cc_addresses: [{ email: 'bob@partner.com' }],
+      }],
+    });
+
+    const id = await computeThreadId(ACCOUNT, '<bob@partner.com>', ...noHeaders, 'Quarterly numbers', {
+      fromEmail: 'bob@partner.com', to: [{ email: 'anna@partner.com' }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('numbers-thread');
+  });
+
+  it('does not count a sender addressing its own mail to itself as an exchange', async () => {
+    // Bulk senders often put their own address in To and BCC everyone. That made each such
+    // message look like an answer to the one before it.
+    query.mockResolvedValueOnce({
+      rows: [{ thread_id: 'digest-1', from_email: 'digest@news.example', to_addresses: [{ email: 'digest@news.example' }], cc_addresses: [] }],
+    });
+
+    const id = await computeThreadId(ACCOUNT, '<digest-2@news.example>', ...noHeaders, 'Your weekly digest', {
+      fromEmail: 'digest@news.example', to: [{ email: 'digest@news.example' }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('<digest-2@news.example>');
+  });
+
+  it('never uses the fallback for bulk mail, even with a reply prefix', async () => {
+    const id = await computeThreadId(ACCOUNT, '<list-2@lists.example>', ...noHeaders, 'Re: Weekly update', {
+      fromEmail: 'anna@partner.com', to: [{ email: OWNER }], cc: [], own: OWNER, isBulk: true,
+    });
+
+    expect(id).toBe('<list-2@lists.example>');
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'no-reply@doordash.com',
+    'noreply@example.com',
+    'NoReply@Example.com',
+    'donotreply@bank.example',
+    'do-not-reply@bank.example',
+    'do_not_reply@bank.example',
+    'no-reply-orders@shop.example',
+    'noreply+alerts@shop.example',
+  ])('never uses the fallback for a no-reply sender (%s)', async (from) => {
+    const id = await computeThreadId(ACCOUNT, '<alert-2@example.com>', ...noHeaders, `Re: ${SUBJECT}`, {
+      fromEmail: from, to: [{ email: OWNER }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('<alert-2@example.com>');
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('does not mistake an address that merely contains "reply" for a no-reply one', async () => {
+    query.mockResolvedValueOnce({
+      rows: [{ thread_id: 'reply-thread', from_email: 'replyteam@partner.com', to_addresses: [{ email: OWNER }], cc_addresses: [] }],
+    });
+
+    const id = await computeThreadId(ACCOUNT, '<r2@partner.com>', ...noHeaders, 'RE: Contract', {
+      fromEmail: 'replyteam@partner.com', to: [{ email: OWNER }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('reply-thread');
+  });
+
+  it('does not count bulk or no-reply mail sent to a sender as an exchange with that sender', async () => {
+    // Anna writes without a prefix. A newsletter and a no-reply notice were addressed to her,
+    // which would pass for an exchange, but they are not something she answers. The third
+    // candidate, Bob's message to her, is an ordinary exchange.
+    query.mockResolvedValueOnce({
+      rows: [
+        { thread_id: 'bulk', from_email: 'news@shop.example', to_addresses: [{ email: 'anna@partner.com' }], cc_addresses: [], is_bulk: true },
+        { thread_id: 'no-reply', from_email: 'no-reply@shop.example', to_addresses: [{ email: 'anna@partner.com' }], cc_addresses: [], is_bulk: false },
+        { thread_id: 'bob', from_email: 'bob@partner.com', to_addresses: [{ email: 'anna@partner.com' }], cc_addresses: [], is_bulk: null },
+      ],
+    });
+
+    const id = await computeThreadId(ACCOUNT, '<anna@partner.com>', ...noHeaders, 'Order question', {
+      fromEmail: 'anna@partner.com', to: [{ email: OWNER }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('bob');
+    expect(query.mock.calls[0][0]).toContain('is_bulk');
+  });
+
+  it('starts a new thread when the only exchange is bulk mail sent to the sender', async () => {
+    query.mockResolvedValueOnce({
+      rows: [{ thread_id: 'bulk', from_email: 'news@shop.example', to_addresses: [{ email: 'anna@partner.com' }], cc_addresses: [], is_bulk: true }],
+    });
+
+    const id = await computeThreadId(ACCOUNT, '<anna2@partner.com>', ...noHeaders, 'Order question', {
+      fromEmail: 'anna@partner.com', to: [{ email: OWNER }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('<anna2@partner.com>');
+  });
+
+  it.each([
+    ['bulk', 'team@vendor.example', true],
+    ['no-reply', 'no-reply@vendor.example', false],
+  ])('still threads a header-less reply sent to a %s sender', async (_kind, from, isBulk) => {
+    // Our "RE: Survey" from a client that drops headers, sent to the address the survey came
+    // from. Also the shape of a header-less reply to a mailing-list post.
+    query.mockResolvedValueOnce({
+      rows: [{ thread_id: 'survey', from_email: from, to_addresses: [{ email: OWNER }], cc_addresses: [], is_bulk: isBulk }],
+    });
+
+    const id = await computeThreadId(ACCOUNT, `<re-${_kind}@example.com>`, ...noHeaders, 'RE: Survey', {
+      fromEmail: OWNER, to: [{ email: from }], cc: [], own: OWNER,
+    });
+
+    expect(id).toBe('survey');
+  });
+
+  it('leaves header threading alone, even for bulk mail from a no-reply sender', async () => {
+    query.mockResolvedValueOnce({ rows: [{ message_id: '<order@doordash.com>', thread_id: 'order-thread' }] });
+
+    const id = await computeThreadId(ACCOUNT, '<update@doordash.com>', '<order@doordash.com>', '<order@doordash.com>', SUBJECT, {
+      fromEmail: 'no-reply@doordash.com', to: [{ email: OWNER }], cc: [], own: OWNER, isBulk: true,
+    });
+
+    expect(id).toBe('order-thread');
+  });
+});
+
+// The ingest paths have to hand computeThreadId the parsed bulk flag, or bulk mail without
+// threading headers would still reach the subject fallback (#649). Each path is driven with a
+// header-less message from an ordinary sender, so the only thing that keeps the fallback's
+// candidate query from running is the flag.
+describe('ingest paths pass isBulk to computeThreadId (#649)', () => {
+  const subjectFallbackRan = () => query.mock.calls.some(([sql]) => String(sql).includes('normalized_subject = $3'));
+  const parsedMessage = (isBulk) => ({
+    uid: 5, messageId: `<digest-${isBulk}@news.example>`, subject: 'Weekly digest',
+    fromName: 'News', fromEmail: 'news@news.example', to: [{ email: 'me@example.com' }], cc: [], replyTo: [],
+    inReplyTo: null, references: null, date: new Date('2026-10-01T10:00:00Z'), snippet: 'hi',
+    isRead: true, isStarred: false, hasAttachments: false, flags: ['\\Seen'], isBulk, parsedHeaders: {},
+  });
+  let seq = 0;
+  const freshAccount = () => ({
+    id: `acct-649-wiring-${++seq}`, user_id: 'user-1', email_address: 'me@example.com', enabled: true,
+    gtd_enabled: false, categorization_enabled: false, imap_host: 'imap.example.com', imap_port: 993,
+    imap_tls: true, auth_user: 'me', auth_pass: 'enc',
+  });
+
+  beforeEach(() => {
+    query.mockReset();
+    parseMessage.mockReset();
+    getAccountAddresses.mockReset();
+    getAccountAddresses.mockResolvedValue(['me@example.com']);
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it.each([true, false])('sync (isBulk %s)', async (isBulk) => {
+    const account = freshAccount();
+    invalidateGtdConfigCache(account.id);
+    const client = {
+      noop: vi.fn(async () => true),
+      getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      mailbox: { exists: 1, uidValidity: 100, highestModseq: 500n },
+      fetch: vi.fn(async function* () { yield { uid: 5 }; }),
+    };
+    query.mockImplementation(async (sql) => {
+      if (sql.includes('SELECT uid_validity, highest_modseq FROM folders')) return { rows: [{ uid_validity: 100, highest_modseq: '500' }] };
+      if (sql.includes('COUNT(*) FILTER (WHERE is_read = false)')) return { rows: [{ n: 0 }] };
+      if (sql.includes('COALESCE(MAX(uid), 0)')) return { rows: [{ max_uid: 0 }] };
+      if (sql.includes('SELECT gtd_enabled, gtd_folders FROM email_accounts')) return { rows: [{ gtd_enabled: false, gtd_folders: {} }] };
+      if (sql.includes("preferences->>'categorizationEnabled'")) return { rows: [{ val: false }] };
+      if (sql.includes('INSERT INTO messages')) return { rows: [{ id: 'msg-1', is_new: true }] };
+      return { rows: [] };
+    });
+    parseMessage.mockResolvedValue(parsedMessage(isBulk));
+
+    await ImapManager.prototype.syncMessages.call({ maybeClassifyNewMessage: vi.fn() }, account, client, 'Watch', 50, false, true);
+
+    expect(query.mock.calls.some(([sql]) => sql.includes('INSERT INTO messages'))).toBe(true);
+    expect(subjectFallbackRan()).toBe(!isBulk);
+  });
+
+  it.each([true, false])('backfill (isBulk %s)', async (isBulk) => {
+    const account = freshAccount();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    ImapFlow.mockImplementation(function () {
+      const client = new EventEmitter();
+      client.usable = true;
+      client.connect = vi.fn(() => Promise.resolve());
+      client.logout = vi.fn(() => Promise.resolve());
+      client.close = vi.fn();
+      client.noop = vi.fn(() => Promise.resolve());
+      client.mailbox = { exists: 1, uidValidity: 7 };
+      client.getMailboxLock = vi.fn(async () => ({ release: vi.fn() }));
+      client.search = vi.fn(async () => [5]);
+      client.fetch = vi.fn(async function* () { yield { uid: 5 }; });
+      return client;
+    });
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
+    query.mockImplementation(async (sql) => {
+      if (sql.includes('FROM email_accounts WHERE id = $1')) return { rows: [account] };
+      if (sql.includes('COUNT(*) as count')) return { rows: [{ count: '0', max_uid: 0 }] };
+      if (sql.includes("preferences->>'categorizationEnabled'")) return { rows: [{ val: false }] };
+      if (sql.includes('INSERT INTO messages')) return { rows: [{ id: 'msg-1', is_new: true }] };
+      return { rows: [] };
+    });
+    parseMessage.mockResolvedValue(parsedMessage(isBulk));
+
+    const mgr = new ImapManager({ clients: new Set() });
+    mgr.maybeClassifyNewMessage = vi.fn();
+    await mgr.backfillMessages(account, 'INBOX');
+
+    expect(error).not.toHaveBeenCalled();
+    expect(query.mock.calls.some(([sql]) => sql.includes('INSERT INTO messages'))).toBe(true);
+    expect(subjectFallbackRan()).toBe(!isBulk);
+  });
+
+  it.each([true, false])('reply draft ingest (isBulk %s)', async (isBulk) => {
+    const account = freshAccount();
+    parseMessage.mockResolvedValue(parsedMessage(isBulk));
+    query.mockImplementation(async () => ({ rows: [{ id: 'row-1' }] }));
+
+    await Object.create(ImapManager.prototype)._ingestDraftUidWithClient(account, 'Drafts', 5,
+      { mailbox: { uidValidity: 9n } }, { headers: Buffer.from('headers'), bodyStructure: { type: 'text/plain' } });
+
+    expect(query.mock.calls.some(([sql]) => sql.includes('INSERT INTO messages'))).toBe(true);
+    expect(subjectFallbackRan()).toBe(!isBulk);
   });
 });
 
@@ -2859,6 +4569,218 @@ describe('backfillMessages — error text (#474)', () => {
   });
 });
 
+// ── Backfill reconnect that cannot succeed ───────────────────────────────────
+//
+// A failed reconnect inside the batch loop slept and retried the same batch with no bound,
+// and the loop's liveness probe only checked that the account row still existed. So an
+// account disabled mid-run (openBfClient refuses it) or a login the provider now rejects
+// looped until restart, holding the folder's backfill guard and, under backfillAllFolders,
+// one of the host's two background-connection slots. Once such a walk can end, its finally
+// must not start the two follow-up jobs, since each opens a login of its own.
+describe('backfill — a reconnect that cannot succeed', () => {
+  let acct, serverUids;
+  const TEN_MINUTES = 10 * 60 * 1000;
+  const manager = () => ({ backfillRunning: new Set(), broadcast: vi.fn(), pluginFacade: {},
+    _secondaryConnectBlocked: () => null, _noteSecondaryRefusal: vi.fn(), maybeClassifyNewMessage: vi.fn() });
+  // The whole walk, with the real backoff so the walk's own refusal is what its finally sees.
+  // The follow-up jobs are spies: what matters is whether they start.
+  const walkManager = () => ({ ...manager(), backfillAllRunning: new Set(), _bgConnSem: createKeyedSemaphore(2),
+    backfillMessages: ImapManager.prototype.backfillMessages,
+    _connectCooldown: new Map(), _secondaryCooldown: new Map(),
+    _secondaryConnectBlocked: ImapManager.prototype._secondaryConnectBlocked,
+    _noteSecondaryRefusal: ImapManager.prototype._noteSecondaryRefusal,
+    refreshBulkFlags: vi.fn().mockResolvedValue(), startSnippetIndexer: vi.fn().mockResolvedValue() });
+  const rejectedLogin = () => Object.assign(new Error('Command failed'), {
+    responseText: 'Invalid credentials (Failure)', serverResponseCode: 'AUTHENTICATIONFAILED' });
+  const serverDown = () => Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:993'), { code: 'ECONNREFUSED' });
+  function client({ connect, fetch }) {
+    return Object.assign(new EventEmitter(), {
+      mailbox: { exists: serverUids.length, uidValidity: 1 },
+      connect, close: vi.fn(), logout: vi.fn().mockResolvedValue(),
+      getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      search: vi.fn(async () => serverUids),
+      fetch,
+    });
+  }
+  function start(mgr, method = 'backfillMessages') {
+    const run = { settled: false };
+    ImapManager.prototype[method].call(mgr, acct, 'INBOX').then(() => { run.settled = true; });
+    return run;
+  }
+  // The first session drops on its first FETCH, and every login after that fails with `failure`.
+  function dropThenFail(failure) {
+    let logins = 0;
+    ImapFlow.mockImplementation(function () {
+      const first = ++logins === 1;
+      return client({
+        connect: first ? vi.fn().mockResolvedValue() : vi.fn().mockRejectedValue(failure()),
+        fetch: vi.fn(async function* () {
+          yield* [];
+          throw new Error('Connection closed');
+        }),
+      });
+    });
+  }
+  // Every login works, and the account is switched off while the first batch is fetched.
+  function disableDuringFirstBatch() {
+    let fetches = 0;
+    ImapFlow.mockImplementation(function () {
+      return client({
+        connect: vi.fn().mockResolvedValue(),
+        fetch: vi.fn(async function* (range) {
+          fetches++;
+          for (const uid of range.split(',').map(Number)) yield { uid, flags: new Set() };
+          acct.enabled = false;
+        }),
+      });
+    });
+    return () => fetches;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    acct = { id: 'bf-stuck', user_id: 'u1', enabled: true, imap_host: 'imap.example.com', imap_port: 993,
+      imap_tls: true, auth_user: 'u', auth_pass: 'enc', email_address: 'u@example.com' };
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'] });
+    parseMessage.mockImplementation(async m => ({ uid: m.uid, messageId: `<m${m.uid}@example.com>`, subject: 's',
+      fromEmail: 'a@example.com', to: [], cc: [], replyTo: [], date: new Date('2026-09-01'),
+      isRead: true, flags: [], parsedHeaders: {} }));
+    query.mockReset();
+    query.mockImplementation(async sql => {
+      // SELECT * returns the row whatever its state (openBfClient checks enabled itself);
+      // a probe that filters on enabled sees nothing once the account is switched off.
+      if (sql.includes('FROM email_accounts')) return { rows: sql.includes('AND enabled') && !acct.enabled ? [] : [acct] };
+      if (sql.includes('SELECT uid_validity')) return { rows: [{ uid_validity: 1 }] };
+      if (sql.includes('COUNT(*) as count')) return { rows: [{ count: 0, max_uid: 0 }] };
+      if (sql.includes('INSERT INTO messages')) return { rows: [{ id: 'row', is_new: false }] };
+      return { rows: [] };
+    });
+    ImapFlow.mockReset();
+  });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it('stops at the next batch when the account is disabled mid-run', async () => {
+    // Enough UIDs to outlast one connection, so without the probe the loop reaches the
+    // periodic reconnect that openBfClient refuses for a disabled account.
+    const { batchSize, batchesPerConn } = providerProfile(acct);
+    serverUids = Array.from({ length: batchSize * batchesPerConn + 1 }, (_, k) => k + 1);
+    const fetches = disableDuringFirstBatch();
+    const mgr = manager();
+    const run = start(mgr);
+    await vi.advanceTimersByTimeAsync(TEN_MINUTES);
+
+    expect(run.settled).toBe(true);
+    expect(fetches()).toBe(1);                 // no further batch runs for a disabled account
+    expect(ImapFlow).toHaveBeenCalledTimes(1); // and no fresh login is attempted for it
+    expect(mgr.backfillRunning.size).toBe(0);
+  });
+
+  // A changed password or revoked OAuth grant is recognised and arms the backoff. A server
+  // that is down matches neither isConnectionRefusal nor isAuthFailure, so it arms nothing,
+  // and the cap has to end the run all the same.
+  it.each([
+    ['a rejected login', rejectedLogin, '[AUTHENTICATIONFAILED] Invalid credentials (Failure)', true],
+    ['an unreachable server', serverDown, 'connect ECONNREFUSED 127.0.0.1:993', false],
+  ])('gives up after three failed reconnects (%s) instead of retrying forever', async (_, failure, detail, armsBackoff) => {
+    serverUids = Array.from({ length: 150 }, (_, k) => k + 1);
+    dropThenFail(failure);
+    const mgr = manager();
+    const run = start(mgr);
+    await vi.advanceTimersByTimeAsync(TEN_MINUTES);
+
+    expect(run.settled).toBe(true);
+    expect(ImapFlow).toHaveBeenCalledTimes(4); // the first login, then three failed reconnects
+    expect(mgr.backfillRunning.size).toBe(0);  // the folder is free for the integrity repair again
+    expect(mgr._noteSecondaryRefusal.mock.calls).toEqual(armsBackoff ? [[acct]] : []);
+    // Each retry and the final line carry the server's reason, not imapflow's 'Command failed'.
+    const errors = console.error.mock.calls.map(args => args.join(' '));
+    const retries = errors.filter(line => line.includes('Backfill reconnect failed'));
+    expect(retries).not.toHaveLength(0);
+    for (const line of retries) expect(line).toContain(detail);
+    expect(errors.find(line => line.includes('Backfill failed'))).toContain(detail);
+  });
+
+  it('still recovers in place when a reconnect succeeds between failures', async () => {
+    serverUids = [1, 2, 3];
+    // Logins go ok, rejected, rejected, ok, rejected, ok, and the first two sessions drop on
+    // FETCH to force each reconnect. Three rejections in all but never three in a row, so the
+    // count must start over after each login that works, and the run must finish.
+    const accepted = [true, false, false, true, false, true];
+    let logins = 0;
+    ImapFlow.mockImplementation(function () {
+      const n = ++logins;
+      return client({
+        connect: accepted[n - 1] ? vi.fn().mockResolvedValue() : vi.fn().mockRejectedValue(rejectedLogin()),
+        fetch: vi.fn(async function* (range) {
+          if (n < accepted.length) throw new Error('Connection closed');
+          for (const uid of range.split(',').map(Number)) yield { uid, flags: new Set() };
+        }),
+      });
+    });
+    const mgr = manager();
+    const run = start(mgr);
+    await vi.advanceTimersByTimeAsync(TEN_MINUTES);
+
+    expect(run.settled).toBe(true);
+    expect(ImapFlow).toHaveBeenCalledTimes(accepted.length);
+    expect(mgr.broadcast).toHaveBeenCalledWith({ type: 'backfill_complete', accountId: acct.id }, acct.user_id);
+    expect(mgr._noteSecondaryRefusal).not.toHaveBeenCalled();
+  });
+
+  it('starts no follow-up jobs after a walk stopped by the account being disabled', async () => {
+    const { batchSize, batchesPerConn } = providerProfile(acct);
+    serverUids = Array.from({ length: batchSize * batchesPerConn + 1 }, (_, k) => k + 1);
+    disableDuringFirstBatch();
+    const mgr = walkManager();
+    const run = start(mgr, 'backfillAllFolders');
+    await vi.advanceTimersByTimeAsync(TEN_MINUTES);
+
+    expect(run.settled).toBe(true);
+    expect(mgr._bgConnSem.activeCount('imap.example.com')).toBe(0);
+    // Each would log in to the disabled account, the snippet indexer to download message bodies.
+    expect(mgr.refreshBulkFlags).not.toHaveBeenCalled();
+    expect(mgr.startSnippetIndexer).not.toHaveBeenCalled();
+  });
+
+  it('starts no follow-up jobs after a walk that ended on rejected logins', async () => {
+    serverUids = Array.from({ length: 150 }, (_, k) => k + 1);
+    dropThenFail(rejectedLogin);
+    const mgr = walkManager();
+    const run = start(mgr, 'backfillAllFolders');
+    await vi.advanceTimersByTimeAsync(TEN_MINUTES);
+
+    expect(run.settled).toBe(true);
+    expect(ImapFlow).toHaveBeenCalledTimes(4);
+    // The walk armed the backoff as it ended; another rejected login inside it helps nobody.
+    expect(mgr._secondaryCooldown.get(acct.id)?.failures).toBe(1);
+    expect(mgr.refreshBulkFlags).not.toHaveBeenCalled();
+    expect(mgr.startSnippetIndexer).not.toHaveBeenCalled();
+  });
+
+  it('still starts both follow-up jobs after a walk that finishes normally', async () => {
+    serverUids = [1, 2, 3];
+    ImapFlow.mockImplementation(function () {
+      return client({
+        connect: vi.fn().mockResolvedValue(),
+        fetch: vi.fn(async function* (range) {
+          for (const uid of range.split(',').map(Number)) yield { uid, flags: new Set() };
+        }),
+      });
+    });
+    const mgr = walkManager();
+    const run = start(mgr, 'backfillAllFolders');
+    await vi.advanceTimersByTimeAsync(TEN_MINUTES);
+
+    expect(run.settled).toBe(true);
+    expect(mgr.refreshBulkFlags).toHaveBeenCalledWith(acct);
+    expect(mgr.startSnippetIndexer).toHaveBeenCalledWith(acct);
+  });
+});
+
 // ── Body prefetch circuit breaker (#474 follow-up) ───────────────────────────
 //
 // prefetchFolderBodies caught each failure and continued to the next UID. Every iteration
@@ -2888,6 +4810,20 @@ describe('prefetchFolderBodies — stops instead of hammering a refusing provide
     return mgr;
   }
   afterEach(() => { vi.restoreAllMocks(); });
+
+  // A prefetch leaves the pool's last idle session to the user's click (acquirePooledClient).
+  it('fetches each body as background work', async () => {
+    const mgr = arrange(() => new Error('Command failed'));
+    await mgr.prefetchFolderBodies('acc-1', UIDS.map(u => `m-${u}`));
+    expect(mgr.fetchMessageBody).toHaveBeenNthCalledWith(1, YAHOO, 101, 'INBOX', { background: true });
+  });
+
+  it('prefetches newly arrived bodies as background work too', async () => {
+    const mgr = arrange(() => new Error('Command failed'));
+    mgr.fetchMessageBody = vi.fn(async () => ({}));
+    await mgr.prefetchNewMessageBodies(YAHOO, [{ id: 'm-101', uid: 101, folder: 'INBOX' }]);
+    expect(mgr.fetchMessageBody).toHaveBeenCalledWith(YAHOO, 101, 'INBOX', { background: true });
+  });
 
   it('stops after the FIRST refusal rather than trying every remaining message', async () => {
     const mgr = arrange(() => Object.assign(new Error('Command failed'), {
@@ -3388,6 +5324,114 @@ describe('fetchMessageBody under an armed backoff (#474)', () => {
     expect(err.poolExhausted).toBe(true);
   });
 });
+
+// ── Inline images embedded by fetchMessageBody ───────────────────────────────────────────
+//
+// cid: references become data: URIs built from the sender's MIME type and base64 text.
+// Inserted as a replacement string, a $' or $& in that text was expanded at every reference;
+// a pass per image rewrote cid: text inside the images already inserted; and every reference
+// to one large part got its own full copy. Each let a small message inflate its body to
+// hundreds of MB. These drive the real fetchMessageBody against a scripted client.
+describe('fetchMessageBody inline images', () => {
+  let seq = 900;
+  function arrange(images, parts) {
+    const account = { id: `acct-cid-${++seq}`, user_id: 'u1', imap_host: 'imap.mail.yahoo.com', email_address: 'y@example.test', auth_user: 'y', auth_pass: 'enc' };
+    const structure = {
+      type: 'multipart/related',
+      childNodes: [{ part: '1', type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } }, ...images],
+    };
+    ImapFlow.mockImplementation(function () {
+      const client = new EventEmitter();
+      client.usable = true;
+      client.connect = vi.fn(() => Promise.resolve());
+      client.logout = vi.fn(() => Promise.resolve());
+      client.close = vi.fn();
+      client.noop = vi.fn(() => Promise.resolve());
+      client.getMailboxLock = vi.fn(() => Promise.resolve({ release: vi.fn() }));
+      client.fetch = vi.fn(async function* (_range, q) {
+        const bodyParts = new Map((q.bodyParts || []).filter(p => p in parts).map(p => [p, Buffer.from(parts[p])]));
+        yield { ...(q.bodyStructure ? { bodyStructure: structure } : {}), bodyParts };
+      });
+      return client;
+    });
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
+    query.mockReset();
+    query.mockResolvedValue({ rows: [account] });
+    return { mgr: new ImapManager({ clients: new Set() }), account };
+  }
+  const image = (part, cid, type = 'image/png') => ({ part, type, encoding: 'base64', id: `<${cid}>` });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('embeds bracketed, upper-case and CSS references to an inline image', async () => {
+    const outlook = 'image001.png@01DA1B2C.3D4E5F60';
+    const symbols = 'logo+v2.$[1]{2}^*?|x@a.b';
+    const { mgr, account } = arrange([image('2', outlook), image('3', symbols)], {
+      1: `<img src="cid:${outlook}"><img src="CID:<${outlook.toUpperCase()}>">`
+        + `<td style="background:url(&quot;cid:${symbols}&quot;)"></td><div style="background:url('cid:${symbols}')"></div><div style="background:url(cid:${symbols}) no-repeat"></div>`,
+      2: 'iVBO\r\nRw==',
+      3: 'QkJC',
+    });
+    const { html } = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    const a = 'data:image/png;base64,iVBORw==';
+    const b = 'data:image/png;base64,QkJC';
+    expect(html).toBe(`<img src="${a}"><img src="${a}">`
+      + `<td style="background:url(&quot;${b}&quot;)"></td><div style="background:url('${b}')"></div><div style="background:url(${b}) no-repeat"></div>`);
+  });
+
+  it('uses the first usable image when parts share a Content-ID', async () => {
+    const { mgr, account } = arrange([image('2', 'd'), image('3', 'D'), image('4', 'd', 'image/gif')], {
+      1: '<img src="cid:d">', 2: '<html><body>not an image</body></html>', 3: 'QUFB', 4: 'QkJC',
+    });
+    const { html } = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(html).toBe('<img src="data:image/png;base64,QUFB">');
+  });
+
+  it("does not expand $ patterns from the sender's MIME type or base64 text", async () => {
+    const { mgr, account } = arrange([image('2', 'a', "image/$'")], { 1: '<img src="cid:a"><p>tail</p>', 2: 'QUFB$&' });
+    const { html } = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(html.match(/<p>tail<\/p>/g)).toHaveLength(1);
+    expect(html).toContain(';base64,QUFB$&"><p>tail</p>');
+  });
+
+  it('leaves cid: text inside an embedded image alone', async () => {
+    const { mgr, account } = arrange([image('2', 'a'), image('3', 'b')], { 1: '<img src="cid:a"><img src="cid:b">', 2: 'cid:b', 3: 'QkJC' });
+    const { html } = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(html).toBe('<img src="data:image/png;base64,cid:b"><img src="data:image/png;base64,QkJC">');
+  });
+
+  it('gives a reference the image its Content-ID names when another Content-ID is a prefix of it', async () => {
+    const { mgr, account } = arrange([image('2', 'x'), image('3', 'xx'), image('4', 'xxx')], {
+      1: '<img src="cid:xxx"><img src="cid:xx"><img src="cid:x">', 2: 'QUFB', 3: 'QkJC', 4: 'Q0ND',
+    });
+    const { html } = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(html).toBe('<img src="data:image/png;base64,Q0ND"><img src="data:image/png;base64,QkJC"><img src="data:image/png;base64,QUFB">');
+  });
+
+  it('embeds each image at its first reference and repeats only within the budget', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const a64 = 'QUFB'.repeat(Math.ceil(INLINE_IMAGE_REPEAT_BUDGET / 16));
+    const b64 = 'QkJC'.repeat(Math.ceil(INLINE_IMAGE_REPEAT_BUDGET / 8));
+    const { mgr, account } = arrange([image('2', 'a'), image('3', 'b')], {
+      1: '<img src="cid:a">'.repeat(10) + '<img src="cid:b">'.repeat(2), 2: a64, 3: b64,
+    });
+    const { html } = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    const count = (s) => html.split(s).length - 1;
+    const a = `data:image/png;base64,${a64}`;
+    const b = `data:image/png;base64,${b64}`;
+    const aEmbedded = 1 + Math.floor(INLINE_IMAGE_REPEAT_BUDGET / a.length);
+    expect(aEmbedded).toBeLessThan(10);
+    expect(count(`<img src="${a}">`)).toBe(aEmbedded);
+    expect(count('<img src="cid:a">')).toBe(10 - aEmbedded);
+    // b no longer fits what is left of the budget, but its first reference is still embedded.
+    expect(b.length).toBeGreaterThan(INLINE_IMAGE_REPEAT_BUDGET - (aEmbedded - 1) * a.length);
+    expect(count(`<img src="${b}">`)).toBe(1);
+    expect(count('<img src="cid:b">')).toBe(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(new RegExp(`left ${10 - aEmbedded + 1} repeated inline image`));
+  });
+});
+
 // ── CONDSTORE-less full sync splits cached UIDs from new ones (#495) ───────────────────
 //
 // A server without CONDSTORE never seeds a modseq baseline, so planModseqSync returns
@@ -3436,6 +5480,7 @@ describe('CONDSTORE-less full sync (#495)', () => {
     }));
     const flagsFor = seen => new Set(seen ? ['\\Seen'] : []);
     const client = {
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
       mailbox: { exists: serverMsgs.length, uidValidity: 7n, highestModseq: null },
       fetch: vi.fn(function (range, q, opts) {
@@ -3952,6 +5997,7 @@ describe('setFlag routing (#474 round 4)', () => {
     return Object.assign({
       usable: true,
       release,
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn(async () => ({ release })),
       messageFlagsAdd: vi.fn(async () => true),
       messageFlagsRemove: vi.fn(async () => true),
@@ -4001,6 +6047,51 @@ describe('setFlag routing (#474 round 4)', () => {
     expect(ImapFlow).not.toHaveBeenCalled();             // zero logins, the whole point
   });
 
+  it('refreshes the persistent session before the STORE, so mail it was never told about is found', async () => {
+    const order = [];
+    const persistent = fakePersistent({
+      noop: vi.fn(async () => { order.push('noop'); return true; }),
+      messageFlagsAdd: vi.fn(async () => { order.push('store'); return true; }),
+    });
+    const { mgr, account } = arrange({ persistent });
+
+    await mgr.setFlag(account, 17, 'INBOX', '\\Seen', true);
+
+    expect(order).toEqual(['noop', 'store']);
+    expect(ImapFlow).not.toHaveBeenCalled();
+  });
+
+  it('a refresh that outlives the deadline does not STORE after the pool path already did', async () => {
+    vi.useFakeTimers();
+    let finishNoop;
+    const persistent = fakePersistent({
+      noop: vi.fn(() => new Promise(res => { finishNoop = () => res(true); })),
+    });
+    const { mgr, account } = arrange({ persistent });
+
+    const call = mgr.setFlag(account, 17, 'INBOX', '\\Seen', true);
+    await vi.advanceTimersByTimeAsync(5100);   // persistent attempt deadline
+    await call;                                // pool path stored the flag
+    expect(ImapFlow).toHaveBeenCalled();
+
+    finishNoop();                              // the slow NOOP finally answers
+    await vi.advanceTimersByTimeAsync(1);
+    expect(persistent.messageFlagsAdd).not.toHaveBeenCalled();
+    expect(persistent.release).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('falls through to the pool when the persistent session cannot be refreshed', async () => {
+    const persistent = fakePersistent({ noop: vi.fn(async () => false) });
+    const { mgr, account } = arrange({ persistent });
+
+    await mgr.setFlag(account, 17, 'INBOX', '\\Seen', true);
+
+    expect(persistent.messageFlagsAdd).not.toHaveBeenCalled(); // never STOREs on a stale view
+    expect(persistent.release).toHaveBeenCalled();
+    expect(ImapFlow).toHaveBeenCalled();                        // pool path took over
+  });
+
   it('falls through to the pool when the persistent store reports not-applied', async () => {
     const persistent = fakePersistent({ messageFlagsAdd: vi.fn(async () => false) });
     const { mgr, account } = arrange({ persistent });
@@ -4039,6 +6130,7 @@ describe('setFlag routing (#474 round 4)', () => {
     const release = vi.fn();
     const persistent = fakePersistent({
       release,
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn(() => new Promise(res => { grantLock = () => res({ release }); })),
     });
     const { mgr, account } = arrange({ persistent });
@@ -4233,8 +6325,9 @@ describe('prefetch on the gate error (#474 round 4)', () => {
 // the copy it means to delete, so a uid read from a stale row, or looked up in the wrong
 // account, deletes nothing. Driven through the real pool so the check is what guards the
 // EXPUNGE.
-describe('permanentDeleteMessage with expectMessageId', () => {
+describe('server copy identity checks', () => {
   let seq = 0;
+  // A server copy is its Message-ID, or { messageId, subject, internalDate, from }.
   function arrange(serverCopies) {
     const account = { id: `acct-pdm-${++seq}`, user_id: 'u1', imap_host: 'imap.example.com', email_address: 'me@example.test', auth_user: 'me', auth_pass: 'enc' };
     const client = Object.assign(new EventEmitter(), {
@@ -4242,12 +6335,26 @@ describe('permanentDeleteMessage with expectMessageId', () => {
       connect: vi.fn(() => Promise.resolve()),
       logout: vi.fn(() => Promise.resolve()),
       close: vi.fn(),
+      noop: vi.fn(async () => true),
       getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
-      fetch: vi.fn(async function* (range) {
+      // As a server does, it answers with only the attributes asked for.
+      fetch: vi.fn(async function* (range, query) {
         for (const uid of String(range).split(',').map(Number)) {
-          if (serverCopies.has(uid)) yield { uid, envelope: { messageId: serverCopies.get(uid) } };
+          if (!serverCopies.has(uid)) continue;
+          const copy = serverCopies.get(uid);
+          const { messageId = null, subject, internalDate, from } = copy !== null && typeof copy === 'object' ? copy : { messageId: copy };
+          yield {
+            uid,
+            ...(query?.envelope && { envelope: { messageId, subject, from: from ? [{ address: from }] : [] } }),
+            ...(query?.internalDate && { internalDate }),
+          };
         }
       }),
+      // Every message, whatever the dates asked for: the search only narrows what is compared.
+      search: vi.fn(async () => [...serverCopies.keys()]),
+      // A UIDPLUS server, so the delete is a UID EXPUNGE of exactly this uid (see expungeUids).
+      capabilities: new Map([['UIDPLUS', true]]),
+      messageFlagsAdd: vi.fn().mockResolvedValue(true),
       messageDelete: vi.fn().mockResolvedValue(true),
     });
     ImapFlow.mockImplementation(function () { return client; });
@@ -4255,8 +6362,32 @@ describe('permanentDeleteMessage with expectMessageId', () => {
     resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
     query.mockReset();
     query.mockResolvedValue({ rows: [account] });
+    decodeMimeWords.mockImplementation(s => s);
     return { mgr: new ImapManager({ clients: new Set() }), account, client };
   }
+  afterEach(() => decodeMimeWords.mockReset());
+
+  it.each([
+    ['<invoice@example.test>', true],
+    ['<other-invoice@example.test>', false],
+    [null, false],
+  ])('checks the exact live copy identity %j before allowing an automatic strip', async (serverId, expected) => {
+    const { mgr, account, client } = arrange(new Map([[7, serverId]]));
+    expect(await mgr.hasMessageCopy(account, 7, 'INBOX', '<invoice@example.test>')).toBe(expected);
+    expect(client.getMailboxLock).toHaveBeenCalledWith('INBOX');
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('accepts the string UID returned by PostgreSQL BIGINT columns', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<invoice@example.test>']]));
+    expect(await mgr.hasMessageCopy(account, '7', 'INBOX', '<invoice@example.test>')).toBe(true);
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('does not count a missing server UID as a surviving copy', async () => {
+    const { mgr, account } = arrange(new Map());
+    expect(await mgr.hasMessageCopy(account, 7, 'INBOX', '<invoice@example.test>')).toBe(false);
+  });
 
   it('deletes the uid when the server copy carries the expected Message-ID', async () => {
     const { mgr, account, client } = arrange(new Map([[7, '<old@example.test>']]));
@@ -4277,9 +6408,11 @@ describe('permanentDeleteMessage with expectMessageId', () => {
     expect(client.messageDelete).not.toHaveBeenCalled();
   });
 
-  it('deletes nothing when the uid is no longer on the server', async () => {
+  // Nothing holds the uid any more, which is where a delete would have left it.
+  it('counts a uid no longer on the server as deleted, expunging nothing', async () => {
     const { mgr, account, client } = arrange(new Map());
-    expect(await mgr.permanentDeleteMessage(account, 7, 'Drafts', { expectMessageId: '<old@example.test>' })).toBe(false);
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Drafts', { expectMessageId: '<old@example.test>' })).toBe(true);
+    expect(client.messageFlagsAdd).not.toHaveBeenCalled();
     expect(client.messageDelete).not.toHaveBeenCalled();
   });
 
@@ -4294,5 +6427,604 @@ describe('permanentDeleteMessage with expectMessageId', () => {
     expect(await mgr.permanentDeleteMessage(account, 7, 'Drafts')).toBe(true);
     expect(client.fetch).not.toHaveBeenCalled();
     expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  // messageParser stores a Message-ID cut at 500 characters, so the row of a message with a
+  // longer one holds a prefix of what the server copy carries.
+  const LONG_ID = `<${'x'.repeat(600)}@example.test>`;
+
+  it('deletes the uid when the row holds the Message-ID cut at the storage cap', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, LONG_ID]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectMessageId: LONG_ID.slice(0, 500) })).toBe(true);
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  it('deletes nothing when a cut Message-ID is not the start of the server copy\'s', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, `<${'y'.repeat(600)}@example.test>`]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectMessageId: LONG_ID.slice(0, 500) })).toBe(false);
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('does not take a short Message-ID for the start of a longer one', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<old@example.test.other>']]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectMessageId: '<old@example.test' })).toBe(false);
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  // A row of the messages table, and the server copy sync filed it from: sync stores the copy's
+  // INTERNALDATE as the row's date and its first From address as from_email.
+  const AT = new Date('2026-10-21T09:00:00Z');
+  const LATER = new Date('2026-10-21T09:00:01Z');
+  const row = (fields) => ({ message_id: null, date: AT, from_email: 'scanner@example.test', subject: 'Scan', ...fields });
+  const scan = (fields) => ({ messageId: null, internalDate: AT, from: 'scanner@example.test', subject: 'Scan', ...fields });
+
+  it.each([
+    ['the row has none and the server copy has one', row(), scan({ messageId: '<second@example.test>' })],
+    ['the row has <> and the server copy has one', row({ message_id: '<>' }), scan({ messageId: '<second@example.test>' })],
+    ['the row has one and the server copy has none', row({ message_id: '<first@example.test>' }), scan()],
+  ])('deletes nothing when only one side has a Message-ID: %s', async (_case, expectRow, copy) => {
+    const { mgr, account, client } = arrange(new Map([[7, copy]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow })).toBe(false);
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('deletes a server copy with no Message-ID whose INTERNALDATE, sender and subject are the row\'s', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, scan()]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row() })).toBe(true);
+    expect(client.fetch).toHaveBeenCalledWith('7', { uid: true, envelope: true, internalDate: true }, { uid: true });
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  it.each([
+    ['another INTERNALDATE', row(), scan({ internalDate: LATER })],
+    ['another subject', row(), scan({ subject: 'Invoice' })],
+    // The two cases from the #666 review: the same subject and time from another sender, and no
+    // subject on either.
+    ['another sender', row(), scan({ from: 'printer@example.test' })],
+    ['no subject and another sender', row({ subject: '(no subject)' }), scan({ subject: '', from: 'printer@example.test' })],
+    ['no date on either side', row({ date: null }), scan({ internalDate: null })],
+  ])('deletes nothing when neither has a Message-ID and they have %s', async (_case, expectRow, copy) => {
+    const { mgr, account, client } = arrange(new Map([[7, copy]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow })).toBe(false);
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('compares the sender without regard to case', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, scan({ from: 'Scanner@Example.test' })]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row() })).toBe(true);
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  it('takes the sender from a mailbox and host, as parseMessage does', async () => {
+    const { mgr, account, client } = arrange(new Map());
+    client.fetch = vi.fn(async function* () {
+      yield { uid: 7, envelope: { messageId: null, subject: 'Scan', from: [{ mailbox: 'scanner', host: 'example.test' }] }, internalDate: AT };
+    });
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row() })).toBe(true);
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  it('compares the subject as sync stores it, decoded and trimmed', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, scan({ subject: ' =?UTF-8?Q?Caf=C3=A9?= ' })]]));
+    decodeMimeWords.mockImplementation(s => s.replace('=?UTF-8?Q?Caf=C3=A9?=', 'Café'));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row({ subject: 'Café' }) })).toBe(true);
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  // Without a subject in the envelope, sync takes the row's from the Subject header, or stores
+  // '(no subject)', and the header is not fetched here.
+  it('compares only INTERNALDATE and sender when the server copy\'s envelope has no subject', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, scan({ subject: '' })]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row({ subject: 'From the Subject header' }) })).toBe(true);
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  // Nothing a row with no Message-ID stores tells apart two messages with its INTERNALDATE, sender
+  // and subject, so with two in the folder it could be either.
+  it('deletes nothing when another message in the folder matches the row as well', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, scan()], [8, scan()]]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row() })).toBe(false);
+    // The days around the row's date, wide enough for any server's time zone.
+    expect(client.search).toHaveBeenCalledWith({ since: new Date('2026-10-19T00:00:00Z'), before: new Date('2026-10-24T00:00:00Z') }, { uid: true });
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('deletes the copy when nothing else in the folder matches the row', async () => {
+    const { mgr, account, client } = arrange(new Map([
+      [7, scan()],
+      [8, scan({ internalDate: LATER })],
+      [9, scan({ from: 'printer@example.test' })],
+      [10, scan({ messageId: '<scan@example.test>' })],
+    ]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row() })).toBe(true);
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  it('deletes nothing when the folder cannot be searched for another match', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, scan()]]));
+    client.search.mockResolvedValue(false);
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row() })).toBe(false);
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  // Copies that share a Message-ID can be taken for each other, an accepted limit.
+  it('does not search the folder for a row with a Message-ID', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<a@example.test>'], [8, '<a@example.test>']]));
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectRow: row({ message_id: '<a@example.test>' }) })).toBe(true);
+    expect(client.search).not.toHaveBeenCalled();
+  });
+
+  // The bulk delete of rows already in Trash. Rows hold PostgreSQL BIGINT uids as strings.
+  it('bulkPermanentDelete deletes only the uids whose server copy is the row\'s message', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<a@example.test>'], [8, '<someone-elses@example.test>']]));
+    const expectRows = new Map([[7, row({ message_id: '<a@example.test>' })], [8, row({ message_id: '<b@example.test>' })]]);
+    expect(await mgr.bulkPermanentDelete(account, ['7', '8'], 'Trash', { expectRows }))
+      .toEqual({ succeeded: ['7'], failed: [], mismatched: ['8'] });
+    expect(client.fetch).toHaveBeenCalledTimes(1);
+    expect(client.search).not.toHaveBeenCalled();
+    expect(client.messageDelete).toHaveBeenCalledTimes(1);
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  it('bulkPermanentDelete counts a uid no longer on the server as deleted, expunging nothing for it', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<a@example.test>']]));
+    const expectRows = new Map([[7, row({ message_id: '<a@example.test>' })], [8, row({ message_id: '<b@example.test>' })]]);
+    expect(await mgr.bulkPermanentDelete(account, [7, 8], 'Trash', { expectRows }))
+      .toEqual({ succeeded: [7, 8], failed: [], mismatched: [] });
+    expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+  });
+
+  it('bulkPermanentDelete expunges nothing when no server copy matches', async () => {
+    const { mgr, account, client } = arrange(new Map([[8, '<someone-elses@example.test>']]));
+    expect(await mgr.bulkPermanentDelete(account, [8], 'Trash', { expectRows: new Map([[8, row({ message_id: '<b@example.test>' })]]) }))
+      .toEqual({ succeeded: [], failed: [], mismatched: [8] });
+    expect(client.messageFlagsAdd).not.toHaveBeenCalled();
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('bulkPermanentDelete checks a row with no Message-ID by INTERNALDATE, sender and subject', async () => {
+    const { mgr, account, client } = arrange(new Map([
+      [7, '<a@example.test>'],
+      [8, scan()],
+      [9, scan({ messageId: '<z@example.test>' })],
+      [10, scan({ internalDate: LATER })],
+      [11, scan({ from: 'printer@example.test' })],
+    ]));
+    const expectRows = new Map([[7, row({ message_id: '<a@example.test>' })], [8, row()], [9, row({ message_id: '<>' })], [10, row()], [11, row()]]);
+    expect(await mgr.bulkPermanentDelete(account, [7, 8, 9, 10, 11], 'Trash', { expectRows }))
+      .toEqual({ succeeded: [7, 8], failed: [], mismatched: [9, 10, 11] });
+    expect(client.fetch).toHaveBeenCalledWith('7,8,9,10,11', { uid: true, envelope: true, internalDate: true }, { uid: true });
+    expect(client.messageDelete).toHaveBeenCalledWith('7,8', { uid: true });
+  });
+
+  it('bulkPermanentDelete leaves a row with no Message-ID that another message in the folder also matches', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, scan()], [8, scan()], [9, scan({ subject: 'Invoice' })]]));
+    const expectRows = new Map([[7, row()], [9, row({ subject: 'Invoice' })]]);
+    expect(await mgr.bulkPermanentDelete(account, [7, 9], 'Trash', { expectRows }))
+      .toEqual({ succeeded: [9], failed: [], mismatched: [7] });
+    // Both rows' dates fall on one day, so one search serves them both.
+    expect(client.search).toHaveBeenCalledTimes(1);
+    expect(client.messageDelete).toHaveBeenCalledWith('9', { uid: true });
+  });
+
+  it('bulkPermanentDelete reports the uids it tried, and those already gone, when the expunge fails and is verified', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<a@example.test>'], [8, '<someone-elses@example.test>'], [9, '<c@example.test>']]));
+    client.messageDelete.mockRejectedValueOnce(new Error('connection lost'));
+    client.search = vi.fn(async () => [9]); // 7 went, 9 is still there
+    const expectRows = new Map([7, 8, 9, 10].map(uid => [uid, row({ message_id: `<${'abcd'[uid - 7]}@example.test>` })]));
+    expect(await mgr.bulkPermanentDelete(account, [7, 8, 9, 10], 'Trash', { expectRows }))
+      .toEqual({ succeeded: [7, 10], failed: [9], mismatched: [8] });
+    expect(client.search).toHaveBeenCalledWith({ uid: '7,9' }, { uid: true });
+  });
+
+  it('bulkPermanentDelete counts every uid it tried as failed when the expunge fails and cannot be verified', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<a@example.test>'], [8, '<someone-elses@example.test>']]));
+    client.messageDelete.mockRejectedValueOnce(new Error('connection lost'));
+    client.search = vi.fn(async () => { throw new Error('connection lost'); });
+    const expectRows = new Map([7, 8, 9].map(uid => [uid, row({ message_id: `<${'abc'[uid - 7]}@example.test>` })]));
+    expect(await mgr.bulkPermanentDelete(account, [7, 8, 9], 'Trash', { expectRows }))
+      .toEqual({ succeeded: [9], failed: [7], mismatched: [8] });
+  });
+
+  it('a FETCH answered with an unsolicited flags-only response for the uid still finds its Message-ID', async () => {
+    const { mgr, account, client } = arrange(new Map());
+    client.fetch = vi.fn(async function* () {
+      yield { uid: 7, envelope: { messageId: '<a@example.test>' } };
+      yield { uid: 7, flags: new Set(['\\Seen']) };
+    });
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Trash', { expectMessageId: '<a@example.test>' })).toBe(true);
+    expect(await mgr.bulkPermanentDelete(account, [7], 'Trash', { expectRows: new Map([[7, row({ message_id: '<a@example.test>' })]]) }))
+      .toEqual({ succeeded: [7], failed: [], mismatched: [] });
+    expect(client.messageDelete).toHaveBeenCalledTimes(2);
+  });
+
+  it('bulkPermanentDelete without expected rows deletes as before, with no FETCH', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<a@example.test>'], [8, '<b@example.test>']]));
+    expect(await mgr.bulkPermanentDelete(account, [7, 8], 'Trash')).toEqual({ succeeded: [7, 8], failed: [], mismatched: [] });
+    expect(client.fetch).not.toHaveBeenCalled();
+    expect(client.messageDelete).toHaveBeenCalledWith('7,8', { uid: true });
+  });
+});
+
+// A socket is authenticated once, at upgrade, so a revoked session's socket keeps receiving
+// its user's broadcasts until something closes it. The auth routes call closeSockets for that.
+describe('closeSockets', () => {
+  function arrange() {
+    const socket = (userId, sessionId) => ({ userId, sessionId, close: vi.fn() });
+    const sockets = {
+      mine: socket('u1', 's1'),
+      myOtherDevice: socket('u1', 's2'),
+      someoneElse: socket('u2', 's3'),
+      // Still in its session lookup: websocket.js has not set a userId yet.
+      authenticating: socket(undefined, undefined),
+    };
+    return { sockets, ctx: { wss: { clients: new Set(Object.values(sockets)) } } };
+  }
+  const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+
+  it('closes only the sockets opened by the given session', async () => {
+    const { sockets, ctx } = arrange();
+    ImapManager.prototype.closeSockets.call(ctx, 'u1', { sessionId: 's1', reason: 'Locked' });
+    await nextTurn();
+    expect(sockets.mine.close).toHaveBeenCalledWith(1008, 'Locked');
+    expect(sockets.myOtherDevice.close).not.toHaveBeenCalled();
+    expect(sockets.someoneElse.close).not.toHaveBeenCalled();
+    expect(sockets.authenticating.close).not.toHaveBeenCalled();
+  });
+
+  it('closes every socket of the user when no session is given', async () => {
+    const { sockets, ctx } = arrange();
+    ImapManager.prototype.closeSockets.call(ctx, 'u1');
+    await nextTurn();
+    expect(sockets.mine.close).toHaveBeenCalledWith(1008, 'Unauthorized');
+    expect(sockets.myOtherDevice.close).toHaveBeenCalledWith(1008, 'Unauthorized');
+    expect(sockets.someoneElse.close).not.toHaveBeenCalled();
+    expect(sockets.authenticating.close).not.toHaveBeenCalled();
+  });
+
+  it("closes every socket of the user but the excepted session's", async () => {
+    const { sockets, ctx } = arrange();
+    ImapManager.prototype.closeSockets.call(ctx, 'u1', { exceptSessionId: 's1' });
+    await nextTurn();
+    expect(sockets.mine.close).not.toHaveBeenCalled();
+    expect(sockets.myOtherDevice.close).toHaveBeenCalledWith(1008, 'Unauthorized');
+    expect(sockets.someoneElse.close).not.toHaveBeenCalled();
+    expect(sockets.authenticating.close).not.toHaveBeenCalled();
+  });
+
+  it('closes nothing without a userId, not even a socket still authenticating', async () => {
+    const { sockets, ctx } = arrange();
+    ImapManager.prototype.closeSockets.call(ctx, undefined);
+    await nextTurn();
+    for (const ws of Object.values(sockets)) expect(ws.close).not.toHaveBeenCalled();
+  });
+
+  it('waits a turn, so it also closes a socket that authenticates just after the call', async () => {
+    const { sockets, ctx } = arrange();
+    ImapManager.prototype.closeSockets.call(ctx, 'u1', { sessionId: 's1' });
+    // An upgrade whose session lookup was answered in the same read from Redis as the write
+    // that ended the session authenticates a microtask after that write's callback.
+    await Promise.resolve();
+    Object.assign(sockets.authenticating, { userId: 'u1', sessionId: 's1' });
+    await nextTurn();
+    expect(sockets.authenticating.close).toHaveBeenCalledWith(1008, 'Unauthorized');
+  });
+});
+
+describe('attachmentsFromStructure (#457)', () => {
+  it('lists the attachments from BODYSTRUCTURE alone, as fetchMessageBody stores them, without inline images', () => {
+    const msg = { bodyStructure: { type: 'multipart/mixed', childNodes: [
+      { part: '1', type: 'text/plain', parameters: { charset: 'utf-8' } },
+      { part: '2', type: 'image/png', id: '<logo@x>', disposition: 'inline' },
+      { part: '3', type: 'application/vnd.ms-excel.sheet.macroEnabled.12', disposition: 'attachment',
+        dispositionParameters: { filename: 'budget.xlsm' }, size: 1234, encoding: 'base64' },
+    ] } };
+    const out = attachmentsFromStructure(msg);
+    expect(out.map(a => [a.part, a.filename, a.type])).toEqual([
+      ['3', 'budget.xlsm', 'application/vnd.ms-excel.sheet.macroEnabled.12'],
+    ]);
+    const fetchShape = { textParts: [], attachments: [] };
+    walkStructure(msg.bodyStructure, fetchShape);
+    expect(out).toEqual(fetchShape.attachments);
+  });
+
+  it('is empty without a structure', () => {
+    expect(attachmentsFromStructure({})).toEqual([]);
+    expect(attachmentsFromStructure(null)).toEqual([]);
+  });
+});
+
+// ── Reply-draft markers: a Drafts folder that gained rows (#538) ───────────────
+//
+// The Inbox's reply-draft markers come from synced rows. A draft saved in another client arrives
+// read (\Seen), so it never enters new_messages, and nothing told the client to re-check the
+// markers until it reloaded. A sync that inserts rows into a Drafts folder now says so.
+describe('syncMessages — tells the client when a Drafts folder gained rows', () => {
+  const account = {
+    id: 'acct-drafts', user_id: 'user-1', email_address: 'me@example.com', gtd_enabled: false,
+    categorization_enabled: false, imap_host: 'imap.example.com', folder_mappings: { drafts: 'Entwürfe' },
+  };
+  let folderRow;
+  async function sync(folder, { isNew = true, isRead = true } = {}) {
+    const client = {
+      noop: vi.fn(async () => true),
+      getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      mailbox: { exists: 1, uidValidity: 100, highestModseq: 500n },
+      fetch: vi.fn(async function* () { yield { uid: 501 }; }),
+    };
+    query.mockReset();
+    query.mockImplementation((sql) => {
+      if (sql.includes('SELECT uid_validity, highest_modseq FROM folders')) return Promise.resolve({ rows: [{ uid_validity: 100, highest_modseq: '500' }] });
+      if (sql.includes('COUNT(*) FILTER (WHERE is_read = false)') && !sql.includes('UPDATE folders')) return Promise.resolve({ rows: [{ n: 0 }] });
+      if (sql.includes('COALESCE(MAX(uid), 0)')) return Promise.resolve({ rows: [{ max_uid: 0 }] });
+      if (sql.includes('INSERT INTO messages')) return Promise.resolve({ rows: [{ id: 'draft-row', is_new: isNew }] });
+      if (sql.includes('SELECT account_id, path, special_use, no_select FROM folders')) return Promise.resolve({ rows: folderRow ? [folderRow] : [] });
+      return Promise.resolve({ rows: [] });
+    });
+    parseMessage.mockReset();
+    parseMessage.mockResolvedValue({
+      uid: 501, messageId: '<d1@x>', subject: 'Re: Plans', fromName: 'Me', fromEmail: 'me@example.com',
+      to: [], cc: [], replyTo: [], inReplyTo: '<p1@x>', references: '<p1@x>', date: new Date('2026-10-08T10:00:00Z'),
+      snippet: 'draft', isRead, isStarred: false, hasAttachments: false, flags: isRead ? ['\\Draft', '\\Seen'] : ['\\Draft'],
+      isBulk: false, parsedHeaders: {},
+    });
+    // An unread arrival also schedules a body prefetch (setImmediate) and classification; stub
+    // both, or the prefetch throws after the test has finished.
+    const mgr = { pluginFacade: {}, broadcast: vi.fn(), prefetchNewMessageBodies: vi.fn(async () => {}), maybeClassifyNewMessage: vi.fn() };
+    await ImapManager.prototype.syncMessages.call(mgr, account, client, folder, 100, false, true);
+    return mgr.broadcast.mock.calls.map(([event, userId]) => [event.type, event.accountId, userId]);
+  }
+  let hasActive, runHook;
+  beforeEach(() => {
+    folderRow = null;
+    hasActive = vi.spyOn(pluginRegistry, 'hasActiveAsync').mockResolvedValue(false);
+    runHook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+  });
+  afterEach(() => { hasActive.mockRestore(); runHook.mockRestore(); });
+
+  it('a read draft synced into the folder flagged \\Drafts', async () => {
+    folderRow = { account_id: 'acct-drafts', path: 'Drafts', special_use: '\\Drafts', no_select: false };
+    expect(await sync('Drafts')).toEqual([['drafts_changed', 'acct-drafts', 'user-1']]);
+  });
+
+  it('the mapped Drafts folder, without the flag', async () => {
+    folderRow = { account_id: 'acct-drafts', path: 'Entwürfe', special_use: null, no_select: false };
+    expect(await sync('Entwürfe')).toEqual([['drafts_changed', 'acct-drafts', 'user-1']]);
+  });
+
+  it('an unread draft too, alongside its new_messages', async () => {
+    folderRow = { account_id: 'acct-drafts', path: 'Drafts', special_use: '\\Drafts', no_select: false };
+    const events = await sync('Drafts', { isRead: false });
+    expect(events.filter(([type]) => type === 'drafts_changed')).toHaveLength(1);
+    expect(events.map(([type]) => type)).toContain('new_messages');
+  });
+
+  it('not for another folder, a sync that inserted nothing, or the Inbox', async () => {
+    folderRow = { account_id: 'acct-drafts', path: 'Junk', special_use: '\\Junk', no_select: false };
+    expect(await sync('Junk')).toEqual([]);
+    folderRow = { account_id: 'acct-drafts', path: 'Drafts', special_use: '\\Drafts', no_select: false };
+    expect(await sync('Drafts', { isNew: false })).toEqual([]);
+    expect(await sync('INBOX')).toEqual([]);
+    // The Inbox never pays for the folder lookup.
+    expect(query.mock.calls.some(([sql]) => sql.includes('SELECT account_id, path, special_use, no_select FROM folders'))).toBe(false);
+  });
+
+  it('a failed notice never fails the sync', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(noteDraftsChanged({ broadcast: vi.fn() }, account, 'Drafts')).resolves.toBeUndefined();
+      query.mockReset();
+      query.mockRejectedValue(new Error('db down'));
+      await expect(noteDraftsChanged({ broadcast: vi.fn() }, account, 'Drafts')).resolves.toBeUndefined();
+      query.mockReset();
+      query.mockResolvedValue({ rows: [{ account_id: 'acct-drafts', path: 'Drafts', special_use: '\\Drafts' }] });
+      await expect(noteDraftsChanged({}, account, 'Drafts')).resolves.toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// #677: every command of a body fetch is a round trip to the mail server, and on Gmail they
+// are what opening a message waits for. Text parts are fetched one at a time (some servers
+// garble a batched one), so batching them as well was a command for nothing.
+describe('the commands a body fetch sends', () => {
+  let seq = 900;
+  const alternative = {
+    type: 'multipart/alternative',
+    childNodes: [
+      { part: '1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } },
+      { part: '2', type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } },
+    ],
+  };
+  // A fake server holding one message. answersAlone: the parts a fetch of that part alone
+  // returns (others come back empty), so a server that only answers batched requests can be
+  // played too.
+  // fails(command, client): true makes that command throw on that client (0 is the first one
+  // made); drops: a throw drops that client's connection, so every command after it throws too.
+  function serve(host, structure, parts, { answersAlone = Object.keys(parts), batched = {}, fails = () => false, drops = false } = {}) {
+    const account = { id: `acct-cmds-${++seq}`, user_id: 'u1', imap_host: host, email_address: 'p@example.test', auth_user: 'p', auth_pass: 'enc' };
+    const commands = [];
+    let made = 0;
+    ImapFlow.mockImplementation(function () {
+      const client = new EventEmitter();
+      const index = made++;
+      let dropped = false;
+      client.usable = true;
+      client.connect = vi.fn(() => Promise.resolve());
+      client.logout = vi.fn(() => Promise.resolve());
+      client.close = vi.fn();
+      client.getMailboxLock = vi.fn(async () => ({ release() {} }));
+      client.fetch = vi.fn(async function* (range, fetchQuery) {
+        const wanted = fetchQuery.bodyParts || [];
+        const command = [fetchQuery.bodyStructure ? 'BODYSTRUCTURE' : null, ...wanted].filter(Boolean).join(' ');
+        commands.push(command);
+        if (dropped || fails(command, index)) {
+          if (drops) dropped = true;
+          throw new Error('ECONNRESET');
+        }
+        const alone = wanted.length === 1;
+        yield {
+          uid: 42,
+          bodyStructure: fetchQuery.bodyStructure ? structure : undefined,
+          bodyParts: fetchQuery.bodyParts
+            ? new Map(wanted.filter(p => p in parts).map(p => [p, Buffer.from(alone ? (answersAlone.includes(p) ? parts[p] : '') : (batched[p] ?? parts[p]))]))
+            : undefined,
+        };
+      });
+      return client;
+    });
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
+    return { mgr: new ImapManager({ clients: new Set() }), account, commands, clientsMade: () => made };
+  }
+
+  it('fetches a two-step provider\'s text parts once each, with no batch of them first', async () => {
+    const { mgr, account, commands } = serve('imap.gmail.com', alternative, { '1': 'hello', '2': '<p>hello</p>' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(commands).toEqual(['BODYSTRUCTURE', '1', '2']);
+  });
+
+  it('fetches a single-part message in two commands', async () => {
+    const { mgr, account, commands } = serve('imap.gmail.com', { part: '1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } }, { '1': 'just text' });
+    expect((await mgr.fetchMessageBody(account, 42, 'INBOX')).text).toBe('just text');
+    expect(commands).toEqual(['BODYSTRUCTURE', '1']);
+  });
+
+  it('still batches inline images, and fetches the text parts alone', async () => {
+    const { mgr, account, commands } = serve('imap.gmail.com', {
+      type: 'multipart/related',
+      childNodes: [
+        { part: '1', type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } },
+        { part: '2', type: 'image/png', encoding: 'base64', id: '<logo@x>', size: 12, disposition: 'inline', dispositionParameters: { filename: 'logo.png' } },
+      ],
+    }, { '1': '<img src="cid:logo@x">', '2': 'iVBORw0KGgo=' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body.html).toBe('<img src="data:image/png;base64,iVBORw0KGgo=">');
+    expect(commands).toEqual(['BODYSTRUCTURE', '2', '1']);
+  });
+
+  it('falls back to the batched value of a text part the server answers alone with nothing', async () => {
+    const { mgr, account, commands } = serve('imap.gmail.com', alternative, { '1': 'hello', '2': '<p>hello</p>' }, { answersAlone: ['1'] });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(commands).toEqual(['BODYSTRUCTURE', '1', '2', '1 2']);
+  });
+
+  it('keeps the value a text part\'s own fetch brought over the batched one', async () => {
+    // The batch answers part 1 garbled, as the servers the per-part fetch is there for do.
+    const { mgr, account } = serve('imap.gmail.com', alternative, { '1': 'hello', '2': '<p>hello</p>' }, { answersAlone: ['1'], batched: { '1': '--boundary=_x hello=3D' } });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+  });
+
+  it('leaves a speculative provider\'s single round trip as it was', async () => {
+    const { mgr, account, commands } = serve('imap.example.test', alternative, { '1': 'hello', '2': '<p>hello</p>' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(commands[0].startsWith('BODYSTRUCTURE 1 1.1')).toBe(true);
+    expect(commands.slice(1)).toEqual(['1', '2']);
+  });
+
+  it('never returns a body with a text part missing: a drop after part 1 retries the whole body', async () => {
+    const { mgr, account, commands, clientsMade } = serve('imap.gmail.com', alternative, { '1': 'hello', '2': '<p>hello</p>' },
+      { fails: (command, client) => client === 0 && command === '2', drops: true });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    // Not the plain text alone, which the route would store and show for good.
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(commands).toEqual(['BODYSTRUCTURE', '1', '2', '1 2', 'BODYSTRUCTURE', '1', '2']);
+    expect(clientsMade()).toBe(2);
+  });
+
+  it('fails rather than return a partial body when the retry drops too', async () => {
+    const { mgr, account } = serve('imap.gmail.com', alternative, { '1': 'hello', '2': '<p>hello</p>' },
+      { fails: command => command === '2', drops: true });
+    await expect(mgr.fetchMessageBody(account, 42, 'INBOX')).rejects.toThrow(/ECONNRESET/);
+  });
+
+  it('fails over to a fresh login when no text part arrived and the fallback throws', async () => {
+    const { mgr, account, commands, clientsMade } = serve('imap.gmail.com', alternative, { '1': 'hello', '2': '<p>hello</p>' },
+      { fails: (command, client) => client === 0 && command === '1', drops: true });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(clientsMade()).toBe(2);
+    expect(commands).toEqual(['BODYSTRUCTURE', '1', '2', '1 2', 'BODYSTRUCTURE', '1', '2']);
+  });
+
+  it('takes the batched value of a text part whose own fetch threw', async () => {
+    const { mgr, account, commands } = serve('imap.gmail.com', alternative, { '1': 'hello', '2': '<p>hello</p>' },
+      { fails: command => command === '2' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(commands).toEqual(['BODYSTRUCTURE', '1', '2', '1 2']);
+  });
+
+  it('falls back to two steps when a speculative fetch is refused, with no batch of text parts', async () => {
+    const { mgr, account, commands } = serve('imap.example.test', alternative, { '1': 'hello', '2': '<p>hello</p>' },
+      { fails: command => command.startsWith('BODYSTRUCTURE ') });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(commands.slice(1)).toEqual(['BODYSTRUCTURE', '1', '2']);
+  });
+
+  it('fetches nested text parts on their own', async () => {
+    const { mgr, account, commands } = serve('imap.gmail.com', {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'multipart/alternative', part: '1', childNodes: [
+          { part: '1.1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } },
+          { part: '1.2', type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } },
+        ] },
+        { part: '2', type: 'application/pdf', encoding: 'base64', size: 900, disposition: 'attachment', dispositionParameters: { filename: 'a.pdf' } },
+      ],
+    }, { '1.1': 'hello', '1.2': '<p>hello</p>' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body).toMatchObject({ text: 'hello', html: '<p>hello</p>' });
+    expect(body.attachments.map(a => a.filename)).toEqual(['a.pdf']);
+    expect(commands).toEqual(['BODYSTRUCTURE', '1.1', '1.2']);
+  });
+
+  it('does not fetch again a text part the structure says is empty', async () => {
+    const empty = { ...alternative, childNodes: [{ ...alternative.childNodes[0], size: 0 }, { ...alternative.childNodes[1], size: 12 }] };
+    const { mgr, account, commands } = serve('imap.gmail.com', empty, { '1': '', '2': '<p>hello</p>' });
+    const body = await mgr.fetchMessageBody(account, 42, 'INBOX');
+    expect(body.html).toBe('<p>hello</p>');
+    expect(commands).toEqual(['BODYSTRUCTURE', '1', '2']);
+  });
+});
+
+// #677: a body prefetch fetches from the mail server only when that cannot add to a provider's
+// trouble or stand in a click's way.
+describe('prefetchBodyVerdict', () => {
+  let seq = 0;
+  const manager = () => Object.assign(Object.create(ImapManager.prototype), { _connectCooldown: new Map(), _secondaryCooldown: new Map() });
+  const acct = host => ({ ...baseAccount, id: `prefetch-gate-${++seq}`, user_id: 'u1', email_address: 'p@example.test', imap_host: host });
+
+  it('allows Gmail and an ordinary server', () => {
+    const m = manager();
+    expect(m.prefetchBodyVerdict(acct('imap.gmail.com'))).toBe('yes');
+    expect(m.prefetchBodyVerdict(acct('mail.example.test'))).toBe('yes');
+  });
+
+  it('says later while the secondary backoff or the connect cooldown is armed', () => {
+    const m = manager();
+    const a = acct('imap.gmail.com');
+    m._secondaryCooldown.set(a.id, { until: Date.now() + 60_000, failures: 1 });
+    expect(m.prefetchBodyVerdict(a)).toBe('later');
+    const b = acct('imap.gmail.com');
+    m._connectCooldown.set(b.id, { until: Date.now() + 60_000 });
+    expect(m.prefetchBodyVerdict(b)).toBe('later');
+    m._secondaryCooldown.set(a.id, { until: Date.now() - 1, failures: 1 });
+    expect(m.prefetchBodyVerdict(a)).toBe('yes');
+  });
+
+  it('says never for a provider whose body fetches open a login of their own (PurelyMail)', () => {
+    expect(manager().prefetchBodyVerdict(acct('imap.purelymail.com'))).toBe('never');
+  });
+
+  it('says never for a one-connection pool (Yahoo), even with that connection free', () => {
+    const m = manager();
+    expect(m.prefetchBodyVerdict(acct('imap.mail.yahoo.com'))).toBe('never');
   });
 });

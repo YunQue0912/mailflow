@@ -1,0 +1,2 @@
+# Server scripts must remain executable by Linux shells after a Windows checkout/copy.
+*.sh text eol=lf

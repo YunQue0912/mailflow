@@ -15,7 +15,9 @@ registerHooks({
   load(url, context, nextLoad) {
     if (url.endsWith('react-i18next/dist/es/index.js') || url.endsWith('/react-i18next')) {
       return { format: 'module', shortCircuit: true, source: [
-        'export const useTranslation = () => ({ t: (k) => k, i18n: { language: "en", changeLanguage: () => {} } });',
+        // Keys stand in for text. The one string that wraps another (the AI panel's error) shows
+        // what it wraps, so a test can tell which error it is.
+        'export const useTranslation = () => ({ t: (k, o) => (o?.message ? `${k} ${o.message}` : k), i18n: { language: "en", changeLanguage: () => {} } });',
         'export const initReactI18next = { type: "3rdParty", init: () => {} };',
         'export const Trans = ({ children }) => children ?? null;',
         'export const I18nextProvider = ({ children }) => children ?? null;',
@@ -79,7 +81,7 @@ async function hideTab() {
 // Opens a draft the way MessageList does for a click in the Drafts folder. Returns an unmount.
 async function openDraft({ plaintextEmail, body }) {
   saved.length = 0;
-  useStore.setState({ plaintextEmail });
+  useStore.setState({ plaintextEmail, composing: false, composeData: null, prepareComposeSwitch: null });
   useStore.getState().openCompose({
     accountId: 'acct',
     draftUid: 7,
@@ -188,5 +190,1377 @@ describe('switching From on a reopened draft', () => {
     assert.equal(saved.length, 1);
     assert.equal(saved[0].existingUid, 8);
     assert.equal(saved[0].existingAccountId, 'other');
+  });
+});
+
+describe('automatic Cc and Bcc (#491)', () => {
+  // Several tests assert that nothing happens (no chip, no save). Each first shows the automatic
+  // address appearing where it should, so none of them can pass with the feature missing.
+  const ME = 'me@example.invalid';
+  const SENDER = { name: 'Sender', email: 'sender@example.invalid' };
+  const posted = [];
+  let realPost;
+
+  const account = (id, { cc = [], bcc = [], aliases } = {}) => ({
+    id, enabled: true, email_address: `${id}@example.invalid`, name: id, color: '#fff',
+    auto_cc_addresses: cc, auto_bcc_addresses: bcc, ...(aliases ? { aliases } : {}),
+  });
+  // What composeFromMessage hands over for Reply All, and for Reply.
+  const replyAll = (thread) => ({
+    accountId: 'A', isReply: true, isReplyAll: true, subject: 'Re: Plan', body: '',
+    to: [SENDER], originalFrom: [SENDER], cc: thread, allRecipients: thread,
+  });
+  const reply = (thread) => ({ ...replyAll(thread), isReplyAll: false, cc: [] });
+  // A thread that already Cc's the address account A sends an automatic Bcc to.
+  const PERSONAL = 'me@personal.example.invalid';
+  const THREAD = [{ name: '', email: 'thread@example.invalid' }, { name: '', email: PERSONAL }];
+  const BOTH_LISTS = { cc: ['boss@example.invalid'], bcc: [PERSONAL] };
+
+  // Opens the composer through the store, as every entry point does. Returns an unmount.
+  async function mountCompose(composeData, { accounts, strict = false }) {
+    saved.length = 0;
+    posted.length = 0;
+    useStore.setState({ plaintextEmail: false, accounts, selectedAccountId: accounts[0]?.id ?? null, defaultSender: '', composing: false, composeData: null, prepareComposeSwitch: null });
+    useStore.getState().openCompose(composeData);
+    const root = createRoot(document.getElementById('root'));
+    const modal = React.createElement(ComposeModal);
+    await React.act(async () => { root.render(strict ? React.createElement(React.StrictMode, null, modal) : modal); });
+    await React.act(async () => {});
+    return () => React.act(async () => root.unmount());
+  }
+
+  const rowOf = (label) => [...document.querySelectorAll('span')].find(s => s.textContent === label)?.parentElement ?? null;
+  // The chips in the row labelled `label`, or null when that row is not rendered at all.
+  const chips = (label) => {
+    const row = rowOf(label);
+    return row ? [...row.querySelectorAll('span[title]')].map(s => s.title) : null;
+  };
+  const click = (el) => React.act(async () => { el.dispatchEvent(new window.MouseEvent('click', { bubbles: true })); });
+
+  async function chooseFrom(value) {
+    const from = [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === value));
+    await React.act(async () => {
+      from.value = value;
+      from.dispatchEvent(new window.Event('change', { bubbles: true }));
+    });
+  }
+  async function typeInto(input, text) {
+    const setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    await React.act(async () => {
+      setValue.call(input, text);
+      input.dispatchEvent(new window.Event('input', { bubbles: true }));
+    });
+  }
+  const typeSubject = (text) => typeInto(document.querySelector('input[placeholder="compose.subject"]'), text);
+  // Types a recipient into the row labelled `label` and commits it with Enter.
+  async function addChip(label, text) {
+    const input = rowOf(label).querySelector('input');
+    await typeInto(input, text);
+    await React.act(async () => {
+      input.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+  }
+  async function send() {
+    await click([...document.querySelectorAll('button')].find(b => b.textContent === 'compose.send'));
+    await React.act(async () => {});
+    return posted.find(p => p.path === '/mail/send')?.body;
+  }
+  // Renders at phone width, where the composer has its own layout with Reply and Reply All tabs.
+  async function onMobile(run) {
+    const width = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 375 });
+    try {
+      await run((label) => [...document.querySelectorAll('button')].find(b => b.textContent === label));
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: width });
+    }
+  }
+  async function editBody(text) {
+    const editor = document.querySelector('.ProseMirror').editor;
+    await React.act(async () => { editor.commands.insertContent(text); });
+  }
+  async function removeChip(label, address) {
+    const chip = [...rowOf(label).querySelectorAll('span[title]')].find(s => s.title === address);
+    await click(chip.querySelector('button'));
+  }
+  async function switchReplyType(label) {
+    await click([...document.querySelectorAll('button')].find(b => /^compose\.reply(All)?$/.test(b.textContent)));
+    await click([...document.querySelectorAll('div')].find(d => d.textContent === label));
+  }
+
+  before(() => {
+    // A reply autofocuses the editor, and TipTap focuses through requestAnimationFrame.
+    globalThis.requestAnimationFrame ??= cb => setTimeout(() => cb(Date.now()), 0);
+    realPost = api.post;
+    api.post = async (path, body) => { posted.push({ path, body }); return { sentFolder: 'Sent' }; };
+  });
+  after(() => { api.post = realPost; });
+
+  test('a new message shows the account\'s automatic Bcc in a visible Bcc row', async () => {
+    const close = await mountCompose({}, { accounts: [account('A', { bcc: [ME] })] });
+    try {
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+    } finally { await close(); }
+  });
+
+  test('an untouched composer with automatic recipients is not autosaved and closes without a prompt', async () => {
+    const close = await mountCompose({}, { accounts: [account('A', { cc: ['boss@example.invalid'], bcc: [ME] })] });
+    try {
+      assert.deepEqual(chips('compose.cc'), ['boss@example.invalid']);
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+      await hideTab();
+      assert.equal(saved.length, 0, 'nothing the user did needs saving');
+      const unload = new window.Event('beforeunload', { cancelable: true });
+      window.dispatchEvent(unload);
+      assert.equal(unload.defaultPrevented, false, 'no leave-page prompt');
+      await click(document.querySelector('button[title="compose.toolbar.close"]'));
+      assert.equal(useStore.getState().composing, false, 'closed straight away, without the save-or-discard dialog');
+    } finally { await close(); }
+  });
+
+  test('the automatic Bcc is saved and sent like any other recipient', async () => {
+    const close = await mountCompose({ to: ['x@example.invalid'] }, { accounts: [account('A', { bcc: [ME] })] });
+    try {
+      await typeSubject('Plan');
+      await hideTab();
+      assert.equal(saved.length, 1);
+      assert.deepEqual(saved[0].bcc, [ME]);
+      const sent = await send();
+      assert.ok(sent, 'the message was sent');
+      assert.deepEqual(sent.bcc, [ME]);
+      assert.deepEqual(sent.to, ['x@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('a message forwarded as an attachment is sent by id, its own attachments by part (#466)', async () => {
+    const close = await mountCompose({
+      to: ['submit.x@spam.spamcop.net'], subject: 'Fwd: You won', isForward: true,
+      forwardedAttachments: [
+        { messageId: 'spam-1', asMessage: true, filename: 'You won.eml', type: 'message/rfc822', size: null },
+        { messageId: 'other-1', part: '2', filename: 'invoice.pdf', type: 'application/pdf', size: 2048 },
+      ],
+    }, { accounts: [account('A')] });
+    try {
+      const chipText = [...document.querySelectorAll('span')].map(sp => sp.textContent).join(' | ');
+      assert.ok(chipText.includes('You won.eml'));
+      assert.ok(!/NaN|undefined|nullB/.test(chipText), 'a message attachment shows no made-up size');
+      const sent = await send();
+      assert.ok(sent, 'the message was sent');
+      assert.deepEqual(sent.forwardedMessages, ['spam-1']);
+      assert.deepEqual(sent.forwardedAttachments, [{ messageId: 'other-1', part: '2' }]);
+    } finally { await close(); }
+  });
+
+  test('a mailto Bcc is kept alongside the automatic Bcc, and the composer stays clean', async () => {
+    const close = await mountCompose(
+      { to: ['x@example.invalid'], bcc: ['u@example.invalid'] },
+      { accounts: [account('A', { bcc: [ME] })] },
+    );
+    try {
+      assert.deepEqual(chips('compose.bcc'), ['u@example.invalid', ME]);
+      await hideTab();
+      assert.equal(saved.length, 0);
+    } finally { await close(); }
+  });
+
+  test('reply-all keeps an automatic Cc that is not on the thread', async () => {
+    const close = await mountCompose(
+      replyAll([{ name: '', email: 'thread@example.invalid' }]),
+      { accounts: [account('A', { cc: ['boss@example.invalid'] })] },
+    );
+    try {
+      assert.deepEqual(chips('compose.cc'), ['thread@example.invalid', 'boss@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('reply-all lists an automatic Cc that is already on the thread only once', async () => {
+    const close = await mountCompose(
+      replyAll([{ name: '', email: 'ARCHIVE@example.invalid' }]),
+      { accounts: [account('A', { cc: ['archive@example.invalid', 'boss@example.invalid'] })] },
+    );
+    try {
+      assert.deepEqual(chips('compose.cc'), ['ARCHIVE@example.invalid', 'boss@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('a reopened draft is not given the automatic recipients, on opening or on a From switch', async () => {
+    const accounts = [account('acct', { bcc: [ME] }), account('other', { bcc: ['other-auto@example.invalid'] })];
+    const fresh = await mountCompose({}, { accounts });
+    try {
+      assert.deepEqual(chips('compose.bcc'), [ME], 'a new message from the same account gets it');
+    } finally { await fresh(); }
+
+    const close = await openDraft({ plaintextEmail: false, body: GMAIL_DRAFT });
+    try {
+      assert.equal(chips('compose.bcc'), null, 'no Bcc row: the draft saved none');
+      await hideTab();
+      assert.equal(saved.length, 0, 'opening the draft is still not an edit');
+      await chooseFrom('account:other');
+      assert.equal(chips('compose.bcc'), null, 'nor from the account From switches to');
+      await hideTab();
+      assert.equal(saved.length, 1, 'a saved sender change is persisted');
+    } finally { await close(); }
+  });
+
+  test('a message reopened by undo send keeps the Cc and Bcc it was sent with', async () => {
+    const accounts = [account('acct', { bcc: [ME] })];
+    const fresh = await mountCompose({}, { accounts });
+    try {
+      assert.deepEqual(chips('compose.bcc'), [ME], 'a new message from the account gets it');
+    } finally { await fresh(); }
+
+    // Sent without the automatic Bcc (the user removed it), then undone. No draft was saved.
+    const close = await mountCompose({ accountId: 'acct', to: ['x@example.invalid'], cc: [], bcc: [], subject: 'Plan', body: '<p>Plan</p>', restored: true }, { accounts });
+    try {
+      assert.equal(chips('compose.bcc'), null, 'the removed automatic Bcc does not come back');
+    } finally { await close(); }
+  });
+
+  test('switching From before any save swaps only the automatic addresses', async () => {
+    const accounts = [account('A', { bcc: ['a@example.invalid'] }), account('B', { bcc: ['b@example.invalid'] })];
+    const close = await mountCompose({ to: ['x@example.invalid'], bcc: ['u@example.invalid'] }, { accounts });
+    try {
+      assert.deepEqual(chips('compose.bcc'), ['u@example.invalid', 'a@example.invalid']);
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.bcc'), ['u@example.invalid', 'b@example.invalid']);
+      await typeSubject('Plan');
+      await hideTab();
+      assert.equal(saved.length, 1);
+      assert.equal(saved[0].accountId, 'B');
+      assert.deepEqual(saved[0].bcc, ['u@example.invalid', 'b@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('switching From on an untouched composer is not an edit', async () => {
+    const accounts = [account('A', { bcc: ['a@example.invalid'] }), account('B', { bcc: ['b@example.invalid'] })];
+    const close = await mountCompose({}, { accounts });
+    try {
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.bcc'), ['b@example.invalid']);
+      await hideTab();
+      assert.equal(saved.length, 0);
+    } finally { await close(); }
+  });
+
+  test('switching From to another account and back gives the first account\'s automatic Bcc back', async () => {
+    const accounts = [account('A', { bcc: ['a@example.invalid'] }), account('B', { bcc: ['b@example.invalid'] })];
+    const close = await mountCompose({ to: ['x@example.invalid'] }, { accounts });
+    try {
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.bcc'), ['b@example.invalid']);
+      await chooseFrom('account:A');
+      assert.deepEqual(chips('compose.bcc'), ['a@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('a Cc or Bcc the user typed before a From switch is still an unsaved edit', async () => {
+    const accounts = [
+      account('A', { cc: ['a-cc@example.invalid'], bcc: ['a@example.invalid'] }),
+      account('B', { cc: ['b-cc@example.invalid'], bcc: ['b@example.invalid'] }),
+    ];
+    for (const [field, fromB] of [['cc', 'b-cc@example.invalid'], ['bcc', 'b@example.invalid']]) {
+      const close = await mountCompose({ to: ['x@example.invalid'] }, { accounts });
+      try {
+        await addChip(`compose.${field}`, 'typed@example.invalid');
+        await chooseFrom('account:B');
+        await hideTab();
+        assert.equal(saved.length, 1, `the typed ${field} is the only edit, and it is saved`);
+        assert.deepEqual(saved[0][field], ['typed@example.invalid', fromB]);
+      } finally { await close(); }
+    }
+  });
+
+  test('a tab hidden right after a From switch does not save the old account\'s chips under the new From', async () => {
+    const accounts = [account('A', { bcc: ['a@example.invalid'] }), account('B', { bcc: ['b@example.invalid'] })];
+    const close = await mountCompose({}, { accounts });
+    const actEnvironment = globalThis.IS_REACT_ACT_ENVIRONMENT;
+    try {
+      // Outside act(), so React schedules as it does in a browser: the From change renders in a
+      // microtask, and the tab is hidden straight after it, before any later task can run.
+      globalThis.IS_REACT_ACT_ENVIRONMENT = false;
+      const from = [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === 'account:B'));
+      from.value = 'account:B';
+      from.dispatchEvent(new window.Event('change', { bubbles: true }));
+      await Promise.resolve();
+      visibility = 'hidden';
+      document.dispatchEvent(new window.Event('visibilitychange'));
+      visibility = 'visible';
+      await new Promise(resolve => setTimeout(resolve, 0));
+      globalThis.IS_REACT_ACT_ENVIRONMENT = actEnvironment;
+      await React.act(async () => {});
+      assert.deepEqual(chips('compose.bcc'), ['b@example.invalid']);
+      assert.deepEqual(saved.map(s => ({ accountId: s.accountId, bcc: s.bcc })), [], 'an untouched composer is not saved');
+    } finally {
+      globalThis.IS_REACT_ACT_ENVIRONMENT = actEnvironment;
+      await close();
+    }
+  });
+
+  test('switching From after an autosave saves the new From together with its lists', async () => {
+    const accounts = [account('A', { bcc: ['a@example.invalid'] }), account('B', { bcc: ['b@example.invalid'] })];
+    const close = await mountCompose({ to: ['x@example.invalid'] }, { accounts });
+    try {
+      await editBody('Hi');
+      await hideTab();
+      assert.equal(saved.length, 1);
+      assert.equal(saved[0].accountId, 'A');
+      assert.deepEqual(saved[0].bcc, ['a@example.invalid']);
+
+      await chooseFrom('account:B');
+      await hideTab();
+      assert.equal(saved.length, 2, 'the switch alone is saved');
+      assert.equal(saved[1].accountId, 'B');
+      assert.deepEqual(saved[1].bcc, ['b@example.invalid']);
+      assert.equal(saved[1].existingUid, 8);
+      assert.equal(saved[1].existingAccountId, 'A');
+    } finally { await close(); }
+  });
+
+  test('an automatic address the user removed is not added back by a From switch', async () => {
+    const accounts = [account('A', { cc: ['crm@example.invalid'] }), account('B', { cc: ['crm@example.invalid'] })];
+    const close = await mountCompose({}, { accounts });
+    try {
+      assert.deepEqual(chips('compose.cc'), ['crm@example.invalid']);
+      await removeChip('compose.cc', 'crm@example.invalid');
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.cc'), []);
+      await chooseFrom('account:A');
+      assert.deepEqual(chips('compose.cc'), [], 'nor by switching back');
+    } finally { await close(); }
+  });
+
+  // Writes a message in a composer keyed the way MailApp keys it, sends it with an undo window and
+  // undoes it, so the undone message mounts a composer of its own. `beforeSend` runs first;
+  // `whileSending` runs after Send is clicked and before the server has answered. Returns an
+  // unmount.
+  async function sendAndUndo(composeData, { accounts, beforeSend, whileSending }) {
+    const Host = () => {
+      const composing = useStore(s => s.composing);
+      const session = useStore(s => s.composeSession);
+      return composing ? React.createElement(ComposeModal, { key: session }) : null;
+    };
+    const plainPost = api.post;
+    let answer;
+    api.post = (path, body) => {
+      posted.push({ path, body });
+      if (path !== '/mail/send') return plainPost(path, body);
+      return new Promise(resolve => {
+        answer = () => resolve({ ok: true, pending: true, pendingId: 'p-auto', sendAt: new Date(Date.now() + 10_000).toISOString(), remainingMs: 10_000 });
+      });
+    };
+    api.cancelSend = async () => ({ cancelled: true });
+    saved.length = 0;
+    posted.length = 0;
+    useStore.setState({ plaintextEmail: false, accounts, selectedAccountId: accounts[0].id, defaultSender: '', notifications: [], composing: false, composeData: null });
+    useStore.getState().openCompose(composeData);
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(Host)); });
+    await React.act(async () => {});
+    const unmount = () => React.act(async () => root.unmount());
+    try {
+      await beforeSend?.();
+      await send();
+      await whileSending?.();
+      await React.act(async () => { answer(); });
+      await React.act(async () => {});
+      const bar = useStore.getState().notifications.find(n => n.onUndo);
+      await React.act(async () => { await bar.onUndo(); });
+      await React.act(async () => {});
+    } catch (err) {
+      await unmount();
+      throw err;
+    } finally {
+      api.post = plainPost;
+    }
+    return unmount;
+  }
+
+  test('after undo send, an automatic address removed before sending stays out across From switches', async () => {
+    const accounts = [account('A', { cc: ['crm@example.invalid'] }), account('B', { cc: ['crm@example.invalid'] })];
+    const cc = () => chips('compose.cc') ?? [];
+    const close = await sendAndUndo({ to: ['x@example.invalid'], subject: 'Plan' }, {
+      accounts,
+      beforeSend: async () => {
+        assert.deepEqual(cc(), ['crm@example.invalid']);
+        await removeChip('compose.cc', 'crm@example.invalid');
+      },
+    });
+    try {
+      assert.deepEqual(cc(), [], 'reopened as it was sent');
+      await chooseFrom('account:B');
+      assert.deepEqual(cc(), [], 'a From switch does not bring it back');
+      await chooseFrom('account:A');
+      assert.deepEqual(cc(), [], 'nor does switching back');
+    } finally { await close(); }
+  });
+
+  test('after undo send, a From switch replaces the first account\'s automatic Bcc with the second\'s', async () => {
+    const accounts = [account('A', { bcc: ['a-arch@example.invalid'] }), account('B', { bcc: ['b-arch@example.invalid'] })];
+    const close = await sendAndUndo({ to: ['x@example.invalid'], subject: 'Plan' }, { accounts });
+    try {
+      assert.deepEqual(chips('compose.bcc'), ['a-arch@example.invalid'], 'reopened as it was sent');
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.bcc'), ['b-arch@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('after undo send of a reply, Reply All and back to Reply keeps the automatic Bcc', async () => {
+    const close = await sendAndUndo(reply([{ name: '', email: 'thread@example.invalid' }]), { accounts: [account('A', { bcc: [ME] })] });
+    try {
+      assert.deepEqual(chips('compose.bcc'), [ME], 'reopened as it was sent');
+      await switchReplyType('compose.replyAll');
+      await switchReplyType('compose.reply');
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+    } finally { await close(); }
+  });
+
+  test('after undo send, a From switch made while the message was being sent does not change what it reopens with', async () => {
+    const accounts = [account('A', { cc: ['crm-a@example.invalid'] }), account('B', { cc: ['crm-b@example.invalid'] })];
+    const cc = () => chips('compose.cc') ?? [];
+    // The server has not answered yet, and From stays usable while it is sending.
+    const close = await sendAndUndo({ to: ['x@example.invalid'], subject: 'Plan' }, { accounts, whileSending: () => chooseFrom('account:B') });
+    try {
+      assert.deepEqual(cc(), ['crm-a@example.invalid'], 'reopened as it was sent, from A');
+      await chooseFrom('account:B');
+      assert.deepEqual(cc(), ['crm-b@example.invalid'], 'B\'s automatic Cc replaces A\'s');
+    } finally { await close(); }
+  });
+
+  test('after undo send of a message autosaved before Send, a From switch still swaps the automatic Cc', async () => {
+    // A composer open for a while has saved a draft by the time Send is clicked. The undone message
+    // comes back with that draft, but it was never opened from one, so it behaves like its composer.
+    const accounts = [account('A', { cc: ['crm-a@example.invalid'] }), account('B', { cc: ['crm-b@example.invalid'] })];
+    const close = await sendAndUndo({ to: ['x@example.invalid'], subject: 'Plan' }, {
+      accounts,
+      beforeSend: async () => {
+        await editBody('Hi');
+        await hideTab();
+        assert.equal(saved.length, 1, 'precondition: the message was autosaved before Send');
+      },
+    });
+    try {
+      assert.equal(useStore.getState().composeData.draftUid, 8, 'reopened with its draft');
+      assert.deepEqual(chips('compose.cc'), ['crm-a@example.invalid']);
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.cc'), ['crm-b@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('a message undone after an autosave closes like its composer once saved again: without a discard prompt', async () => {
+    const close = await sendAndUndo({ to: ['x@example.invalid'], subject: 'Plan' }, {
+      accounts: [account('A')],
+      beforeSend: async () => { await editBody('Hi'); await hideTab(); },
+    });
+    try {
+      await hideTab(); // the reopened message is newer than its draft, so it is saved
+      assert.equal(saved.length, 2, 'precondition: saved again after it was reopened');
+      await click(document.querySelector('button[title="compose.toolbar.close"]'));
+      assert.equal(useStore.getState().composing, false, 'closed, keeping the draft it saved');
+    } finally { await close(); }
+  });
+
+  test('after undo send of a draft opened from the list, a From switch still adds no automatic Bcc', async () => {
+    // The other side of the two tests above: this one was opened from a draft, so it stays one.
+    const accounts = [account('A', { bcc: ['a-arch@example.invalid'] }), account('B', { bcc: ['b-arch@example.invalid'] })];
+    const close = await sendAndUndo(
+      { accountId: 'A', draftUid: 7, draftFolder: 'Drafts', to: ['x@example.invalid'], subject: 'Plan', body: '<p>Plan</p>' },
+      { accounts },
+    );
+    try {
+      assert.equal(useStore.getState().composeData.draftUid, 7, 'reopened with its draft');
+      assert.equal(chips('compose.bcc'), null, 'no Bcc row: the draft saved none');
+      await chooseFrom('account:B');
+      assert.equal(chips('compose.bcc'), null, 'nor from the account From switches to');
+    } finally { await close(); }
+  });
+
+  test('a From switch keeps a recipient the user added for an automatic address', async () => {
+    const accounts = [account('A', { cc: ['boss@example.invalid'] }), account('B')];
+    const close = await mountCompose({ to: ['x@example.invalid'], subject: 'Plan' }, { accounts });
+    try {
+      await addChip('compose.cc', 'Boss Person <boss@example.invalid>');
+      assert.deepEqual(chips('compose.cc'), ['boss@example.invalid', 'Boss Person <boss@example.invalid>']);
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.cc'), ['Boss Person <boss@example.invalid>'], 'only the automatic chip goes');
+      const sent = await send();
+      assert.equal(sent.accountId, 'B');
+      assert.deepEqual(sent.cc, ['Boss Person <boss@example.invalid>']);
+    } finally { await close(); }
+  });
+
+  test('Reply All to Reply keeps the automatic Bcc, and its row stays while the user edits it', async () => {
+    const close = await mountCompose(
+      replyAll([{ name: '', email: 'thread@example.invalid' }]),
+      { accounts: [account('A', { bcc: [ME] })] },
+    );
+    try {
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+      await switchReplyType('compose.reply');
+      assert.equal(chips('compose.cc'), null, 'the thread\'s Cc goes, as before');
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+      await hideTab();
+      assert.deepEqual(saved.at(-1).bcc, [ME]);
+
+      const input = rowOf('compose.bcc').querySelector('input');
+      await React.act(async () => {
+        input.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+      });
+      assert.deepEqual(chips('compose.bcc'), [], 'Backspace removes the chip but leaves the row');
+    } finally { await close(); }
+  });
+
+  test('sent Reply -> Reply All -> Reply retains external To and only toggles extras', async () => {
+    const { openReplyFromMessage } = await import('../utils/composeFromMessage.js');
+    const owner = account('A');
+    owner.email_address = 'owner@example.test';
+    const to = [{ email: 'first@example.test' }, { email: 'second@example.test' }];
+    const cc = [{ email: 'extra@example.test' }];
+    let data;
+    await openReplyFromMessage({ account_id: 'A', from_email: owner.email_address, reply_to: [{ email: owner.email_address }], to_addresses: to, cc_addresses: cc }, {
+      accounts: [owner], openCompose: p => { data = p; }, getMessageBody: async () => null,
+    });
+    const close = await mountCompose(data, { accounts: [owner] });
+    try {
+      assert.deepEqual(chips('compose.to'), to.map(a => a.email));
+      assert.deepEqual(chips('compose.cc') ?? [], []);
+      await switchReplyType('compose.replyAll');
+      assert.deepEqual(chips('compose.to'), to.map(a => a.email));
+      assert.deepEqual(chips('compose.cc'), cc.map(a => a.email));
+      await switchReplyType('compose.reply');
+      assert.deepEqual(chips('compose.to'), to.map(a => a.email));
+      assert.deepEqual(chips('compose.cc') ?? [], []);
+    } finally { await close(); }
+  });
+
+  test('Reply to Reply All keeps the automatic Cc and leaves no address in both Cc and Bcc', async () => {
+    const close = await mountCompose(reply(THREAD), { accounts: [account('A', BOTH_LISTS)] });
+    try {
+      assert.deepEqual(chips('compose.cc'), ['boss@example.invalid']);
+      assert.deepEqual(chips('compose.bcc'), [PERSONAL]);
+      await switchReplyType('compose.replyAll');
+      assert.deepEqual(chips('compose.cc'), ['thread@example.invalid', PERSONAL, 'boss@example.invalid']);
+      assert.deepEqual(chips('compose.bcc') ?? [], [], 'the thread has it in Cc, so it is not in Bcc as well');
+    } finally { await close(); }
+  });
+
+  test('the mobile Reply and Reply All tabs keep the automatic Bcc as well', () => onMobile(async (tab) => {
+    const close = await mountCompose(
+      replyAll([{ name: '', email: 'thread@example.invalid' }]),
+      { accounts: [account('A', { bcc: [ME] })] },
+    );
+    try {
+      assert.ok(tab('compose.reply'), 'the mobile layout is rendered');
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+      await click(tab('compose.reply'));
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+      await click(tab('compose.replyAll'));
+      assert.deepEqual(chips('compose.cc'), ['thread@example.invalid']);
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+    } finally { await close(); }
+  }));
+
+  test('the mobile Reply All tab keeps the automatic Cc and leaves no address in both Cc and Bcc', () => onMobile(async (tab) => {
+    const close = await mountCompose(reply(THREAD), { accounts: [account('A', BOTH_LISTS)] });
+    try {
+      assert.ok(tab('compose.replyAll'), 'the mobile layout is rendered');
+      assert.deepEqual(chips('compose.cc'), ['boss@example.invalid']);
+      assert.deepEqual(chips('compose.bcc'), [PERSONAL]);
+      await click(tab('compose.replyAll'));
+      assert.deepEqual(chips('compose.cc'), ['thread@example.invalid', PERSONAL, 'boss@example.invalid']);
+      assert.deepEqual(chips('compose.bcc') ?? [], [], 'the thread has it in Cc, so it is not in Bcc as well');
+    } finally { await close(); }
+  }));
+
+  test('Reply All to Reply keeps an automatic Cc that was on the thread', async () => {
+    const close = await mountCompose(
+      replyAll([{ name: '', email: 'archive@example.invalid' }]),
+      { accounts: [account('A', { cc: ['archive@example.invalid'] })] },
+    );
+    try {
+      assert.deepEqual(chips('compose.cc'), ['archive@example.invalid']);
+      await switchReplyType('compose.reply');
+      assert.deepEqual(chips('compose.cc'), ['archive@example.invalid']);
+    } finally { await close(); }
+  });
+
+  test('a From switch after Reply All to Reply takes out the automatic Bcc that Reply placed', async () => {
+    const close = await mountCompose(replyAll(THREAD), { accounts: [account('A', { bcc: [PERSONAL] }), account('B')] });
+    try {
+      assert.equal(chips('compose.bcc'), null, 'Reply All: the thread already has it in Cc');
+      await switchReplyType('compose.reply');
+      assert.deepEqual(chips('compose.bcc'), [PERSONAL]);
+      await chooseFrom('account:B');
+      assert.deepEqual(chips('compose.bcc'), [], 'B has no lists');
+    } finally { await close(); }
+  });
+
+  test('an alias reply opened before accounts load gets the automatic Bcc when they arrive, and stays clean', async () => {
+    const close = await mountCompose({
+      accountId: 'late', aliasId: 'al1', isReply: true, subject: 'Re: Plan', body: '',
+      to: [SENDER], originalFrom: [SENDER], cc: [], allRecipients: [],
+    }, { accounts: [] });
+    try {
+      assert.equal(chips('compose.bcc'), null);
+      await React.act(async () => {
+        useStore.setState({ accounts: [account('late', { bcc: [ME], aliases: [{ id: 'al1', email: 'alias@example.invalid', name: 'Alias' }] })] });
+      });
+      assert.deepEqual(chips('compose.bcc'), [ME]);
+      await hideTab();
+      assert.equal(saved.length, 0);
+    } finally { await close(); }
+  });
+
+  test('under StrictMode the automatic Bcc is applied once and the composer stays clean', async () => {
+    const close = await mountCompose(
+      { to: ['x@example.invalid'], bcc: ['u@example.invalid'] },
+      { accounts: [account('A', { bcc: [ME] })], strict: true },
+    );
+    try {
+      assert.deepEqual(chips('compose.bcc'), ['u@example.invalid', ME]);
+      await hideTab();
+      assert.equal(saved.length, 0);
+    } finally { await close(); }
+  });
+});
+
+describe('opening Cc and Bcc', () => {
+  const account = (id, extra = {}) => ({ id, enabled: true, email_address: `${id}@example.invalid`, name: id, color: '#fff', ...extra });
+
+  async function mountCompose(composeData, accounts) {
+    useStore.setState({ plaintextEmail: false, accounts, selectedAccountId: accounts[0]?.id ?? null, defaultSender: '', composing: false, composeData: null, prepareComposeSwitch: null });
+    useStore.getState().openCompose(composeData);
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(ComposeModal)); });
+    await React.act(async () => {});
+    return () => React.act(async () => root.unmount());
+  }
+  const rowOf = (label) => [...document.querySelectorAll('span')].find(s => s.textContent === label)?.parentElement ?? null;
+  const inputOf = (label) => rowOf(label)?.querySelector('input') ?? null;
+  // The row the cursor is in, by its label. A failed assert.equal on DOM elements prints them
+  // in full, which for a jsdom node is the whole document and React tree.
+  const cursorIn = () => ['compose.to', 'compose.cc', 'compose.bcc'].find(label => inputOf(label) === document.activeElement)
+    ?? document.activeElement?.tagName;
+  const button = (label) => [...document.querySelectorAll('button')].find(b => b.textContent === label);
+  // Returns where the cursor was when the click's handlers returned, before act runs the work
+  // React queued: iOS raises the keyboard only for focus given while it is handling the tap.
+  const click = async (el) => {
+    let cursorDuringClick;
+    await React.act(async () => {
+      el.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+      cursorDuringClick = cursorIn();
+    });
+    return cursorDuringClick;
+  };
+
+  test('the Cc and Bcc buttons open their row with the cursor in it', async () => {
+    const close = await mountCompose({}, [account('A')]);
+    try {
+      assert.equal(cursorIn(), 'compose.to', 'a new message starts in To');
+      assert.equal(await click(button('compose.cc')), 'compose.cc', 'focused during the click');
+      assert.equal(cursorIn(), 'compose.cc');
+      assert.equal(await click(button('compose.bcc')), 'compose.bcc', 'focused during the click');
+      assert.equal(cursorIn(), 'compose.bcc');
+    } finally { await close(); }
+  });
+
+  test('on a phone, Cc and Bcc picked from the menu open with the cursor in them', async () => {
+    const width = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 375 });
+    const close = await mountCompose({}, [account('A')]);
+    // The phone layout puts Cc and Bcc in a menu behind the chevron at the end of the To row.
+    const chevron = () => [...rowOf('compose.to').children].find(el => el.tagName === 'BUTTON');
+    try {
+      assert.ok(chevron(), 'the phone layout is rendered');
+      await click(chevron());
+      assert.equal(await click(button('compose.cc')), 'compose.cc', 'focused during the tap');
+      assert.equal(cursorIn(), 'compose.cc');
+      await click(chevron());
+      assert.equal(await click(button('compose.bcc')), 'compose.bcc', 'focused during the tap');
+      assert.equal(cursorIn(), 'compose.bcc');
+    } finally {
+      await close();
+      Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: width });
+    }
+  });
+
+  test('a row the account opens by itself leaves the cursor where it is', async () => {
+    // Opened before the accounts load: the account's automatic Bcc row appears when they
+    // arrive, which can be while the user is already typing.
+    const close = await mountCompose({ accountId: 'late', aliasId: 'al1' }, []);
+    try {
+      await click(button('compose.cc'));
+      assert.equal(cursorIn(), 'compose.cc');
+      await React.act(async () => {
+        useStore.setState({ accounts: [account('late', {
+          auto_bcc_addresses: ['me@example.invalid'],
+          aliases: [{ id: 'al1', email: 'alias@example.invalid', name: 'Alias' }],
+        })] });
+      });
+      assert.ok(inputOf('compose.bcc'), 'the automatic Bcc row opened');
+      assert.equal(cursorIn(), 'compose.cc', 'and the cursor stayed in Cc');
+    } finally { await close(); }
+  });
+});
+
+describe('undo send', () => {
+  // Mounted the way MailApp mounts it, so closing the composer unmounts it and reopening it
+  // mounts a fresh one from the store's composeData.
+  const Host = () => (useStore(s => s.composing) ? React.createElement(ComposeModal) : null);
+  const posted = [];
+  const deleted = [];
+  const cancels = [];
+  let unmount;
+  before(async () => {
+    useStore.setState({
+      plaintextEmail: false, composing: false, composeData: null, prepareComposeSwitch: null,
+      notifications: [],
+      accounts: [{ id: 'acct', enabled: true, email_address: 'me@example.invalid', name: 'Me', color: '#fff' }],
+    });
+    api.post = async (path, payload) => {
+      posted.push({ path, payload });
+      return { ok: true, pending: true, pendingId: 'p1', sendAt: new Date(Date.now() + 10_000).toISOString(), remainingMs: 9_500 };
+    };
+    api.deleteDraft = async (...args) => { deleted.push(args); return { ok: true }; };
+    api.cancelSend = async (id) => { cancels.push(id); return { cancelled: true }; };
+    api.getSendStatus = async () => ({ status: 'pending' });
+    useStore.getState().openCompose({
+      accountId: 'acct',
+      draftUid: 7,
+      draftFolder: 'Drafts',
+      to: ['Bob <bob@example.invalid>'],
+      cc: [],
+      subject: 'Contract',
+      body: '<p>Here it is.</p>',
+      attachments: [{ name: 'contract.pdf', size: 3, type: 'application/pdf', data: 'QUJD' }],
+      priority: 'high',
+    });
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(Host)); });
+    await React.act(async () => {});
+    unmount = () => React.act(async () => root.unmount());
+  });
+  after(() => unmount());
+
+  test('Send hands the message to the server with an undo window and closes the composer', async () => {
+    const send = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'compose.send');
+    await React.act(async () => { send.click(); });
+    await React.act(async () => {});
+    assert.equal(posted.length, 1);
+    const { payload } = posted[0];
+    assert.equal(payload.undoSeconds, 10);
+    assert.deepEqual(payload.draft, { uid: 7, folder: 'Drafts', accountId: 'acct' });
+    assert.equal(payload.attachments[0].filename, 'contract.pdf');
+    assert.equal(payload.priority, 'high');
+    assert.equal(useStore.getState().composing, false);
+    assert.deepEqual(deleted, [], 'the draft stays until the server has delivered the message');
+    const bar = useStore.getState().notifications.find(n => n.onUndo);
+    assert.equal(bar.title, 'compose.undoSend.sending', 'the bar names the message (its subject)');
+    assert.equal(bar.undoMs, 9_500, 'Undo lasts what the server said was left');
+  });
+
+  test('Undo gives the message back as it was sent, attachments included', async () => {
+    const bar = useStore.getState().notifications.find(n => n.onUndo);
+    await React.act(async () => { await bar.onUndo(); });
+    await React.act(async () => {});
+    assert.deepEqual(cancels, ['p1']);
+    assert.equal(useStore.getState().composing, true);
+    const data = useStore.getState().composeData;
+    assert.equal(data.subject, 'Contract');
+    assert.deepEqual(data.to, ['Bob <bob@example.invalid>']);
+    assert.equal(data.priority, 'high');
+    assert.equal(data.draftUid, 7);
+    assert.match(document.body.textContent, /contract\.pdf/, 'the attachment is back in the composer');
+    assert.match(document.querySelector('.ProseMirror').editor.getHTML(), /Here it is\./);
+  });
+
+  test('the reopened message counts as unsaved, so its draft is brought up to date', async () => {
+    saved.length = 0;
+    await hideTab();
+    assert.equal(saved.length, 1, 'saved although nothing was typed since it reopened');
+    assert.equal(saved[0].existingUid, 7);
+    assert.equal(saved[0].subject, 'Contract');
+  });
+
+  test('a server without undo send delivers at once, and the draft is deleted from here', async () => {
+    posted.length = 0;
+    api.post = async (path, payload) => { posted.push({ path, payload }); return { ok: true }; };
+    const send = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'compose.send');
+    await React.act(async () => { send.click(); });
+    await React.act(async () => {});
+    assert.equal(useStore.getState().composing, false);
+    assert.deepEqual(deleted, [['acct', 8, 'Drafts']], 'the copy saved after the undo');
+    assert.equal(useStore.getState().notifications[0].title, 'compose.sent.title');
+  });
+});
+
+describe('undo send, message without attachments', () => {
+  // With nothing to set it apart from its draft, only being a reopened message keeps it from
+  // looking saved: closing it would then drop whatever was typed after the last autosave.
+  const Host = () => (useStore(s => s.composing) ? React.createElement(ComposeModal) : null);
+  let unmount;
+  before(async () => {
+    useStore.setState({ plaintextEmail: false, notifications: [] });
+    api.post = async () => ({ ok: true, pending: true, pendingId: 'p2', sendAt: new Date(Date.now() + 10_000).toISOString() });
+    api.cancelSend = async () => ({ cancelled: true });
+    useStore.getState().openCompose({
+      accountId: 'acct', draftUid: 9, draftFolder: 'Drafts',
+      to: ['Bob <bob@example.invalid>'], cc: [], subject: 'Plan', body: '<p>Typed after the last autosave.</p>',
+    });
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(Host)); });
+    await React.act(async () => {});
+    unmount = () => React.act(async () => root.unmount());
+  });
+  after(() => unmount());
+
+  test('the reopened message still counts as unsaved', async () => {
+    const send = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'compose.send');
+    await React.act(async () => { send.click(); });
+    await React.act(async () => {});
+    const bar = useStore.getState().notifications.find(n => n.onUndo);
+    await React.act(async () => { await bar.onUndo(); });
+    await React.act(async () => {});
+    saved.length = 0;
+    await hideTab();
+    assert.equal(saved.length, 1, 'saved although nothing was typed since it reopened');
+    assert.equal(saved[0].existingUid, 9);
+    assert.match(saved[0].body, /Typed after the last autosave\./);
+  });
+});
+
+describe('undo send while another message is being written', () => {
+  // Keyed the way MailApp keys it.
+  const Host = () => {
+    const composing = useStore(s => s.composing);
+    const session = useStore(s => s.composeSession);
+    return composing ? React.createElement(ComposeModal, { key: session }) : null;
+  };
+  let unmount;
+  let next = 0;
+  before(async () => {
+    useStore.setState({ plaintextEmail: false, notifications: [], composing: false, composeData: null });
+    api.post = async () => ({ ok: true, pending: true, pendingId: `p-${++next}`, sendAt: new Date(Date.now() + 10_000).toISOString(), remainingMs: 10_000 });
+    api.cancelSend = async () => ({ cancelled: true });
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(Host)); });
+    unmount = () => React.act(async () => root.unmount());
+  });
+  after(async () => {
+    // Signing out stops following the held sends, as it must for the next user of the tab.
+    await React.act(async () => { useStore.setState({ user: { id: 'someone-else' } }); });
+    assert.equal(useStore.getState().notifications.some(n => n.heldSendId), false, 'no Undo bar is left behind');
+    await unmount();
+  });
+
+  const subjectField = () => document.querySelector('input[placeholder="compose.subject"]');
+  const sendButton = () => [...document.querySelectorAll('button')].find(b => /compose\.(send|sending)$/.test(b.textContent.trim()));
+  async function write(subject) {
+    await React.act(async () => {
+      useStore.getState().openCompose({ accountId: 'acct', to: ['Bob <bob@example.invalid>'], cc: [], subject, body: `<p>${subject} body</p>` });
+    });
+    await React.act(async () => {});
+  }
+  async function send() {
+    await React.act(async () => { sendButton().click(); });
+    await React.act(async () => {});
+  }
+
+  test('the undone message opens as itself once the open one is sent', async () => {
+    await write('Plan A');
+    await send();
+    const undoA = useStore.getState().notifications.find(n => n.onUndo);
+    await write('Plan B');
+    await React.act(async () => { await undoA.onUndo(); });
+    assert.equal(subjectField().value, 'Plan B', 'the message being written is left alone');
+
+    await send();
+    assert.equal(useStore.getState().composeData.subject, 'Plan A');
+    assert.equal(subjectField().value, 'Plan A', 'the screen shows the reopened message, not the one just sent');
+    assert.equal(sendButton().textContent.trim(), 'compose.send', 'and it can be sent again');
+    assert.equal(sendButton().disabled, false);
+  });
+});
+
+describe('Reply with AI', () => {
+  const ANA = { name: 'Ana', email: 'ana@example.invalid' };
+  const thread = [
+    { id: 'm1', message_id: '<m1@example.invalid>', thread_id: '<m1@example.invalid>', date: '2026-10-01T10:00:00Z', from_name: 'Ana', from_email: ANA.email },
+    { id: 'm2', message_id: '<m2@example.invalid>', thread_id: '<m1@example.invalid>', date: '2026-10-02T10:00:00Z', from_name: 'Me', from_email: 'me@example.invalid' },
+    { id: 'm3', message_id: '<m3@example.invalid>', thread_id: '<m1@example.invalid>', date: '2026-10-03T10:00:00Z', from_name: 'Ana', from_email: ANA.email },
+  ];
+  const bodies = {
+    m1: { text: 'Here is the artwork for the new box.' },
+    m2: { text: 'Could the logo be bigger?\n\nOn Thu, Oct 1, 2026 at 10:00 AM Ana <ana@example.invalid> wrote:\n> Here is the artwork for the new box.' },
+    m3: { text: 'Done, the logo is bigger now. Can you approve?' },
+  };
+  const real = {};
+  const chats = [];
+  const purposes = [];
+  let refusal = null;
+  let threadLoads = 0;
+  let answer = '';
+  let unmount;
+
+  const button = (text) => [...document.querySelectorAll('button')].find(b => b.textContent.trim() === text);
+  const press = (el) => React.act(async () => { el.dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true })); });
+  const click = (el) => React.act(async () => { el.dispatchEvent(new window.MouseEvent('click', { bubbles: true })); });
+  const instructionField = () => document.querySelector('input[aria-label="compose.toolbar.aiReplyInstruction"]');
+  async function typeInto(input, text) {
+    const setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    await React.act(async () => {
+      setValue.call(input, text);
+      input.dispatchEvent(new window.Event('input', { bubbles: true }));
+    });
+  }
+  async function openAiMenu() {
+    await press(document.querySelector('button[title="compose.toolbar.aiAssist"]'));
+  }
+  async function mount(composeData) {
+    useStore.setState({ plaintextEmail: false, composing: false, composeData: null });
+    useStore.getState().openCompose(composeData);
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(ComposeModal)); });
+    await React.act(async () => {});
+    unmount = () => React.act(async () => root.unmount());
+  }
+
+  before(() => {
+    Object.assign(real, { status: api.ai.status, chat: api.ai.chat, getThread: api.getThread, getMessageBody: api.getMessageBody, resolveMessage: api.resolveMessage });
+    api.ai.status = async () => ({ enabled: true, features: { compose: true, summarize: true } });
+    api.ai.chat = async (messages, { purpose, onDelta } = {}) => {
+      chats.push(messages);
+      purposes.push(purpose);
+      if (refusal) throw Object.assign(new Error('refused'), { status: 403, ...refusal });
+      onDelta?.(answer.slice(0, 5));
+      return answer;
+    };
+    api.getThread = async () => { threadLoads++; return { messages: thread }; };
+    api.getMessageBody = async (id) => bodies[id];
+    api.resolveMessage = async (ref) => thread.find(m => m.message_id === ref) ?? null;
+    useStore.setState({
+      user: { id: 'u1' },
+      accounts: [{ id: 'acct', enabled: true, email_address: 'me@example.invalid', name: 'Me', color: '#fff' }],
+    });
+  });
+  after(() => {
+    api.ai.status = real.status;
+    api.ai.chat = real.chat;
+    api.getThread = real.getThread;
+    api.getMessageBody = real.getMessageBody;
+    api.resolveMessage = real.resolveMessage;
+  });
+
+  describe('in a reply', () => {
+    // Opened the way a reply from the ungrouped list is: without the thread id, which that list
+    // does not load.
+    before(() => mount({
+      accountId: 'acct', isReply: true, subject: 'Re: Artwork', body: '', cc: [],
+      to: [ANA], originalFrom: [ANA], inReplyTo: '<m3@example.invalid>',
+      quotedBody: '\n\n---\nOn 10/3/2026, Ana wrote:\n> Done, the logo is bigger now. Can you approve?',
+      quotedBodyHtml: '<div><p>Done, the logo is bigger now. Can you approve?</p></div>',
+    }));
+    after(() => unmount());
+
+    test('writes the reply from the conversation and the instruction', async () => {
+      await openAiMenu();
+      assert.equal(button('compose.toolbar.aiWriteDraft'), undefined, 'a reply offers Reply with AI, not a draft that ignores the conversation');
+      await press(button('compose.toolbar.aiReply'));
+      assert.equal(chats.length, 0, 'nothing is asked before the instruction is given');
+      await typeInto(instructionField(), 'approve it');
+      answer = 'Hi Ana,\n\nApproved, thank you.';
+      await click(button('compose.toolbar.aiReplyGenerate'));
+      await React.act(async () => {});
+
+      assert.equal(chats.length, 1);
+      const request = chats[0].map(m => m.content).join('\n');
+      assert.equal(request.split('Here is the artwork for the new box.').length - 1, 1, 'once: the quote under a reply is not sent again');
+      assert.match(request, /<<<EMAIL [0-9a-f]{24} 2 of 3; written by the user>>>\nFrom: Me <me@example\.invalid>\n[\s\S]*Could the logo be bigger\?/);
+      assert.match(request, /; the one being answered>>>[\s\S]*Can you approve\?/);
+      assert.deepEqual(chats[0].at(-1), { role: 'user', content: 'Instruction for the reply: approve it' }, 'the instruction in its own message');
+      assert.equal(purposes.at(-1), 'reply', 'asked for under both switches: a draft written from received mail');
+      assert.match(document.body.textContent, /Approved, thank you\./, 'the suggestion is shown');
+    });
+
+    test('Apply puts the reply in the editor and keeps the quoted message', async () => {
+      await click(button('compose.toolbar.aiApply'));
+      const editor = document.querySelector('.ProseMirror').editor;
+      assert.equal(editor.getHTML(), '<p>Hi Ana,</p><p></p><p>Approved, thank you.</p>', 'the blank line between paragraphs is kept');
+      assert.equal(instructionField(), null, 'the panel closes');
+      assert.match(document.body.textContent, /Done, the logo is bigger now\. Can you approve\?/, 'the quoted original is still there');
+    });
+
+    test('rewording the instruction asks again without reloading the conversation', async () => {
+      await openAiMenu();
+      await press(button('compose.toolbar.aiReply'));
+      await typeInto(instructionField(), 'approve it');
+      await click(button('compose.toolbar.aiReplyGenerate'));
+      await React.act(async () => {});
+      await typeInto(instructionField(), 'approve it, and ask for the print date');
+      await click(button('message.aiRegenerate'));
+      await React.act(async () => {});
+      assert.equal(chats.length, 3);
+      assert.equal(chats[2].at(-1).content, 'Instruction for the reply: approve it, and ask for the print date');
+      assert.equal(threadLoads, 1, 'the conversation was read once');
+    });
+
+    test('markup in the suggestion stays text, so an email cannot put a link into the reply', async () => {
+      answer = 'Approved. Pay at <a href="https://evil.example">the portal</a>.';
+      await click(button('message.aiRegenerate'));
+      await React.act(async () => {});
+      await click(button('compose.toolbar.aiApply'));
+      const editor = document.querySelector('.ProseMirror').editor;
+      assert.equal(document.querySelectorAll('.ProseMirror a').length, 0, 'no link was created');
+      assert.equal(editor.getText(), 'Approved. Pay at <a href="https://evil.example">the portal</a>.');
+    });
+
+    // Reply with AI needs two switches, so the refusal says which one is off (#577 review).
+    test('a refusal names the switch that is off, and is announced', async () => {
+      await openAiMenu();
+      await press(button('compose.toolbar.aiReply'));
+      const cases = [
+        [{ code: 'ai_feature_disabled', feature: 'summarize' }, 'message.aiFeatureOff'],
+        [{ code: 'ai_feature_disabled', feature: 'compose' }, 'compose.toolbar.aiFeatureOff'],
+        [{ code: 'ai_user_disabled' }, 'compose.toolbar.aiNotAllowed'],
+      ];
+      for (const [refused, key] of cases) {
+        refusal = refused;
+        try {
+          await click(button('compose.toolbar.aiReplyGenerate') || button('message.aiRegenerate'));
+          await React.act(async () => {});
+        } finally { refusal = null; }
+        assert.equal(document.querySelector('[role="alert"]')?.textContent, `compose.toolbar.aiError ${key}`);
+      }
+    });
+
+    test('says what it is doing in a live region', async () => {
+      let release;
+      api.ai.chat = (messages, { onDelta } = {}) => new Promise((resolve) => { release = () => { onDelta?.('Hi'); resolve('Hi'); }; });
+      try {
+        await click(button('message.aiRegenerate'));
+        await React.act(async () => {});
+        const status = document.querySelector('[role="status"]');
+        assert.equal(status?.getAttribute('aria-live'), 'polite');
+        assert.equal(status.textContent, 'compose.toolbar.aiGenerating');
+        await React.act(async () => { release(); });
+      } finally {
+        api.ai.chat = async (messages, { purpose, onDelta } = {}) => {
+          chats.push(messages);
+          purposes.push(purpose);
+          if (refusal) throw Object.assign(new Error('refused'), { status: 403, ...refusal });
+          onDelta?.(answer.slice(0, 5));
+          return answer;
+        };
+      }
+    });
+  });
+
+  describe('in a reply, with summaries off', () => {
+    before(async () => {
+      api.ai.status = async () => ({ enabled: true, features: { compose: true, summarize: false } });
+      await mount({
+        accountId: 'acct', isReply: true, subject: 'Re: Artwork', body: '', cc: [],
+        to: [ANA], originalFrom: [ANA], inReplyTo: '<m3@example.invalid>',
+      });
+    });
+    after(async () => {
+      await unmount();
+      api.ai.status = async () => ({ enabled: true, features: { compose: true, summarize: true } });
+    });
+
+    // As the reading pane and the conversation view offer no Reply with AI then (#577 review).
+    test('offers Write draft, not Reply with AI', async () => {
+      await openAiMenu();
+      assert.ok(button('compose.toolbar.aiWriteDraft'));
+      assert.equal(button('compose.toolbar.aiReply'), undefined);
+    });
+  });
+
+  describe('on a conversation too long for one request', () => {
+    let realBody;
+    before(async () => {
+      realBody = api.getMessageBody;
+      // The message being answered alone is longer than one AI request.
+      api.getMessageBody = async (id) => (id === 'm3' ? { text: 'A clause of the contract.\n\n'.repeat(3_000) } : bodies[id]);
+      await mount({
+        accountId: 'acct', isReply: true, subject: 'Re: Artwork', body: '', cc: [],
+        to: [ANA], originalFrom: [ANA], inReplyTo: '<m3@example.invalid>',
+      });
+    });
+    after(async () => {
+      await unmount();
+      api.getMessageBody = realBody;
+    });
+
+    test('tells the model what was cut, and says under the suggestion that it is partial', async () => {
+      await openAiMenu();
+      await press(button('compose.toolbar.aiReply'));
+      answer = 'Hi Ana,\n\nApproved.';
+      await click(button('compose.toolbar.aiReplyGenerate'));
+      await React.act(async () => {});
+      const request = chats.at(-1)[1].content;
+      assert.ok(request.length <= 32_000, `${request.length}`);
+      assert.match(request, /; only its first \d+ of \d+ characters are included, to fit the AI request size limit>>>/);
+      assert.match(document.body.textContent, /compose\.toolbar\.aiReplyPartial/);
+    });
+  });
+
+  describe('on a thread longer than the messages it reads', () => {
+    const stubs = {};
+    before(async () => {
+      Object.assign(stubs, { getThread: api.getThread, getMessageBody: api.getMessageBody });
+      const long = Array.from({ length: 12 }, (_, i) => ({
+        id: `l${i}`, message_id: `<l${i}@example.invalid>`, thread_id: '<l0@example.invalid>',
+        date: new Date(Date.UTC(2026, 9, 1 + i)).toISOString(), from_name: 'Ana', from_email: ANA.email,
+      }));
+      api.getThread = async () => ({ messages: long });
+      api.getMessageBody = async (id) => ({ text: `Body of ${id}.` });
+      await mount({
+        accountId: 'acct', isReply: true, subject: 'Re: Artwork', body: '', cc: [], threadId: '<l0@example.invalid>',
+        to: [ANA], originalFrom: [ANA], inReplyTo: '<l11@example.invalid>',
+      });
+    });
+    after(async () => {
+      await unmount();
+      Object.assign(api, stubs);
+    });
+
+    test('says the older messages were left out, not that they were too long to send', async () => {
+      await openAiMenu();
+      await press(button('compose.toolbar.aiReply'));
+      answer = 'Hi Ana,\n\nApproved.';
+      await click(button('compose.toolbar.aiReplyGenerate'));
+      await React.act(async () => {});
+      assert.match(chats.at(-1)[1].content, /\(oldest first; 2 earlier emails left out\):/);
+      assert.match(document.body.textContent, /compose\.toolbar\.aiReplyLeftOut/);
+      assert.doesNotMatch(document.body.textContent, /compose\.toolbar\.aiReplyPartial/);
+    });
+  });
+
+  describe("opened by the message view's Reply with AI", () => {
+    const opened = {
+      accountId: 'acct', isReply: true, aiReply: true, subject: 'Re: Artwork', body: '', cc: [],
+      to: [ANA], originalFrom: [ANA], inReplyTo: '<m3@example.invalid>',
+      quotedBody: '\n\n---\nOn 10/3/2026, Ana wrote:\n> Done, the logo is bigger now. Can you approve?',
+    };
+    const stubs = {};
+    let asked;
+    before(async () => {
+      asked = chats.length;
+      Object.assign(stubs, { post: api.post, cancelSend: api.cancelSend, getSendStatus: api.getSendStatus });
+      api.post = async () => ({ ok: true, pending: true, pendingId: 'p-ai', sendAt: new Date(Date.now() + 10_000).toISOString(), remainingMs: 10_000 });
+      api.cancelSend = async () => ({ cancelled: true });
+      api.getSendStatus = async () => ({ status: 'pending' });
+      useStore.setState({ user: { id: 'u1' }, notifications: [] });
+      await mount(opened);
+    });
+    after(async () => {
+      await unmount();
+      Object.assign(api, stubs);
+    });
+
+    test('opens with the instruction field ready, and the focus in it', async () => {
+      assert.ok(instructionField(), 'the panel is open');
+      // Compared by label: a failed comparison of two elements would print the whole DOM.
+      assert.equal(document.activeElement?.getAttribute('aria-label'), 'compose.toolbar.aiReplyInstruction', 'typing goes to the instruction, not the reply');
+      assert.equal(chats.length, asked, 'nothing is asked before the instruction is given');
+    });
+
+    test('a message reopened by Undo does not open the panel again', async () => {
+      const editor = document.querySelector('.ProseMirror').editor;
+      await React.act(async () => { editor.commands.setContent('<p>Approved.</p>'); });
+      await click(button('compose.send'));
+      await React.act(async () => {});
+      const undo = useStore.getState().notifications.find(n => n.onUndo);
+      assert.ok(undo, 'the send is held with Undo');
+      await React.act(async () => { await undo.onUndo(); });
+      const reopened = useStore.getState().composeData;
+      assert.equal(reopened.restored, true, 'precondition: the message was reopened');
+      assert.equal(reopened.aiReply, undefined);
+    });
+  });
+
+  describe('with a signature', () => {
+    let accountsBefore;
+    before(async () => {
+      accountsBefore = useStore.getState().accounts;
+      useStore.setState({ accounts: [{ id: 'acct', enabled: true, email_address: 'me@example.invalid', name: 'Me', sender_name: 'Jordan Lee', color: '#fff', signature: '<p>Jordan Lee<br>Purchasing</p>' }] });
+      await mount({
+        accountId: 'acct', isReply: true, subject: 'Re: Artwork', body: '', cc: [],
+        to: [ANA], originalFrom: [ANA], inReplyTo: '<m3@example.invalid>',
+      });
+    });
+    after(async () => {
+      await unmount();
+      useStore.setState({ accounts: accountsBefore });
+    });
+    const ask = async () => {
+      await openAiMenu();
+      await press(button('compose.toolbar.aiReply'));
+      await click(button('compose.toolbar.aiReplyGenerate'));
+      await React.act(async () => {});
+      return chats.at(-1)[0].content;
+    };
+
+    test('leaves the closing to the signature the composer adds', async () => {
+      assert.match(await ask(), /Do not add a signature/);
+    });
+
+    test('signs with the sender\'s name once the signature is turned off for this message', async () => {
+      await click(document.querySelector('button[title="compose.insertSignature"]'));
+      assert.equal(document.querySelector('button[title="compose.insertSignature"]').getAttribute('aria-pressed'), 'false', 'precondition: the signature is off');
+      assert.match(await ask(), /Sign off with the name Jordan Lee\./);
+    });
+  });
+
+  describe('in a new message', () => {
+    before(() => mount({ accountId: 'acct', to: ['Bob <bob@example.invalid>'], cc: [], subject: 'Quote', body: '' }));
+    after(() => unmount());
+
+    test('Reply with AI is not offered, since there is nothing to reply to', async () => {
+      await openAiMenu();
+      assert.ok(button('compose.toolbar.aiWriteDraft'), 'the AI menu is open');
+      assert.equal(button('compose.toolbar.aiReply'), undefined);
+    });
+
+    test('Write draft writes from the subject and recipients, without asking for an instruction', async () => {
+      const asked = chats.length;
+      answer = 'Hi Bob,\n\nCould you send a quote?';
+      await press(button('compose.toolbar.aiWriteDraft'));
+      await React.act(async () => {});
+      assert.equal(instructionField(), null);
+      assert.equal(chats.length, asked + 1);
+      assert.match(chats.at(-1)[1].content, /^Subject: Quote\nTo: Bob <bob@example\.invalid>/);
+      assert.equal(purposes.at(-1), 'compose');
+    });
+  });
+});
+
+describe('pasting text copied from an email', () => {
+  // What Chrome puts on the clipboard for a phrase copied out of an email shown as sent: the
+  // words wrapped in the frame's white page and #1a1a1a text. utils/editorPaste.editor.test.js
+  // covers the other shapes a copy takes; this checks the composer is wired to drop the colors.
+  const COPIED = `<meta charset='utf-8'><span style="color: rgb(26, 26, 26); font-family: -apple-system, Arial, sans-serif; font-size: 14px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(255, 255, 255); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial; display: inline !important; float: none;">ice resurfacer is booked for</span>`;
+  const Host = () => (useStore(s => s.composing) ? React.createElement(ComposeModal) : null);
+  const posted = [];
+  let unmount;
+  before(async () => {
+    useStore.setState({
+      plaintextEmail: false, notifications: [], composing: false, composeData: null,
+      accounts: [{ id: 'acct', enabled: true, email_address: 'me@example.invalid', name: 'Me', color: '#fff' }],
+    });
+    api.post = async (path, payload) => { posted.push({ path, payload }); return { ok: true }; };
+    useStore.getState().openCompose({ accountId: 'acct', to: ['Bob <bob@example.invalid>'], cc: [], subject: 'Rink', body: '' });
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(Host)); });
+    await React.act(async () => {});
+    unmount = () => React.act(async () => root.unmount());
+  });
+  after(() => unmount());
+
+  test('the message is sent without the colors of the email the text came from', async () => {
+    const editor = document.querySelector('.ProseMirror').editor;
+    // An explicit event, because jsdom has no ClipboardEvent for prosemirror-view to construct.
+    await React.act(async () => { editor.view.pasteHTML(COPIED, new window.Event('paste')); });
+    const send = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'compose.send');
+    await React.act(async () => { send.click(); });
+    await React.act(async () => {});
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].path, '/mail/send');
+    assert.match(posted[0].payload.body, /ice resurfacer is booked for/);
+    assert.doesNotMatch(posted[0].payload.body, /background-color|(?<![\w-])color\s*:/);
+  });
+});
+
+describe('pasting into the signature and the quoted message', () => {
+  // What Chrome puts on the clipboard for two paragraphs copied out of the message pane: each <p>
+  // carries the email frame's white page and #1a1a1a text. utils/contentEditablePaste.test.js
+  // covers the other shapes a copy takes; this checks both areas are wired to drop the colors.
+  const PAGE = 'color: rgb(26, 26, 26); font-family: -apple-system, Arial, sans-serif; font-size: 14px; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; font-weight: 400; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; white-space: normal; background-color: rgb(255, 255, 255); text-decoration-thickness: initial; text-decoration-style: initial; text-decoration-color: initial;';
+  const COPIED = `<meta charset='utf-8'><p id="p1" style="${PAGE}">Hi Marty,</p><p id="p2" style="${PAGE}">The ice resurfacer is booked.</p>`;
+  const Host = () => (useStore(s => s.composing) ? React.createElement(ComposeModal) : null);
+  const posted = [];
+
+  // jsdom has no editing, so this stands in for the browser twice: insertHTML puts its HTML at
+  // the caret and fires input, and a paste the page does not cancel inserts the clipboard's HTML
+  // as it is, which is what the browser's own paste keeps of the colors.
+  function insertAtCaret(target, html) {
+    const selection = window.getSelection();
+    let range = selection.rangeCount ? selection.getRangeAt(0) : null;
+    if (!range || !target.contains(range.commonAncestorContainer)) {
+      range = document.createRange();
+      range.selectNodeContents(target);
+      range.collapse(false);
+    }
+    range.deleteContents();
+    range.insertNode(range.createContextualFragment(html));
+    target.dispatchEvent(new window.Event('input', { bubbles: true }));
+  }
+  function paste(target, html) {
+    document.execCommand = (command, showUi, value) => {
+      if (command !== 'insertHTML') return false;
+      insertAtCaret(target, value);
+      return true;
+    };
+    try {
+      const event = new window.Event('paste', { bubbles: true, cancelable: true });
+      event.clipboardData = { getData: type => (type === 'text/html' ? html : '') };
+      target.dispatchEvent(event);
+      if (!event.defaultPrevented) insertAtCaret(target, html);
+    } finally {
+      delete document.execCommand;
+    }
+  }
+
+  // Opens a reply with a signature and a quoted message, pastes the copy into both, and sends it.
+  // Returns the payload the server was sent.
+  async function pasteAndSend({ phone }) {
+    posted.length = 0;
+    useStore.setState({
+      plaintextEmail: false, notifications: [], composing: false, composeData: null,
+      accounts: [{ id: 'acct', enabled: true, email_address: 'me@example.invalid', name: 'Me', color: '#fff', signature: '<p>Marty Example</p>' }],
+    });
+    api.post = async (path, payload) => { posted.push({ path, payload }); return { ok: true }; };
+    useStore.getState().openCompose({
+      accountId: 'acct', isReply: true, to: ['Bob <bob@example.invalid>'], cc: [], subject: 'Re: Rink', body: '',
+      quotedBodyHtml: '<p>Original message</p>',
+    });
+    const width = window.innerWidth;
+    if (phone) Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 375 });
+    const root = createRoot(document.getElementById('root'));
+    try {
+      await React.act(async () => { root.render(React.createElement(Host)); });
+      await React.act(async () => {});
+      const buttons = () => [...document.querySelectorAll('button')];
+      // Only the phone layout shows Reply and Reply All side by side.
+      assert.equal(buttons().some(b => b.textContent === 'compose.replyAll'), phone, 'precondition: the layout under test is rendered');
+      const editable = (text) => [...document.querySelectorAll('[contenteditable]')].find(el => el.textContent.includes(text));
+      const signature = editable('Marty Example');
+      const quoted = editable('Original message');
+      assert.ok(signature && quoted, 'precondition: the signature and the quoted message are editable');
+      await React.act(async () => { paste(signature, COPIED); });
+      await React.act(async () => { paste(quoted, COPIED); });
+      await React.act(async () => { buttons().find(b => b.textContent.trim() === 'compose.send').click(); });
+      await React.act(async () => {});
+      assert.equal(posted.length, 1);
+      return posted[0].payload;
+    } finally {
+      await React.act(async () => root.unmount());
+      Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: width });
+    }
+  }
+
+  function assertNoCopiedColor({ editedSignature, quotedBodyHtml }) {
+    for (const [name, html] of [['signature', editedSignature], ['quoted message', quotedBodyHtml]]) {
+      assert.match(html, /The ice resurfacer is booked\./, `the paste reached the ${name}`);
+      assert.doesNotMatch(html, /background-color|(?<![\w-])color\s*:/, `the ${name} carries no copied color`);
+    }
+  }
+
+  test('the reply is sent without the colors of the email the text came from', async () => {
+    assertNoCopiedColor(await pasteAndSend({ phone: false }));
+  });
+
+  test('and so it is from the phone layout, which has its own quoted message', async () => {
+    assertNoCopiedColor(await pasteAndSend({ phone: true }));
   });
 });

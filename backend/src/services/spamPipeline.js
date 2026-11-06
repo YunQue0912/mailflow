@@ -7,7 +7,7 @@
 // Layers (design §2 / §9):
 //   3. messages.spam_user_override — ALWAYS wins, skip if set (user intent)
 //   2. per-user MNB model — active when training_records >= 50
-//   1. 14-rule engine — always on, sole classifier below 50 records
+//   1. 15-rule engine — always on, sole classifier below 50 records
 //
 // The move is delegated to the caller via an injected `imap` facade so this
 // module never imports imapManager (avoids an import cycle mail.js ↔ index):
@@ -156,7 +156,7 @@ export async function classifyAndTagMessage(messageId, opts = {}) {
     rulesFired: rules.fired.map(r => ({ name: r.name, weight: r.weight })),
     mlProbability: mlProbability == null ? null : round(mlProbability),
     mlConfidence: mlConfidence == null ? null : round(mlConfidence),
-    topTokens: extractTopTokens(model, tokens, 5).map(t => ({
+    topTokens: extractTopTokens(model, tokens, 5, flagFeatures).map(t => ({
       token: t.token,
       contribution: round(t.contribution),
     })),
@@ -218,19 +218,12 @@ async function autoMove(row, spamFolder, imap, messageId) {
         [spamFolder, newUid, messageId],
       );
     } else {
-      // Non-UIDPLUS server: DB holds the stale source UID at the destination.
-      // Guard it so reconcileDeletes does not treat it as an orphan before the
-      // next sync corrects it — the same guard the manual /spam path applies in
-      // routes/mail.js, mirrored here so an auto-moved verdict survives reconcile.
-      imap._guardMoveUid?.(row.account_id, spamFolder, row.uid);
-      await query(
-        'UPDATE messages SET folder = $1 WHERE id = $2',
-        [spamFolder, messageId],
-      );
-      setTimeout(
-        () => imap._unguardMoveUid?.(row.account_id, spamFolder, row.uid),
-        10_000,
-      );
+      // The new uid is not known, and the source uid can belong to another message in the spam
+      // folder (#665), as in the manual /spam path: drop the row rather than keep it on that uid,
+      // and let a sync of the spam folder file the message under its real one.
+      await query('DELETE FROM messages WHERE id = $1', [messageId]);
+      Promise.resolve(imap.syncFolderOnDemand?.({ id: row.account_id }, spamFolder))
+        .catch(err => console.warn(`Sync of ${spamFolder} after an auto-move without a new uid failed: ${err.message}`));
     }
     imap.broadcast?.(
       { type: 'folder_updated', folder: spamFolder, accountId: row.account_id },

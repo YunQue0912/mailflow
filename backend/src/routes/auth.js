@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { authenticator } from 'otplib';
 import QRCode from 'qrcode';
-import { query, pool } from '../services/db.js';
+import { query, pool, withTransaction } from '../services/db.js';
 import { imapManager } from '../index.js';
 import { decrypt, encrypt } from '../services/encryption.js';
 import { pushConfigured } from '../services/pushNotifications.js';
@@ -17,8 +17,11 @@ import { buildEndSessionUrl } from './oidc.js';
 import { invalidateGlobalCategorizationCache } from '../services/categorizer.js';
 import { sanitizeGtdPrefs } from '../utils/gtdPrefs.js';
 import { sanitizeRightSidebarPrefs } from '../utils/rightSidebarPrefs.js';
-import { sanitizeConversationMode } from '../utils/conversationMode.js';
 import { redisClient } from '../services/redis.js';
+import { destroyUserSessions } from '../services/userSessions.js';
+import { touchLastSeen } from '../services/lastSeen.js';
+import { removeIdentitiesForPasswordReset } from '../services/userIdentities.js';
+import { aiEnabledForNewUser } from '../services/aiNewUsers.js';
 import { consume as rlConsume, reset as rlReset } from '../services/rateLimiter.js';
 
 const router = Router();
@@ -43,26 +46,6 @@ function getTrustDurationMs(setting) {
     case '30d': return 30 * 24 * 60 * 60 * 1000;
     case 'permanent': return 365 * 24 * 60 * 60 * 1000;
     default: return 0; // 'never'
-  }
-}
-
-// Delete every server-side session belonging to a user (Redis-backed store, keys
-// prefixed "sess:"). Used after a password reset so a pre-existing session can't
-// outlive a credential change. Best-effort — never throws to the caller.
-async function destroyUserSessions(userId) {
-  try {
-    let cursor = 0;
-    do {
-      const res = await redisClient.scan(cursor, { MATCH: 'sess:*', COUNT: 200 });
-      cursor = res.cursor;
-      for (const key of res.keys) {
-        const raw = await redisClient.get(key);
-        if (!raw) continue;
-        try { if (JSON.parse(raw).userId === userId) await redisClient.del(key); } catch { /* not this user / unparsable */ }
-      }
-    } while (cursor !== 0);
-  } catch (err) {
-    console.error('destroyUserSessions failed:', err.message);
   }
 }
 
@@ -182,8 +165,8 @@ router.post('/register', authLimiter, async (req, res) => {
     }
 
     const result = await client.query(
-      'INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, $3) RETURNING id, username, is_admin',
-      [username.toLowerCase().trim(), hash, isFirstUser]
+      'INSERT INTO users (username, password_hash, is_admin, ai_enabled) VALUES ($1, $2, $3, $4) RETURNING id, username, is_admin',
+      [username.toLowerCase().trim(), hash, isFirstUser, await aiEnabledForNewUser(client)]
     );
     const newUser = result.rows[0];
 
@@ -587,6 +570,7 @@ router.post('/2fa/enrollment/enable', authLimiter, async (req, res) => {
 
 router.post('/logout', async (req, res) => {
   const userId = req.session.userId;
+  const sessionId = req.sessionID;
   const oidcProviderId = req.session.oidcProviderId;
   const oidcIdToken = req.session.oidcIdToken;
   const rawCookies = req.headers.cookie || '';
@@ -599,6 +583,15 @@ router.post('/logout', async (req, res) => {
       .catch(err => console.error('logout: failed to delete trusted device:', err.message));
   }
 
+  // A push subscription belongs to the user, not the session, so without this the
+  // signed-out user's new-mail notifications keep arriving on this device. Only this
+  // browser's endpoint goes; the user's other devices keep theirs.
+  const pushEndpoint = req.body?.pushEndpoint;
+  if (userId && pushEndpoint && typeof pushEndpoint === 'string') {
+    query('DELETE FROM push_subscriptions WHERE user_id = $1 AND endpoint = $2', [userId, pushEndpoint])
+      .catch(err => console.error('logout: failed to delete push subscription:', err.message));
+  }
+
   // If this session signed in via an OIDC provider with RP-initiated logout enabled,
   // build the end-session URL (using the still-present id_token) before destroying the
   // session. buildEndSessionUrl never throws and returns null when it does not apply, so
@@ -607,6 +600,7 @@ router.post('/logout', async (req, res) => {
 
   req.session.destroy((err) => {
     if (err) console.error('Session destroy error:', err.message);
+    if (userId) imapManager.closeSockets(userId, { sessionId });
     const cookieOpts = { path: '/', sameSite: 'lax', secure: req.secure };
     res.clearCookie('connect.sid', cookieOpts);
     res.clearCookie('mf_td', { ...cookieOpts, httpOnly: true });
@@ -615,14 +609,17 @@ router.post('/logout', async (req, res) => {
   if (userId) imapManager.disconnectUser(userId);
 });
 
-router.get('/me', async (req, res) => {
+export async function getMe(req, res) {
   if (!req.session.userId) return res.status(401).json({ error: 'Not authenticated' });
   const result = await query('SELECT id, username, display_name, avatar, is_admin, totp_enabled, password_hash, lock_pin_hash FROM users WHERE id = $1', [req.session.userId]);
   const user = result.rows[0];
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
+  // /me is what every app start calls, and it sits outside requireAuth, which records the rest.
+  touchLastSeen(user.id);
   req.session.isAdmin = user.is_admin;
   res.json({ user: { id: user.id, username: user.username, displayName: user.display_name, avatar: user.avatar, isAdmin: user.is_admin, totpEnabled: user.totp_enabled, hasPassword: !!user.password_hash, hasLockPin: !!user.lock_pin_hash, locked: !!req.session.locked } });
-});
+}
+router.get('/me', getMe);
 
 // ── Screen-lock PIN (#235) ──────────────────────────────────────────────────
 // A dedicated PIN (not the account password / SSO) gates a server-enforced privacy
@@ -632,9 +629,12 @@ const LOCK_PIN_RE = /^\d{4,6}$/;
 const MAX_UNLOCK_FAILS = 5;
 const LOCK_FAIL_WINDOW_MS = 15 * 60 * 1000;
 
-router.post('/lock', (req, res) => {
+router.post('/lock', async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not authenticated' });
   req.session.locked = true;
+  // Saved before the sockets close, so one that reconnects straight away is refused as locked.
+  await new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()));
+  imapManager.closeSockets(req.session.userId, { sessionId: req.sessionID, reason: 'Locked' });
   res.json({ ok: true });
 });
 
@@ -761,16 +761,43 @@ router.get('/preferences', async (req, res) => {
   res.json(prefs);
 });
 
+// Each folder's list order (#528, #196): { "<accountId or all>:<folder>": { sort, dir, starredFirst } }.
+// The client sends the whole map, as it does favorite folders. A folder at the default order (date,
+// newest first, starred not on top) is left out. Returns the JSON to store, or undefined to refuse.
+const LIST_SORT_KEY = /^(all|[0-9a-fA-F-]{36}):.{1,500}$/s;
+export function sanitizeListSort(listSort) {
+  if (typeof listSort !== 'object' || Array.isArray(listSort)) return undefined;
+  const entries = Object.entries(listSort);
+  if (entries.length > 500) return undefined;
+  const clean = {};
+  for (const [key, value] of entries) {
+    if (!LIST_SORT_KEY.test(key) || typeof value !== 'object' || value === null) return undefined;
+    const { sort = 'date', dir = 'desc', starredFirst = false } = value;
+    if (!['date', 'from', 'subject'].includes(sort) || !['asc', 'desc'].includes(dir)
+      || typeof starredFirst !== 'boolean') return undefined;
+    if (sort === 'date' && dir === 'desc' && !starredFirst) continue;
+    clean[key] = { sort, dir, starredFirst };
+  }
+  return JSON.stringify(clean);
+}
+
 export async function patchPreferences(req, res) {
   if (!req.session.userId) return res.status(401).json({ error: 'Not authenticated' });
   const { theme, font, layout, notificationSound, pageSize, scrollMode, syncInterval,
           blockRemoteImages, imageWhitelist, shortcuts, hiddenFolders, language,
-          threadedView, conversationMode, plaintextEmail, hoverQuickActions, swipeActions,
+          threadedView, plaintextEmail, hoverQuickActions, swipeActions,
           expandedAccounts, collapsedFolders, favoriteFolders, recentFolders, fontSize,
           showAppBadge, showFaviconBadge, replyDefault, sidebarWidth,
           categorizationEnabled, markReadBehavior, markReadDelay, aiActions,
           autoLockMinutes, showMobileAvatars, gravatarAvatars, folderSyncInterval,
-          folderOrder, senderFavicons, showMessagePreviews, defaultSender, hoverActionSet } = req.body;
+          folderOrder, senderFavicons, showMessagePreviews, defaultSender,
+          conversationMode, hoverActionSet, autoOpenReplyDrafts, afterRemove, darkEmailBodies, listSort } = req.body;
+  if (autoOpenReplyDrafts !== undefined && typeof autoOpenReplyDrafts !== 'boolean') {
+    return res.status(400).json({ error: 'autoOpenReplyDrafts must be a boolean' });
+  }
+  if (darkEmailBodies !== undefined && typeof darkEmailBodies !== 'boolean') {
+    return res.status(400).json({ error: 'darkEmailBodies must be a boolean' });
+  }
   // GTD content and generic right-sidebar layout preferences are independent flat
   // top-level keys with separate allow-lists. gtdEnabled is intentionally NOT a user
   // preference — it lives per-account in email_accounts.gtd_enabled.
@@ -791,9 +818,10 @@ export async function patchPreferences(req, res) {
   const replyDefaultVal       = (replyDefault === 'reply' || replyDefault === 'replyAll') ? replyDefault : null;
   const sidebarWidthVal       = (() => { const n = parseInt(sidebarWidth); return (n >= 160 && n <= 400) ? String(n) : null; })();
   const markReadBehaviorVal   = ['immediate', 'delay', 'manual'].includes(markReadBehavior) ? markReadBehavior : null;
+  // What the reading pane opens when the open message leaves the list (#572).
+  const afterRemoveVal        = ['next', 'previous', 'list'].includes(afterRemove) ? afterRemove : null;
   const markReadDelayVal      = (() => { const n = parseInt(markReadDelay); return (n >= 1 && n <= 10) ? String(n) : null; })();
   const autoLockMinutesVal    = [0, 1, 5, 15, 30].includes(Number(autoLockMinutes)) ? String(Number(autoLockMinutes)) : null;
-  const conversationModeVal   = sanitizeConversationMode(conversationMode);
   // Folder-structure sync cadence in seconds; 0 = never.
   const folderSyncIntervalVal = folderSyncInterval != null && [0, 900, 1800, 3600].includes(Number(folderSyncInterval)) ? String(Number(folderSyncInterval)) : null;
   // User-defined AI actions: bound the array and each field so the JSONB can't grow unbounded.
@@ -828,11 +856,19 @@ export async function patchPreferences(req, res) {
     return res.status(400).json({ error: 'senderFavicons must be a boolean' });
   }
   const senderFaviconsVal = hasSenderFavicons ? senderFavicons : null;
-  // Same vocabulary and canonical order as frontend/src/utils/hoverActions.js.
+  // Only the three known modes are stored; anything else is ignored rather than persisted.
+  const conversationModeVal = ['off', 'list', 'pane'].includes(conversationMode) ? conversationMode : null;
+  // #440: which hover quick actions the message list shows. Same vocabulary and canonical
+  // order as frontend/src/utils/hoverActions.js; unknown keys are dropped rather than stored.
   const HOVER_ACTION_KEYS = ['markRead', 'star', 'archive', 'snooze', 'delete', 'move'];
   const hoverActionSetJson = Array.isArray(hoverActionSet)
     ? JSON.stringify(HOVER_ACTION_KEYS.filter(k => hoverActionSet.includes(k)))
     : null;
+  const listSortJson = listSort != null ? sanitizeListSort(listSort) : null;
+  if (listSortJson === undefined) {
+    return res.status(400).json({ error: 'listSort must map "<accountId|all>:<folder>" to { sort, dir, starredFirst }' });
+  }
+
   await query(`
     UPDATE users
     SET preferences = preferences
@@ -873,12 +909,16 @@ export async function patchPreferences(req, res) {
       || CASE WHEN $36::boolean IS NOT NULL THEN jsonb_build_object('showMobileAvatars', $36::boolean) ELSE '{}'::jsonb END
       || CASE WHEN $37::boolean IS NOT NULL THEN jsonb_build_object('gravatarAvatars', $37::boolean) ELSE '{}'::jsonb END
       || CASE WHEN $38::text IS NOT NULL THEN jsonb_build_object('folderSyncInterval', $38::text) ELSE '{}'::jsonb END
-      || CASE WHEN $39::text IS NOT NULL THEN jsonb_build_object('conversationMode', $39::text) ELSE '{}'::jsonb END
-      || CASE WHEN $40::jsonb IS NOT NULL THEN jsonb_build_object('folderOrder', $40::jsonb) ELSE '{}'::jsonb END
-      || CASE WHEN $41::boolean IS NOT NULL THEN jsonb_build_object('senderFavicons', $41::boolean) ELSE '{}'::jsonb END
-      || CASE WHEN $42::boolean IS NOT NULL THEN jsonb_build_object('showMessagePreviews', $42::boolean) ELSE '{}'::jsonb END
-      || CASE WHEN $43::text IS NOT NULL THEN jsonb_build_object('defaultSender', $43::text) ELSE '{}'::jsonb END
+      || CASE WHEN $39::jsonb IS NOT NULL THEN jsonb_build_object('folderOrder', $39::jsonb) ELSE '{}'::jsonb END
+      || CASE WHEN $40::boolean IS NOT NULL THEN jsonb_build_object('senderFavicons', $40::boolean) ELSE '{}'::jsonb END
+      || CASE WHEN $41::boolean IS NOT NULL THEN jsonb_build_object('showMessagePreviews', $41::boolean) ELSE '{}'::jsonb END
+      || CASE WHEN $42::text IS NOT NULL THEN jsonb_build_object('defaultSender', $42::text) ELSE '{}'::jsonb END
+      || CASE WHEN $43::text IS NOT NULL THEN jsonb_build_object('conversationMode', $43::text) ELSE '{}'::jsonb END
       || CASE WHEN $44::jsonb IS NOT NULL THEN jsonb_build_object('hoverActionSet', $44::jsonb) ELSE '{}'::jsonb END
+      || CASE WHEN $45::boolean IS NOT NULL THEN jsonb_build_object('autoOpenReplyDrafts', $45::boolean) ELSE '{}'::jsonb END
+      || CASE WHEN $46::text IS NOT NULL THEN jsonb_build_object('afterRemove', $46::text) ELSE '{}'::jsonb END
+      || CASE WHEN $47::boolean IS NOT NULL THEN jsonb_build_object('darkEmailBodies', $47::boolean) ELSE '{}'::jsonb END
+      || CASE WHEN $48::jsonb IS NOT NULL THEN jsonb_build_object('listSort', $48::jsonb) ELSE '{}'::jsonb END
     WHERE id = $1
   `, [req.session.userId, theme ?? null, font ?? null, layout ?? null, notificationSound ?? null,
       pageSize ?? null, scrollMode ?? null, syncInterval ?? null,
@@ -888,9 +928,9 @@ export async function patchPreferences(req, res) {
       showAppBadge ?? null, showFaviconBadge ?? null, replyDefaultVal, sidebarWidthVal,
       categorizationEnabled ?? null, markReadBehaviorVal, markReadDelayVal, aiActionsJson,
       rightSidebarWidth, rightSidebarHidden, gtdCollapsedSectionsJson, gtdPetSlug, autoLockMinutesVal,
-      showMobileAvatars ?? null, gravatarAvatars ?? null, folderSyncIntervalVal, conversationModeVal,
-      folderOrderJson, senderFaviconsVal,
-      showMessagePreviews ?? null, defaultSenderVal, hoverActionSetJson]);
+      showMobileAvatars ?? null, gravatarAvatars ?? null, folderSyncIntervalVal, folderOrderJson, senderFaviconsVal,
+      showMessagePreviews ?? null, defaultSenderVal, conversationModeVal, hoverActionSetJson, autoOpenReplyDrafts ?? null,
+      afterRemoveVal, darkEmailBodies ?? null, listSortJson]);
 
   if (syncInterval != null) {
     const ms = parseInt(syncInterval) * 1000;
@@ -976,7 +1016,18 @@ router.patch('/profile/recovery-email', async (req, res) => {
   if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
     return res.status(400).json({ error: 'Invalid email address' });
   }
-  await query('UPDATE users SET recovery_email = $1 WHERE id = $2', [trimmed || null, req.session.userId]);
+  const userId = req.session.userId;
+  const current = await query('SELECT recovery_email FROM users WHERE id = $1', [userId]);
+  const changed = (trimmed || null) !== (current.rows[0]?.recovery_email ?? null);
+  await withTransaction(async client => {
+    await client.query('UPDATE users SET recovery_email = $1 WHERE id = $2', [trimmed || null, userId]);
+    // A reset link or login code already sent to the old address must stop working, as when
+    // an admin changes it (routes/admin.js): the old address may be why it is changing.
+    if (changed) {
+      await client.query('DELETE FROM password_reset_tokens WHERE user_id = $1', [userId]);
+      await client.query('DELETE FROM email_otp_tokens WHERE user_id = $1', [userId]);
+    }
+  });
   res.json({ ok: true });
 });
 
@@ -1083,6 +1134,7 @@ router.post('/forgot-password', authLimiter, async (req, res) => {
           transport = createSmtpTransport(acctResolved, {
             port: acct.smtp_port,
             secure: acct.smtp_port === 465,
+            requireTLS: acct.smtp_port !== 465 && !policy.allowInsecureTls,
             auth: smtpAuth, tls: acctTls,
           });
           fromHeader = `${acct.name} <${acct.email_address}>`;
@@ -1116,26 +1168,42 @@ router.post('/reset-password', authLimiter, async (req, res) => {
 
   const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');
   try {
-    // Atomically consume the token — DELETE RETURNING prevents two concurrent resets
-    // from both reading a valid token, both updating the password, and only then deleting.
-    const tokenResult = await query(
-      `DELETE FROM password_reset_tokens
-       WHERE token_hash = $1 AND expires_at > NOW()
-       RETURNING user_id`,
-      [tokenHash]
-    );
-    if (!tokenResult.rows.length) {
+    // The link is spent, the password set, and trusted devices, API tokens and linked identities
+    // revoked together or not at all: a failure part-way must not leave a new password, a spent
+    // link and tokens that survived, with nothing left to retry with.
+    const reset = await withTransaction(async (client) => {
+      // Atomically consume the token — DELETE RETURNING prevents two concurrent resets
+      // from both reading a valid token, both updating the password, and only then deleting.
+      const tokenResult = await client.query(
+        `DELETE FROM password_reset_tokens
+         WHERE token_hash = $1 AND expires_at > NOW()
+         RETURNING user_id`,
+        [tokenHash]
+      );
+      if (!tokenResult.rows.length) return null;
+      const id = tokenResult.rows[0].user_id;
+
+      const hash = await bcrypt.hash(password, 12);
+      const { rows: [user] } = await client.query('SELECT username FROM users WHERE id = $1 FOR UPDATE', [id]);
+      await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, id]);
+      // Revoke trusted devices, API tokens and, while password sign-in is on, linked single sign-on
+      // identities here, and every session below, so a pre-existing (possibly attacker) session,
+      // device, token or linked account can't survive a compromise-driven password reset (#714).
+      await client.query('DELETE FROM trusted_devices WHERE user_id = $1', [id]);
+      // Identities before tokens: removing them reads the sign-in policy row shared, and an admin's
+      // policy change updates that row before it deletes tokens, so the two cannot wait on each other.
+      const removed = await removeIdentitiesForPasswordReset(client, id);
+      await client.query('DELETE FROM api_tokens WHERE user_id = $1', [id]);
+      return { id, username: user?.username, removed };
+    });
+    if (!reset) {
       return res.status(400).json({ error: 'Invalid or expired reset link' });
     }
-    const userId = tokenResult.rows[0].user_id;
-
-    const hash = await bcrypt.hash(password, 12);
-    await query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, userId]);
-
-    // Revoke all existing sessions and trusted devices so a pre-existing (possibly
-    // attacker) session/device can't survive a compromise-driven password reset.
+    const { id: userId, username, removed } = reset;
+    // Sessions are in Redis, outside the transaction, so they end once it has committed.
     await destroyUserSessions(userId);
-    await query('DELETE FROM trusted_devices WHERE user_id = $1', [userId]);
+    if (removed.length) console.log(`[auth] password reset for ${username} removed ${removed.length} linked identity(s): ${removed.map(i => i.provider_name).join(', ')}`);
+    removed.forEach(() => logAuthEvent('identity_unlinked', { userId, username, ip: req.ip, success: true }));
 
     res.locals.resetRateLimit?.();
     res.json({ ok: true });

@@ -1,34 +1,48 @@
-import { downloadAttachmentFile, downloadMessageEml } from '../utils/attachmentDownload.js';
-import { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
+import AccountMark from './AccountMark.jsx';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { api } from '../utils/api.js';
-import { format } from 'date-fns';
+import { formatMessageDateTime } from '../utils/formatDate.js';
 import { shortcutBus } from '../utils/shortcutBus.js';
 import { canHandlePaneShortcut } from '../utils/shortcutApplicability.js';
-import { getEffectiveShortcuts, parseModKey, modCompactLabel } from '../utils/defaultShortcuts.js';
 import { useMobile } from '../hooks/useMobile.js';
+import { useListFirst } from '../hooks/useListFirst.js';
+import { closeOpenMessage } from '../utils/closeMessage.js';
+import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import SwipePager from './SwipePager.jsx';
 import { clearDeleteGuard, clearPendingDelete, setCompletedDelete, setPendingDelete } from '../utils/pendingDeletes.js';
-import { pendingMarkReadMap, completedMarkReadMap, setPending } from '../utils/pendingReads.js';
+import { clearReadGuard } from '../utils/pendingReads.js';
 import { applyMarkRead, scheduleMarkRead, cancelScheduledMarkRead, cancelScheduledMarkReadFor } from '../utils/markRead.js';
+import { advanceSelectionAfterRemoval, adjacentRow, openAdjacentRow } from '../utils/listSelection.js';
+import { selectListedMessage } from '../utils/conversation.js';
+import { bodyCache, prefetchBody as prefetchCachedBody } from '../utils/bodyCache.js';
+import { unsnooze, changeSnooze, refreshCounts } from '../utils/snoozeActions.js';
+import { isDarkTheme, canShowDark, showDark } from '../utils/darkScheme.js';
 import { markMessageUnread } from '../utils/messageHotkeys.js';
-import DOMPurify from 'dompurify';
-import { BUILTIN_SUMMARIZE, summarizePromptForLocale } from '../aiActions.js';
-import { getResults, saveResult, removeResult } from '../aiResults.js';
-import { aiRuns } from '../utils/aiRunRegistry.js';
-import { renderMarkdown } from '../utils/renderMarkdown.js';
-import { openReplyFromMessage, openForwardFromMessage } from '../utils/composeFromMessage.js';
+import { BUILTIN_SUMMARIZE } from '../aiActions.js';
+import { openReplyFromMessage, openForwardFromMessage, openForwardAsAttachmentFromMessage, rowOwnMessage } from '../utils/composeFromMessage.js';
+import { aiReplyAvailable } from '../utils/aiReply.js';
 import MessageBodyView from './MessageBodyView.jsx';
 import { copyToClipboard } from '../utils/clipboard.js';
-import { folderMatchesQuery } from '../utils/folderDisplay.js';
+import { saveSenderCategory } from '../utils/senderCategory.js';
+import { buildMovePickerSections, movePickerSectionHeading, movePickerFoldersEmpty, runMovePickerAction } from '../utils/folderDisplay.js';
+import { usePluginCollected } from '../plugins/PluginSlot.jsx';
 import FolderPathLabel from './FolderPathLabel.jsx';
 import SpamBadge from './SpamBadge.jsx';
 import SpamExplainModal from './SpamExplainModal.jsx';
-import { classifyAttachmentRisk } from '../utils/attachmentRisk.js';
+import { downloadEml } from '../utils/downloadEml.js';
+import { buildPrintDocument, openPrintWindow, printInWindow } from '../utils/printMessage.js';
+import AiResultBox from './AiResultBox.jsx';
+import { useAiActions } from '../hooks/useAiActions.js';
+import AttachmentStrip from './AttachmentStrip.jsx';
+import {
+  ActionBtn, MessageTools, ReplySplitButton, RemoteImagesNotice, UnsubscribeNotice, TOUCH_MIN,
+  AiReplyIcon, ForwardIcon, ArchiveIcon, MoveIcon, SpamIcon, HamIcon, TodoistIcon, ReadStateIcon, HeadersIcon,
+  DownloadIcon, PrintIcon, DarkToggleIcon, StarIcon, TrashIcon, useShortcutTitle,
+} from './MessageActions.jsx';
 const USE_DIV_RENDER = import.meta.env.VITE_EMAIL_DIV_RENDER === 'true';
 const MESSAGE_OPENING_EVENT = 'mailflow:message-opening';
-// riskArmed value for the "Download all" link. A Symbol, so no attachment part can ever equal it.
-const DOWNLOAD_ALL = Symbol('downloadAll');
 
 // Module-level regex so the spam-name heuristic isn't recompiled on every
 // render — same heuristic as ContextMenu.jsx, both files read this constant.
@@ -61,51 +75,15 @@ function linkifyText(text) {
   );
 }
 
-function formatBytes(bytes) {
-  if (!bytes) return '';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function fileIcon(type) {
-  const t = (type || '').toLowerCase();
-  const p = { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.75 };
-  if (t.startsWith('image/')) return (
-    <svg {...p}><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-  );
-  if (t === 'application/pdf') return (
-    <svg {...p}><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-  );
-  if (t.includes('word') || t.includes('document')) return (
-    <svg {...p}><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-  );
-  if (t.includes('sheet') || t.includes('excel') || t.includes('csv')) return (
-    <svg {...p}><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="10" y1="13" x2="10" y2="17"/><line x1="8" y1="15" x2="12" y2="15"/></svg>
-  );
-  if (t.includes('zip') || t.includes('compressed') || t.includes('archive')) return (
-    <svg {...p}><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="11" x2="16" y2="11"/></svg>
-  );
-  if (t.startsWith('video/')) return (
-    <svg {...p}><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-  );
-  if (t.startsWith('audio/')) return (
-    <svg {...p}><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-  );
-  return (
-    <svg {...p}><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
-  );
-}
-
 export default function MessagePane({ windowMessageId = null, onWindowClose = null } = {}) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const {
     messages, searchResults, searchQuery, selectedMessageId: globalSelectedId, setSelectedMessage,
     updateMessage, removeMessage, decrementUnread, incrementUnread, openCompose, accounts, addNotification,
     imageWhitelist, addToImageWhitelist, blockRemoteImages, threadMessages,
-    replyDefault, shortcuts, recentFolders, favoriteFolders, todoistConnected,
+    replyDefault, recentFolders, favoriteFolders, todoistConnected,
     categorizationEnabled, setCategoryCounts, adjustCategoryCount,
-    aiActions, setShowAdmin, setAdminTab,
+    aiActions, setShowAdmin, setAdminTab, plaintextEmail,
   } = useStore();
 
   // Detached-window mode (#219): when a message id is passed in, this pane renders that
@@ -121,56 +99,28 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   }, [windowMode, onWindowClose]);
 
   const isMobile = useMobile();
+  // List first (#596): the message has the content area to itself, with a Back bar as on a phone.
+  const listFirst = useListFirst();
+  // A tooltip with the action's keyboard shortcut, on a desktop.
+  const withShortcut = useShortcutTitle();
   const defaultReplyAll = replyDefault === 'replyAll';
 
-  const effectiveShortcuts = getEffectiveShortcuts(shortcuts);
-  const shortcutLabel = (action) => {
-    const k = effectiveShortcuts[action];
-    if (!k) return null;
-    const mod = parseModKey(k);
-    return mod ? `${modCompactLabel(mod.mod)}${mod.bare.toUpperCase()}` : k.toUpperCase();
-  };
   // Navigate to a message and mark it as read in one shot.
-  // Arrow buttons and swipe gestures bypass handleSelect in MessageList, so they
-  // must duplicate the mark-as-read logic here to keep state consistent.
+  // The arrow buttons bypass handleSelect in MessageList, so they must pick the row as it
+  // does and duplicate the mark-as-read logic here to keep state consistent.
   const selectAndMarkRead = useCallback((msg) => {
     window.dispatchEvent(new CustomEvent(MESSAGE_OPENING_EVENT));
     api.getMessageBody(msg.id).catch(() => {});
-    setSelectedMessage(msg.id);
+    selectListedMessage(useStore, msg.id);
     cancelScheduledMarkRead(autoMarkReadTimerRef.current);
     autoMarkReadTimerRef.current = scheduleMarkRead(msg);
-  }, [setSelectedMessage]);
+  }, []);
 
   const paneRef = useRef(null);
-  const mountedRef = useRef(true);
-  const swipeBackTimerRef = useRef(null);
   const autoMarkReadTimerRef = useRef(null);
   useEffect(() => () => {
-    mountedRef.current = false;
-    if (swipeBackTimerRef.current) clearTimeout(swipeBackTimerRef.current);
     cancelScheduledMarkRead(autoMarkReadTimerRef.current);
   }, []);
-
-  const resetPaneSwipeStyles = useCallback(() => {
-    const el = paneRef.current;
-    if (!el) return;
-    el.style.transition = '';
-    el.style.transform = '';
-  }, []);
-
-  // The mobile swipe-back gesture writes transform/transition inline for the
-  // dismiss animation. MessagePane stays mounted while hidden, so clear those
-  // inline styles before painting the next selected email. Also cancel the
-  // swipe-back timer so it can't fire history.back() after a new email has
-  // already been selected (race: user selects email B within the 220ms window).
-  useLayoutEffect(() => {
-    if (!isMobile || !selectedMessageId) return;
-    if (swipeBackTimerRef.current) {
-      clearTimeout(swipeBackTimerRef.current);
-      swipeBackTimerRef.current = null;
-    }
-    resetPaneSwipeStyles();
-  }, [isMobile, selectedMessageId, resetPaneSwipeStyles]);
 
   // Reset scroll position and iframe height synchronously before the browser
   // paints the new message, so the user never sees stale blank space from the
@@ -180,25 +130,12 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     if (iframeRef.current) iframeRef.current.style.height = '300px';
   }, [selectedMessageId]);
 
-  useEffect(() => {
-    // Deliberately does NOT abort in-flight actions. They persist their own result against the
-    // message they were started from, so leaving a message lets the work finish instead of
-    // discarding it (#428). Only dismissal, re-running the same action, and an identity change
-    // (logout, account switch, lock) cancel a run. Unmount deliberately does not.
-    viewingMsgIdRef.current = selectedMessageId;
-    setShowAiMenu(false);
-    // Restore persisted results (#204) so they reappear instead of vanishing.
-    const saved = getResults(selectedMessageId);
-    const restored = {};
-    for (const [key, r] of Object.entries(saved)) {
-      restored[key] = { status: 'done', text: r.text, label: r.label };
-    }
-    setAiResults(restored);
-  }, [selectedMessageId]);
-
   const allMessages = searchQuery.trim() ? searchResults : messages;
-  const message = allMessages.find(m => m.id === selectedMessageId)
+  const listedMessage = allMessages.find(m => m.id === selectedMessageId)
     ?? Object.values(threadMessages).flat().find(m => m.id === selectedMessageId);
+  // A conversation row carries its thread's first sender and subject; the pane shows the message
+  // itself, and blocking, allowing images or making a rule from it uses its own sender.
+  const message = useMemo(() => rowOwnMessage(listedMessage), [listedMessage]);
 
   useEffect(() => {
     setResolvedSubject(null);
@@ -219,6 +156,12 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   // Mirrors the heuristic in ContextMenu.jsx so the toolbar matches the menu.
   const account = accounts.find(a => a.id === message?.account_id);
   const accountFolders = useStore(s => s.folders[message?.account_id] || []);
+  // Dark email bodies (#228): the setting, and each message's own choice made with the toggle.
+  const theme = useStore(s => s.theme);
+  const darkEmailBodies = useStore(s => s.darkEmailBodies);
+  const [darkChoice, setDarkChoice] = useState({});
+  // What the frame last showed, for which message (see MessageBodyView onDarkResult).
+  const [darkResult, setDarkResult] = useState(null);
   const spamFolderPaths = (() => {
     const mapped = account?.folder_mappings?.spam;
     if (mapped) return new Set([mapped]);
@@ -235,9 +178,10 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const performSingleSpamLabel = useCallback(async (label) => {
     if (!message) return;
     const wasUnread = !message.is_read;
+    advanceSelectionAfterRemoval(message.id);
     removeMessage(message.id);
     closeWindowIfWindowed();
-    if (wasUnread) decrementUnread(message.account_id);
+    if (wasUnread) decrementUnread(message.account_id, 1, { undoable: true });
     let settled = false;
     const undo = () => {
       settled = true;
@@ -274,9 +218,6 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const [bodyError, setBodyError] = useState(null);
   const [retryKey, setRetryKey] = useState(0);
   const [loadingBody, setLoadingBody] = useState(false);
-  const [downloadingPart, setDownloadingPart] = useState(null);
-  const [downloadingAll, setDownloadingAll] = useState(false);
-  const [showReplyMenu, setShowReplyMenu] = useState(false);
   const [savingAllow, setSavingAllow] = useState(false);
   const [paneScrolled, setPaneScrolled] = useState(false);
   const [showHeaderModal, setShowHeaderModal] = useState(false);
@@ -285,7 +226,8 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const [movePickerFolders, setMovePickerFolders] = useState([]);
   const [movePickerLoading, setMovePickerLoading] = useState(false);
   const [moveSearch, setMoveSearch] = useState('');
-  const [showMoreMenu, setShowMoreMenu] = useState(false);
+  // Bumped to close the toolbar's menus, which are remounted under a new key.
+  const [menuEpoch, setMenuEpoch] = useState(0);
   const [contextMenu, setContextMenu] = useState(null);
   const [spamExplainMessageId, setSpamExplainMessageId] = useState(null);
   const [findDialogOpen, setFindDialogOpen] = useState(false);
@@ -297,19 +239,16 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const [aiStatus, setAiStatus] = useState(null);
   // Per-action results for the current message: { [actionKey]: { status, text, label } }.
   // status: 'loading' | 'done' | 'error'. Restored from localStorage on message change.
-  const [aiResults, setAiResults] = useState({});
-  const [showAiMenu, setShowAiMenu] = useState(false);
+  const ai = useAiActions(selectedMessageId, body, message?.subject);
+  const aiResults = ai.results;
   const [aiClassifying, setAiClassifying] = useState(false);
   const [unsubscribeStatus, setUnsubscribeStatus] = useState(null); // null | 'loading' | 'done' | 'error'
   const moveBtnRef = useRef(null);
-  const moreMenuRef = useRef(null);
-  const aiMenuRef = useRef(null);
   // In-flight AI actions live in a module-level registry, keyed by message AND action, so they
   // outlive this component. Navigating, closing a pop-out and changing layout all deliberately
   // leave them running: the result is saved against the message it was started from, so letting
   // the request finish is what puts it there when you return (#428). utils/aiRunRegistry.js.
   // The message currently on screen, read inside async callbacks that outlive a navigation.
-  const viewingMsgIdRef = useRef(selectedMessageId);
   const scrollContainerRef = useRef(null);
   const iframeRef = useRef(null);
   // useMemo so prepared is available in the same render as body.html — no extra frame,
@@ -321,8 +260,6 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const outerRef = useRef(null);
   const scaleRef = useRef(null);
   const innerRef = useRef(null);
-  const bodyCache = useRef({}); // messageId -> body, so revisiting is instant (capped at 50)
-  const bodyCacheOrder = useRef([]); // insertion-order keys for LRU eviction
   // Session-scoped set of message IDs where the user has clicked "Load images once"
   const imagesRequestedRef = useRef(new Set());
   // Ref holding the latest pane action handlers so shortcut subscriptions ([] deps) never go stale
@@ -357,10 +294,8 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
 
   const openPaneContextMenu = useCallback((x, y, options = {}) => {
     if (!message) return;
-    setShowReplyMenu(false);
     setShowMovePicker(false);
-    setShowMoreMenu(false);
-    setShowAiMenu(false);
+    setMenuEpoch(e => e + 1);
     setContextMenu({
       x,
       y,
@@ -414,26 +349,16 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
 
     let evicted = false;
     if (tightened) {
-      for (const id of Object.keys(bodyCache.current)) {
-        if (!bodyCache.current[id]?.hasBlockedRemoteImages) {
-          delete bodyCache.current[id];
-          imagesRequestedRef.current.delete(id); // clear "load once" so policy is respected
-          evicted = true;
-        }
-      }
+      evicted = bodyCache.evict((cached, id) => {
+        if (cached.hasBlockedRemoteImages) return false;
+        imagesRequestedRef.current.delete(id); // clear "load once" so policy is respected
+        return true;
+      }) || evicted;
     }
     if (loosenedGlobally || loosenedViaWhitelist) {
-      for (const id of Object.keys(bodyCache.current)) {
-        if (bodyCache.current[id]?.hasBlockedRemoteImages) {
-          delete bodyCache.current[id];
-          evicted = true;
-        }
-      }
+      evicted = bodyCache.evict(cached => cached.hasBlockedRemoteImages) || evicted;
     }
-    if (evicted) {
-      bodyCacheOrder.current = bodyCacheOrder.current.filter(id => bodyCache.current[id]);
-      setRetryKey(k => k + 1);
-    }
+    if (evicted) setRetryKey(k => k + 1);
   }, [blockRemoteImages, imageWhitelist]);
 
   useLayoutEffect(() => {
@@ -448,7 +373,7 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     // Skip the cache (or clear a stale blocked entry) when the user has explicitly
     // requested images for this message so we re-fetch with ?remoteImages=1.
     const wantsImages = imagesRequestedRef.current.has(selectedMessageId);
-    const cached = bodyCache.current[selectedMessageId];
+    const cached = bodyCache.get(selectedMessageId);
     if (cached && (cached.html || cached.text)) {
       if (!wantsImages || !cached.hasBlockedRemoteImages) {
         setBody(cached);
@@ -457,7 +382,7 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
         return;
       }
       // Cache has the blocked version but user wants images — evict and re-fetch
-      delete bodyCache.current[selectedMessageId];
+      bodyCache.delete(selectedMessageId);
     }
 
     // Clear previous content immediately so stale body never shows for a new message
@@ -489,16 +414,8 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     fetchWithRetry(selectedMessageId)
       .then(data => {
         if (cancelled) return;
-        // Only cache if there's real content — empty results can be retried
-        if (data.html || data.text) {
-          bodyCache.current[selectedMessageId] = data;
-          bodyCacheOrder.current.push(selectedMessageId);
-          // Evict oldest entry when cache exceeds 50 messages
-          if (bodyCacheOrder.current.length > 50) {
-            const evicted = bodyCacheOrder.current.shift();
-            delete bodyCache.current[evicted];
-          }
-        }
+        // Only real content is cached (bodyCache.set): empty results can be retried
+        bodyCache.set(selectedMessageId, data);
         setBody(data);
       })
       .catch(err => {
@@ -636,8 +553,9 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     };
   }, [prepared]);
 
-  // Fade in pane content when switching messages on desktop
-  useEffect(() => {
+  // Fade in pane content when switching messages on desktop. Before the paint: started after it,
+  // the new message showed at full opacity for a frame, then blinked out and faded back in.
+  useLayoutEffect(() => {
     if (isMobile || !selectedMessageId || !paneRef.current) return;
     const el = paneRef.current;
     el.style.animation = 'none';
@@ -645,134 +563,42 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     el.style.animation = 'pane-fade-in 0.15s ease';
   }, [selectedMessageId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Swipe-back gesture: right-swipe from left edge returns to message list on mobile
+  // A neighbor's body, loaded ahead into the cache this pane reads first, so a swipe opens a
+  // message that is ready to show (#229).
+  const prefetchBody = useCallback((row) => {
+    if (row) prefetchCachedBody(row.id, imagesRequestedRef.current.has(row.id));
+  }, []);
+
+  // On a desktop too, the next and previous messages are loaded once this one has shown, so j/k
+  // and opening the next after a delete show a message at once instead of waiting on the server
+  // (on a phone the swipe pager does this). Briefly deferred, so a run of j presses does not
+  // fetch every message it passes.
   useEffect(() => {
-    if (!isMobile) return;
-    const el = paneRef.current;
-    if (!el) return;
+    if (isMobile || !body || !selectedMessageId) return undefined;
+    const timer = setTimeout(() => {
+      prefetchBody(adjacentRow('next'));
+      prefetchBody(adjacentRow('prev'));
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [body, selectedMessageId, isMobile, prefetchBody]);
 
-    let startX = 0, startY = 0, dir = null, active = false, fromEdge = false;
-
-    const onStart = (e) => {
-      const t = e.touches[0];
-      startX = t.clientX; startY = t.clientY;
-      fromEdge = t.clientX <= 32;
-      dir = null; active = false;
-    };
-
-    const onMove = (e) => {
-      const t = e.touches[0];
-      const dx = t.clientX - startX;
-      const dy = t.clientY - startY;
-      if (!dir) {
-        if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
-        dir = Math.abs(dx) > Math.abs(dy) ? 'h' : 'v';
-      }
-      if (dir === 'v') return;
-      if (fromEdge) {
-        if (dx < 0) return;
-        e.preventDefault();
-        active = true;
-        el.style.transition = 'none';
-        el.style.transform = `translateX(${dx}px)`;
-      } else {
-        if (Math.abs(dx) < 5) return;
-        e.preventDefault();
-        active = true;
-      }
-    };
-
-    const onEnd = (e) => {
-      if (!active) return;
-      active = false;
-      const dx = e.changedTouches[0].clientX - startX;
-      if (fromEdge) {
-        // Prevent the synthesized click that fires ~300ms after touchend.
-        // After swipe-back the pane hides and the list is visible at the same
-        // coordinates — the phantom click would ghost-select a list row.
-        e.preventDefault();
-        if (dx > 80) {
-          el.style.transition = 'transform 0.22s ease';
-          el.style.transform = `translateX(${window.innerWidth}px)`;
-          if (swipeBackTimerRef.current) clearTimeout(swipeBackTimerRef.current);
-          swipeBackTimerRef.current = setTimeout(() => {
-            swipeBackTimerRef.current = null;
-            resetPaneSwipeStyles();
-            if (mountedRef.current) history.back();
-          }, 220);
-        } else {
-          el.style.transition = 'transform 0.25s ease';
-          el.style.transform = 'translateX(0)';
-        }
-      } else {
-        const { messages: msgs, searchResults: sr, searchQuery: sq, selectedMessageId: selId, setSelectedMessage: setSel, updateMessage: updMsg, decrementUnread: decUnread, incrementUnread: incUnread, adjustCategoryCount: adjCat } = useStore.getState();
-        const list = sq.trim() ? sr : msgs;
-        const idx = list.findIndex(m => m.id === selId);
-        let target = null;
-        if (dx < -60 && idx >= 0 && idx < list.length - 1) {
-          target = list[idx + 1];
-        } else if (dx > 60 && idx > 0) {
-          target = list[idx - 1];
-        }
-        if (target) {
-          window.dispatchEvent(new CustomEvent(MESSAGE_OPENING_EVENT));
-          api.getMessageBody(target.id).catch(() => {});
-          setSel(target.id);
-          cancelScheduledMarkRead(autoMarkReadTimerRef.current);
-          autoMarkReadTimerRef.current = null;
-          if (!target.is_read) {
-            const { markReadBehavior, markReadDelay } = useStore.getState();
-            if (markReadBehavior !== 'manual') {
-              const doMarkRead = () => {
-                updMsg(target.id, { is_read: true });
-                decUnread(target.account_id);
-                adjCat(target.category, -1);
-                setPending(target.id, target.account_id);
-                api.bulkRead([target.id], true)
-                  .then(() => {
-                    pendingMarkReadMap.delete(target.id);
-                    completedMarkReadMap.set(target.id, target.account_id);
-                    setTimeout(() => completedMarkReadMap.delete(target.id), 10000);
-                  })
-                  .catch(e => {
-                    console.error('markRead failed:', e.message);
-                    updMsg(target.id, { is_read: false });
-                    incUnread(target.account_id);
-                    adjCat(target.category, 1);
-                    pendingMarkReadMap.delete(target.id);
-                  });
-              };
-              if (markReadBehavior === 'delay') {
-                autoMarkReadTimerRef.current = setTimeout(doMarkRead, (markReadDelay || 1) * 1000);
-              } else {
-                doMarkRead();
-              }
-            }
-          }
-        }
-      }
-    };
-
-    el.addEventListener('touchstart', onStart, { passive: true });
-    el.addEventListener('touchmove', onMove, { passive: false });
-    // Non-passive so onEnd can call e.preventDefault() to suppress the phantom click.
-    el.addEventListener('touchend', onEnd, { passive: false });
-    return () => {
-      el.removeEventListener('touchstart', onStart);
-      el.removeEventListener('touchmove', onMove);
-      el.removeEventListener('touchend', onEnd);
-    };
-  }, [isMobile, setSelectedMessage, resetPaneSwipeStyles]);
+  // Swiping on a phone (#229): from the left edge back to the list (hooks/useSwipeBack.js); left and
+  // right for the next and previous message is the SwipePager around the content below.
+  useSwipeBack({
+    enabled: isMobile && !windowMode,
+    rootRef: paneRef,
+    navKey: selectedMessageId,
+    onBack: closeOpenMessage,
+  });
 
   // Both drafts are built by the shared util, so replying from the list, from the
   // reading pane, from a conversation and from GTD triage all produce the same draft.
   // The body is already loaded here, so it is handed over rather than refetched.
   const loadedBody = async () => body;
 
-  const handleReply = (replyAll = false) => {
+  const handleReply = (replyAll = false, { aiReply = false } = {}) => {
     if (!message) return;
-    setShowReplyMenu(false);
-    openReplyFromMessage(message, { accounts, openCompose, getMessageBody: loadedBody, replyAll });
+    openReplyFromMessage(message, { accounts, folders: useStore.getState().folders, openCompose, getMessageBody: loadedBody, replyAll, aiReply });
   };
 
   const handleForward = () => {
@@ -780,150 +606,31 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
     openForwardFromMessage(message, { openCompose, getMessageBody: loadedBody });
   };
 
+  // The star fills at once, as in the list: the server answers only once the mail server has
+  // the flag, which takes seconds on Gmail. Put back, with a notice, if that fails.
   const handleStarToggle = async () => {
     if (!message) return;
+    const { id } = message;
     const newVal = !message.is_starred;
-    await api.markStarred(message.id, newVal);
-    updateMessage(message.id, { is_starred: newVal });
+    updateMessage(id, { is_starred: newVal });
+    try {
+      await api.markStarred(id, newVal);
+    } catch (err) {
+      updateMessage(id, { is_starred: !newVal });
+      addNotification({ type: 'error', title: t('common.error', { message: err.message }) });
+    }
   };
 
   const handlePrint = () => {
     if (!message) return;
-    const esc = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const date = message.date ? new Date(message.date).toLocaleString() : '';
-    const fromStr = message.from_name
-      ? `${esc(message.from_name)} &lt;${esc(message.from_email)}&gt;`
-      : esc(message.from_email);
-
-    const parseList = (raw) => {
-      try { return Array.isArray(raw) ? raw : JSON.parse(raw || '[]'); } catch { return []; }
-    };
-    const fmtAddr = (r) => r.name ? `${esc(r.name)} &lt;${esc(r.email)}&gt;` : esc(r.email);
-    const toStr = parseList(message.to_addresses).map(fmtAddr).join(', ');
-    const ccStr = parseList(message.cc_addresses).map(fmtAddr).join(', ');
-
-    const bodyContent = body?.html
-      ? DOMPurify.sanitize(body.html, { ADD_ATTR: ['target'] })
-      : body?.text
-        ? `<pre style="white-space:pre-wrap;font-family:sans-serif;font-size:14px">${esc(body.text)}</pre>`
-        : '';
-
-    const win = window.open('', '_blank');
-    if (!win) return;
-    // CSP blocks any script execution in this same-origin print window (it has no
-    // sandbox); combined with the DOMPurify pass above this neutralizes email HTML.
-    win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'; base-uri 'none'"><title>${esc(message.subject)}</title>
-<style>
-  body { font-family: Arial, sans-serif; font-size: 14px; color: #111; margin: 32px; }
-  .header { border-bottom: 1px solid #ccc; padding-bottom: 16px; margin-bottom: 24px; }
-  .header h1 { font-size: 18px; margin: 0 0 12px; }
-  .meta { font-size: 13px; color: #444; line-height: 1.8; }
-  .meta span { font-weight: 600; color: #111; }
-  @media print { body { margin: 16px; } }
-</style></head><body>
-<div class="header">
-  <h1>${esc(message.subject) || '(no subject)'}</h1>
-  <div class="meta">
-    <div><span>From:</span> ${fromStr}</div>
-    <div><span>To:</span> ${toStr}</div>
-    ${ccStr ? `<div><span>Cc:</span> ${ccStr}</div>` : ''}
-    <div><span>Date:</span> ${date}</div>
-  </div>
-</div>
-${bodyContent}
-</body></html>`);
-    win.document.close();
-    win.focus();
-    win.print();
+    printInWindow(openPrintWindow(), buildPrintDocument([{ message, body }]));
   };
 
-  // Label shown on a result box for a given action key. The built-in summarize
-  // key maps to the translated "Summary"; custom actions use their label. Falls
-  // back to a stored label (so a result survives its action being deleted).
-  const aiActionLabel = useCallback((key, fallback) => {
-    if (key === BUILTIN_SUMMARIZE.id) return t('message.summary');
-    const found = (aiActions || []).find(a => a.id === key);
-    return found?.label || fallback || key;
-  }, [aiActions, t]);
-
-  // Run an AI action against the current message and stream the result into a
-  // pinned box. Cached results are shown instantly unless force=true (Regenerate).
-  const runAiAction = async (action, { force = false } = {}) => {
-    if (!action?.id) return;
-    const key = action.id;
-    setShowAiMenu(false);
-
-    // Show a cached result without re-calling the model (#204, cost-saving).
-    if (!force) {
-      if (aiResults[key]?.status === 'done') return;
-      const cached = getResults(selectedMessageId)[key];
-      if (cached) {
-        setAiResults(r => ({ ...r, [key]: { status: 'done', text: cached.text, label: cached.label } }));
-        return;
-      }
-    }
-
-    const textContent = body?.text
-      || body?.html?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
-      || '';
-    if (!textContent) return;
-
-    const label = aiActionLabel(key, action.label);
-    const msgId = selectedMessageId;
-    const ctrl = aiRuns.start(msgId, key, new AbortController());
-    // Only paint into the pane while the message this run belongs to is the one on screen.
-    // A run that outlives a navigation still saves; the restore on return shows it.
-    const applyIfViewing = (updater) => { if (viewingMsgIdRef.current === msgId) setAiResults(updater); };
-    applyIfViewing(r => ({ ...r, [key]: { status: 'loading', text: '', label } }));
-    // The built-in Summarize prompt is uneditable, so steer its output to the
-    // user's UI language (#255). Custom actions keep their author's prompt as-is.
-    const promptText = action.builtin ? summarizePromptForLocale(i18n.language) : action.prompt;
-    try {
-      const fullText = await api.ai.chat([{
-        role: 'user',
-        content: `${promptText}\n\n${textContent.slice(0, 6000)}`,
-      }], {
-        signal: ctrl.signal,
-        onDelta: (text) => {
-          applyIfViewing(r => ({ ...r, [key]: { status: 'loading', text, label } }));
-        },
-      });
-      applyIfViewing(r => ({ ...r, [key]: { status: 'done', text: fullText, label } }));
-      // Persist unconditionally: this is the whole point when the user has navigated away.
-      if (fullText) saveResult(msgId, key, fullText, label);
-    } catch (err) {
-      if (err.name === 'AbortError') return;
-      applyIfViewing(r => ({ ...r, [key]: { status: 'error', text: err.message, label } }));
-    } finally {
-      aiRuns.finish(msgId, key);
-    }
-  };
-
-  // Dismiss a pinned result box and drop its cached copy.
-  const dismissAiResult = (key) => {
-    aiRuns.abort(selectedMessageId, key);
-    removeResult(selectedMessageId, key);
-    setAiResults(r => { const next = { ...r }; delete next[key]; return next; });
-  };
-
-  // A single row in the AI actions dropdown. Shows an accent dot when a result
-  // for that action already exists on the current message.
-  const renderAiItem = (key, label, onClick, opts = {}) => (
-    <div
-      key={key}
-      onClick={onClick}
-      style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
-        padding: '8px 10px', cursor: 'pointer', fontSize: 13, borderRadius: 6,
-        color: opts.muted ? 'var(--text-secondary)' : 'var(--text-primary)',
-      }}
-      onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-    >
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
-      {aiResults[key]?.status === 'done' && <span style={{ fontSize: 9, color: 'var(--accent)', flexShrink: 0 }}>●</span>}
-    </div>
-  );
+  // In-flight runs are deliberately not aborted when the reader moves on: they persist their own
+  // result against the message they were started from (#428), restored per message by useAiActions
+  // (#204). Only dismissal, re-running the same action, and an identity change cancel a run.
+  const runAiAction = (action, opts) => ai.run(action, opts);
+  const dismissAiResult = ai.dismiss;
 
   // Keep pane action refs current every render
   paneActionsRef.current = {
@@ -984,51 +691,6 @@ ${bodyContent}
     // instead, from the store, where logout and account switch are actually known about.
   }, []);
 
-  // riskArmed: a risky attachment needs a second click to download; the first
-  // arms the button and shows why. Holds the attachment's part, or DOWNLOAD_ALL.
-  const [riskArmed, setRiskArmed] = useState(null);
-  useEffect(() => { setRiskArmed(null); }, [selectedMessageId]);
-
-  const handleDownload = async (messageId, part, filename, mimeType) => {
-    setDownloadingPart(part);
-    try {
-      await downloadAttachmentFile({
-        path: `/api/mail/messages/${messageId}/attachments/${encodeURIComponent(part)}`,
-        filename,
-        mimeType,
-      });
-    } catch (err) {
-      console.error('Download error:', err);
-      addNotification({
-        type: 'error',
-        title: t('message.downloadFailed.title'),
-        body: t('message.downloadFailed.body'),
-      });
-    } finally {
-      setDownloadingPart(null);
-    }
-  };
-
-  const handleDownloadAll = async () => {
-    setDownloadingAll(true);
-    try {
-      await downloadAttachmentFile({
-        path: `/api/mail/messages/${message.id}/attachments.zip`,
-        filename: `${message.subject || 'attachments'}-attachments.zip`,
-        mimeType: 'application/zip',
-      });
-    } catch (err) {
-      console.error('Download all attachments error:', err);
-      addNotification({
-        type: 'error',
-        title: t('message.downloadFailed.title'),
-        body: t('message.downloadFailed.body'),
-      });
-    } finally {
-      setDownloadingAll(false);
-    }
-  };
-
   const handleOpenMovePicker = useCallback(async () => {
     if (!message) return;
     if (showMovePicker) { setShowMovePicker(false); return; }
@@ -1051,13 +713,36 @@ ${bodyContent}
         cancelScheduledMarkRead(autoMarkReadTimerRef.current);
         autoMarkReadTimerRef.current = null;
         cancelScheduledMarkReadFor(message.id);
-        pendingMarkReadMap.delete(message.id);
-        completedMarkReadMap.delete(message.id);
+        clearReadGuard(message.id);
       },
-      update: updateMessage, incrementUnread, decrementUnread, adjustCategoryCount,
+      // The GTD rail shows its own copy of the thread, as the u hotkey keeps it in step.
+      update: (id, fields) => {
+        updateMessage(id, fields);
+        useStore.getState().markGtdThreadRead(message.message_id || message.id, fields.is_read);
+      },
+      incrementUnread, decrementUnread, adjustCategoryCount,
       patch: api.bulkRead,
-    }) && isMobile) setSelectedMessage(null);
-  }, [message, updateMessage, incrementUnread, decrementUnread, adjustCategoryCount, isMobile, setSelectedMessage]);
+    }) && (isMobile || (listFirst && !windowMode))) setSelectedMessage(null);
+  }, [message, updateMessage, incrementUnread, decrementUnread, adjustCategoryCount, isMobile, listFirst, windowMode, setSelectedMessage]);
+
+  // The toolbar's read toggle. It used to render only for a read message, so it vanished the
+  // moment "Mark as unread" worked and the message could not be marked read again from here
+  // (#683). Explicit "mark read" ignores markReadBehavior, as the context menu's does.
+  const handleMarkRead = useCallback(() => {
+    if (!message || message.is_read) return;
+    // A delayed auto-read still pending would mark it read a second time and count it twice.
+    cancelScheduledMarkRead(autoMarkReadTimerRef.current);
+    autoMarkReadTimerRef.current = null;
+    cancelScheduledMarkReadFor(message.id);
+    applyMarkRead(message);
+    useStore.getState().markGtdThreadRead(message.message_id || message.id, true);
+  }, [message]);
+
+  const handleToggleRead = useCallback(() => {
+    if (!message) return;
+    if (message.is_read) handleMarkUnread();
+    else handleMarkRead();
+  }, [message, handleMarkUnread, handleMarkRead]);
 
   const handleEmailClick = useCallback((ev) => {
     const anchor = ev.target.closest('a[href]');
@@ -1163,9 +848,10 @@ ${bodyContent}
     if (!message) return;
     setShowMovePicker(false);
     const moved = message;
+    advanceSelectionAfterRemoval(moved.id);
     removeMessage(moved.id);
     closeWindowIfWindowed();
-    if (!moved.is_read) decrementUnread(moved.account_id);
+    if (!moved.is_read) decrementUnread(moved.account_id, 1, { undoable: true });
     let undone = false;
     const timer = setTimeout(async () => {
       if (undone) return;
@@ -1195,7 +881,6 @@ ${bodyContent}
   useEffect(() => {
     setShowMovePicker(false);
     setShowHeaderModal(false);
-    setShowMoreMenu(false);
     setContextMenu(null);
     setUnsubscribeStatus(null);
     setAiClassifying(false);
@@ -1212,19 +897,19 @@ ${bodyContent}
     if (!showMovePicker) setMoveSearch('');
   }, [showMovePicker]);
 
-  const recentForMove = message
-    ? recentFolders
-        .filter(r => r.accountId === message.account_id && r.path !== message.folder)
-        .map(r => movePickerFolders.find(f => f.path === r.path))
-        .filter(Boolean)
+  const movePluginSections = usePluginCollected('move-picker-sections', {
+    account, messages: message ? [message] : [], currentFolder: message?.folder,
+    onClose: () => setShowMovePicker(false), t,
+  });
+  const moveSections = message
+    ? buildMovePickerSections({
+        folders: movePickerFolders, recents: recentFolders, favorites: favoriteFolders,
+        pluginSections: movePluginSections, accountId: message.account_id,
+        currentFolder: message.folder, query: moveSearch,
+      })
     : [];
-  const favoritesForMove = message
-    ? favoriteFolders
-        .filter(fav => fav.accountId === message.account_id && fav.path !== message.folder)
-        .map(fav => movePickerFolders.find(f => f.path === fav.path))
-        .filter(Boolean)
-        .filter(f => !recentForMove.some(r => r.path === f.path))
-    : [];
+  const moveFoldersEmpty = movePickerFoldersEmpty(moveSections, movePickerFolders);
+  const closeMovePicker = () => setShowMovePicker(false);
 
   if (!message) {
     // A detached window with no message is mid-close (see auto-close effect above) —
@@ -1281,9 +966,10 @@ ${bodyContent}
   const handleDelete = () => {
     const deleted = message;
     setPendingDelete(deleted.id);
+    advanceSelectionAfterRemoval(deleted.id);
     removeMessage(deleted.id);
     closeWindowIfWindowed();
-    if (!deleted.is_read) decrementUnread(deleted.account_id);
+    if (!deleted.is_read) decrementUnread(deleted.account_id, 1, { undoable: true });
     let undone = false;
     const timer = setTimeout(async () => {
       if (undone) return;
@@ -1312,9 +998,10 @@ ${bodyContent}
 
   const handleArchive = () => {
     const archived = message;
+    advanceSelectionAfterRemoval(archived.id);
     removeMessage(archived.id);
     closeWindowIfWindowed();
-    if (!archived.is_read) decrementUnread(archived.account_id);
+    if (!archived.is_read) decrementUnread(archived.account_id, 1, { undoable: true });
     let undone = false;
     const timer = setTimeout(async () => {
       if (undone) return;
@@ -1334,8 +1021,8 @@ ${bodyContent}
       onUndo: () => {
         undone = true;
         clearTimeout(timer);
-        const state = useStore.getState();
-        state.setMessages([...state.messages, archived].sort((a, b) => new Date(b.date) - new Date(a.date)));
+        // Back into the list it left, not into one opened since (#630).
+        useStore.getState().restoreMessages([archived]);
         if (!archived.is_read) incrementUnread(archived.account_id);
       },
     });
@@ -1380,7 +1067,7 @@ ${bodyContent}
         break;
       case 'markRead':
         // Explicit "mark read" ignores markReadBehavior: the user just asked for it.
-        applyMarkRead(message);
+        handleMarkRead();
         break;
       case 'markUnread':
         handleMarkUnread();
@@ -1396,6 +1083,9 @@ ${bodyContent}
         break;
       case 'forward':
         handleForward();
+        break;
+      case 'forwardAsAttachment':
+        if (message) openForwardAsAttachmentFromMessage(message, { openCompose });
         break;
       case 'archive':
         handleArchive();
@@ -1415,17 +1105,25 @@ ${bodyContent}
       case 'snooze':
         if (data) {
           const snoozedMsg = message;
+          advanceSelectionAfterRemoval(snoozedMsg.id);
           removeMessage(snoozedMsg.id);
           closeWindowIfWindowed();
           if (!snoozedMsg.is_read) decrementUnread(snoozedMsg.account_id);
           addNotification({ title: t('message.snoozed.title'), body: snoozedMsg.subject || t('common.noSubject') });
-          api.snoozeMessage(snoozedMsg.id, data).catch(err => {
+          api.snoozeMessage(snoozedMsg.id, data).then(refreshCounts).catch(err => {
             console.error('Snooze failed:', err.message);
             useStore.getState().restoreMessages([snoozedMsg]);
             if (!snoozedMsg.is_read) incrementUnread(snoozedMsg.account_id);
             addNotification({ title: t('message.snoozed.failTitle'), body: t('message.snoozed.failBody') });
           });
         }
+        break;
+      case 'unsnooze':
+        // Gone from the Snoozed view, so the next one there opens, as after any removal.
+        unsnooze(message, { t, before: (m) => { advanceSelectionAfterRemoval(m.id); closeWindowIfWindowed(); } });
+        break;
+      case 'changeSnooze':
+        if (data) changeSnooze(message, data, { t });
         break;
       case 'createRuleFromMessage': {
         const store = useStore.getState();
@@ -1445,15 +1143,28 @@ ${bodyContent}
         break;
       }
       case 'setCategory': {
+        // Stored as chosen, 'primary' included, as the server does (#489).
         const newCategory = data || 'primary';
-        const dbCategory = newCategory === 'primary' ? null : newCategory;
         try {
           await api.setMessageCategory(message.id, newCategory);
-          updateMessage(message.id, { category: dbCategory });
+          updateMessage(message.id, { category: newCategory });
           const params = message.account_id ? { accountId: message.account_id } : {};
-          api.getCategoryCounts(params).then(d => setCategoryCounts(d.counts || {})).catch(() => {});
+          api.getCategoryCounts(params).then(d => setCategoryCounts(d.counts || {}, d.totals)).catch(() => {});
         } catch (err) {
           console.error('setCategory failed:', err?.message);
+        }
+        break;
+      }
+      case 'setCategoryAlways': {
+        // "Always for this sender/domain" (#490).
+        const category = data?.category;
+        const saved = await saveSenderCategory(message, data?.scope, category, {
+          t, api, getState: useStore.getState, onMatch: loaded => updateMessage(loaded.id, { category }),
+        });
+        if (saved) {
+          updateMessage(message.id, { category });
+          const params = message.account_id ? { accountId: message.account_id } : {};
+          api.getCategoryCounts(params).then(d => setCategoryCounts(d.counts || {}, d.totals)).catch(() => {});
         }
         break;
       }
@@ -1464,7 +1175,7 @@ ${bodyContent}
 
   const handleLoadImages = () => {
     imagesRequestedRef.current.add(selectedMessageId);
-    delete bodyCache.current[selectedMessageId];
+    bodyCache.delete(selectedMessageId);
     setRetryKey(k => k + 1);
   };
 
@@ -1475,10 +1186,7 @@ ${bodyContent}
     try {
       await addToImageWhitelist({ type: 'address', value: senderEmail });
       // Evict all blocked cache entries so they re-fetch with images unblocked
-      for (const id of Object.keys(bodyCache.current)) {
-        if (bodyCache.current[id]?.hasBlockedRemoteImages) delete bodyCache.current[id];
-      }
-      bodyCacheOrder.current = bodyCacheOrder.current.filter(id => bodyCache.current[id]);
+      bodyCache.evict(cached => cached.hasBlockedRemoteImages);
       setRetryKey(k => k + 1);
     } catch {
       addNotification({ title: t('message.whitelistFail.title'), body: t('message.whitelistFail.body') });
@@ -1503,6 +1211,7 @@ ${bodyContent}
         actionLabel: t('message.unsubscribe.moveToTrash'),
         onAction: () => {
           const { removeMessage, decrementUnread, restoreMessages, incrementUnread } = useStore.getState();
+          advanceSelectionAfterRemoval(msg.id);
           removeMessage(msg.id);
           if (!msg.is_read) decrementUnread(msg.account_id);
           api.deleteMessage(msg.id).catch(() => {
@@ -1528,7 +1237,7 @@ ${bodyContent}
         const acct = accounts.find(a => a.id === message.account_id);
         if (acct) {
           const params = message.account_id ? { accountId: message.account_id } : {};
-          api.getCategoryCounts(params).then(d => setCategoryCounts(d.counts || {})).catch(() => {});
+          api.getCategoryCounts(params).then(d => setCategoryCounts(d.counts || {}, d.totals)).catch(() => {});
         }
         addNotification({ title: t('message.aiClassify.done', { category: t(`messageList.categories.${result.category}`) }) });
       }
@@ -1547,10 +1256,7 @@ ${bodyContent}
     try {
       await addToImageWhitelist({ type: 'domain', value: senderDomain });
       // Evict all blocked cache entries so they re-fetch with images unblocked
-      for (const id of Object.keys(bodyCache.current)) {
-        if (bodyCache.current[id]?.hasBlockedRemoteImages) delete bodyCache.current[id];
-      }
-      bodyCacheOrder.current = bodyCacheOrder.current.filter(id => bodyCache.current[id]);
+      bodyCache.evict(cached => cached.hasBlockedRemoteImages);
       setRetryKey(k => k + 1);
     } catch {
       addNotification({ title: t('message.whitelistFail.title'), body: t('message.whitelistFail.body') });
@@ -1575,18 +1281,55 @@ ${bodyContent}
     } catch { return []; }
   })();
 
-  const attachments = body?.attachments || [];
-  // "Download all" hands over every file at once, so it asks first whenever one of them would. While
-  // it does, the link has no href, so a right-click "Save link as", a middle click or a long press has
-  // nothing to fetch; the confirming click starts the download itself.
-  const anyRiskyAttachment = attachments.some(att =>
-    ['block', 'warn'].includes(classifyAttachmentRisk(att.filename, att.type).level));
-  const downloadAllArmed = riskArmed === DOWNLOAD_ALL;
-  const confirmDownloadAll = () => {
-    if (anyRiskyAttachment && !downloadAllArmed) { setRiskArmed(DOWNLOAD_ALL); return; }
-    setRiskArmed(null);
-    handleDownloadAll();
+  // Shown dark, and whether this message offers the toggle: only in a dark theme, and only for a
+  // body that can be shown dark (utils/darkScheme.js). The experimental div renderer does not
+  // apply a sender's dark design, so with it HTML stays as sent.
+  const darkCapable = Boolean(message) && !(USE_DIV_RENDER && body?.html);
+  const bodyDark = darkCapable && showDark({ body, themeKey: theme, setting: darkEmailBodies, override: darkChoice[message.id] });
+  const darkToggleShown = darkCapable && isDarkTheme(theme) && canShowDark(body);
+  // What the frame actually shows: HTML asked for dark is left as sent when showing it dark would
+  // make text unreadable (utils/darkBody.js). Until the frame says, it is taken as dark, so the
+  // card does not flash white.
+  const frameResult = darkResult?.id === selectedMessageId ? darkResult : null;
+  const darkRefused = Boolean(body?.html) && bodyDark && frameResult?.requested === true && frameResult.outcome === 'light';
+  const shownDark = bodyDark && !darkRefused;
+  const toggleDark = () => {
+    if (darkRefused) return;
+    setDarkChoice(choice => ({ ...choice, [message.id]: bodyDark ? 'original' : 'dark' }));
   };
+  const darkToggleLabel = darkRefused ? t('message.cannotShowDark') : shownDark ? t('message.showOriginal') : t('message.showDark');
+
+  // The toolbar's tools, in order: buttons on a desktop, the More menu on a phone (MessageTools).
+  // Reply with AI sits by Reply. A phone's toolbar only just fits its buttons at large font sizes,
+  // so there it is in More.
+  const aiReplyShown = aiReplyAvailable(aiStatus, plaintextEmail);
+  const handleAiReply = () => handleReply(defaultReplyAll, { aiReply: true });
+  const toolItems = message ? [
+    aiReplyShown && isMobile && { key: 'aiReply', label: t('compose.toolbar.aiReply'), icon: <AiReplyIcon />, onClick: handleAiReply },
+    hasSpamFolder && !inSpamFolder && { key: 'spam', label: t('contextMenu.markAsSpam'), icon: <SpamIcon />, onClick: () => performSingleSpamLabel('spam') },
+    inSpamFolder && { key: 'ham', label: t('contextMenu.markAsHam'), icon: <HamIcon />, onClick: () => performSingleSpamLabel('ham') },
+    todoistConnected && { key: 'todoist', label: t('todoist.title'), icon: <TodoistIcon />, onClick: () => setShowTodoistModal(true) },
+    { key: 'read', label: message.is_read ? t('contextMenu.markUnread') : t('contextMenu.markRead'), icon: <ReadStateIcon isRead={message.is_read} />, onClick: handleToggleRead },
+    { key: 'headers', label: t('contextMenu.viewHeaders'), icon: <HeadersIcon />, onClick: () => setShowHeaderModal(true) },
+    // The raw RFC 822 source as an .eml file (#381).
+    { key: 'eml', label: t('message.downloadEml'), icon: <DownloadIcon />, onClick: async () => {
+      try { await downloadEml(message.id); }
+      catch { addNotification({ type: 'error', title: t('message.downloadFailed.title'), body: t('message.downloadFailed.body') }); }
+    } },
+    { key: 'print', label: t('message.print'), title: withShortcut(t('message.print'), 'printMessage'), icon: <PrintIcon />, onClick: handlePrint },
+    darkToggleShown && { key: 'dark', label: darkToggleLabel, icon: <DarkToggleIcon shownDark={shownDark} />, onClick: toggleDark, pressed: shownDark, disabled: darkRefused },
+  ].filter(Boolean) : [];
+  const aiTools = aiStatus?.enabled && aiStatus?.features?.summarize && body ? {
+    items: [{ ...BUILTIN_SUMMARIZE, label: t('message.summarize') }, ...(aiActions || [])],
+    results: aiResults,
+    onRun: action => runAiAction(action),
+    onManage: () => { setAdminTab('ai-actions'); setShowAdmin(true); },
+  } : null;
+
+  // Only messages you sent (or drafts you saved) have a Bcc on record (#585).
+  const bccList = Array.isArray(body?.bccAddresses) ? body.bccAddresses : [];
+
+  const attachments = body?.attachments || [];
 
   return (
     <div
@@ -1599,19 +1342,19 @@ ${bodyContent}
     >
       {isMobile && <style>{`@keyframes mobileSlideIn { from { transform: translateX(100%) } to { transform: translateX(0) } }`}</style>}
 
-      {/* Mobile back bar */}
-      {isMobile && (
+      {/* Back bar: on a phone, and in List first (#596) */}
+      {(isMobile || listFirst) && !windowMode && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 8,
           paddingTop: 'calc(var(--sat) + 10px)',
-          paddingBottom: 10, paddingLeft: 14, paddingRight: 14,
+          paddingBottom: 'calc(10px - var(--sat-trim))', paddingLeft: 14, paddingRight: 14,
           borderBottom: '1px solid var(--border-subtle)',
           background: 'var(--bg-secondary)', flexShrink: 0,
           boxShadow: paneScrolled ? '0 1px 10px rgba(0,0,0,0.2)' : 'none',
           transition: 'box-shadow 0.2s ease',
         }}>
           <button
-            onClick={() => history.back()}
+            onClick={closeOpenMessage}
             style={{
               background: 'none', border: 'none', color: 'var(--accent)',
               cursor: 'pointer', display: 'flex', alignItems: 'center',
@@ -1663,98 +1406,44 @@ ${bodyContent}
         </div>
       )}
 
-      {/* Toolbar — always pinned at top, never scrolls */}
-      <div style={{
-        padding: '8px 16px', borderBottom: '1px solid var(--border-subtle)',
-        display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
+      {/* Toolbar, always pinned at top, never scrolls. The buttons are MessageActions', which every
+          message of a conversation shares (#650). On a phone each is a 44 px touch target, edge to edge,
+          giving way down to TOUCH_MIN when a larger font size leaves the row too narrow.
+          A labeled group of plain buttons, each its own Tab stop, rather than role="toolbar", which
+          promises arrow-key movement between them that the pane has never had. */}
+      <div role="group" aria-label={t('shortcuts.groups.messageActions')} style={{
+        padding: isMobile ? '0 8px' : '8px 16px', borderBottom: '1px solid var(--border-subtle)',
+        display: 'flex', alignItems: 'center', gap: isMobile ? 0 : 6, flexShrink: 0,
         boxShadow: paneScrolled ? '0 1px 10px rgba(0,0,0,0.2)' : 'none',
         transition: 'box-shadow 0.2s ease',
       }}>
-        {/* Split Reply button */}
-        <div style={{ position: 'relative', display: 'flex' }}>
-          <PaneBtn onClick={() => handleReply(defaultReplyAll)} style={{ borderRadius: '6px 0 0 6px' }} title={isMobile ? (defaultReplyAll ? t('message.replyAll') : t('message.reply')) : `${defaultReplyAll ? t('message.replyAll') : t('message.reply')}${shortcutLabel(defaultReplyAll ? 'replyAll' : 'reply') ? ` (${shortcutLabel(defaultReplyAll ? 'replyAll' : 'reply')})` : ''}`}>
-            {defaultReplyAll ? (
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                <polyline points="7 17 2 12 7 7"/><polyline points="13 17 8 12 13 7"/><path d="M20 18v-2a4 4 0 00-4-4H2"/>
-              </svg>
-            ) : (
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                <polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 00-4-4H4"/>
-              </svg>
-            )}
-          </PaneBtn>
-          <button
-            onClick={() => setShowReplyMenu(v => !v)}
-            title={t('message.replyOptions')}
-            style={{
-              background: 'transparent', border: '1px solid transparent',
-              borderLeft: '1px solid var(--border-subtle)',
-              borderRadius: '0 6px 6px 0', padding: '5px 6px',
-              color: 'var(--text-secondary)', cursor: 'pointer',
-              display: 'flex', alignItems: 'center',
-            }}
-            onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
-            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-          >
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="6 9 12 15 18 9"/>
-            </svg>
-          </button>
-          {showReplyMenu && (<>
-            <div onClick={() => setShowReplyMenu(false)} aria-hidden style={{ position: 'fixed', inset: 0, zIndex: 99 }} />
-            <div
-              style={{
-                position: 'absolute', top: '100%', left: 0, marginTop: 4,
-                background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-                borderRadius: 8, overflow: 'hidden', zIndex: 100,
-                boxShadow: '0 4px 20px rgba(0,0,0,0.4)', minWidth: 150,
-              }}
-              onMouseLeave={() => setShowReplyMenu(false)}
-            >
-              {[
-                defaultReplyAll
-                  ? { label: t('message.reply'), replyAll: false }
-                  : { label: t('message.replyAll'), replyAll: true },
-              ].map(opt => (
-                <div
-                  key={opt.label}
-                  onClick={() => handleReply(opt.replyAll)}
-                  style={{
-                    padding: '9px 14px', cursor: 'pointer', fontSize: 13,
-                    color: 'var(--text-primary)',
-                  }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                >
-                  {opt.label}
-                </div>
-              ))}
-            </div>
-          </>)}
-        </div>
+        <ReplySplitButton
+          key={`reply-${message.id}-${menuEpoch}`}
+          defaultReplyAll={defaultReplyAll}
+          onReply={handleReply}
+          title={withShortcut(defaultReplyAll ? t('message.replyAll') : t('message.reply'), defaultReplyAll ? 'replyAll' : 'reply')}
+          touch={isMobile}
+        />
 
-        <PaneBtn onClick={handleForward} title={isMobile ? t('message.forward') : `${t('message.forward')}${shortcutLabel('forward') ? ` (${shortcutLabel('forward')})` : ''}`}>
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-            <polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 014-4h12"/>
-          </svg>
-        </PaneBtn>
+        {aiReplyShown && !isMobile && (
+          <ActionBtn onClick={handleAiReply} label={t('compose.toolbar.aiReply')}>
+            <AiReplyIcon />
+          </ActionBtn>
+        )}
 
-        <PaneBtn onClick={handleArchive} title={isMobile ? t('message.archive') : `${t('message.archive')}${shortcutLabel('archive') ? ` (${shortcutLabel('archive')})` : ''}`}>
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-            <rect x="2" y="3" width="20" height="5" rx="1"/>
-            <path d="M4 8v11a1 1 0 001 1h14a1 1 0 001-1V8"/>
-            <polyline points="9 13 12 16 15 13"/>
-            <line x1="12" y1="11" x2="12" y2="16"/>
-          </svg>
-        </PaneBtn>
+        <ActionBtn onClick={handleForward} label={t('message.forward')} title={withShortcut(t('message.forward'), 'forward')} touch={isMobile}>
+          <ForwardIcon />
+        </ActionBtn>
+
+        <ActionBtn onClick={handleArchive} label={t('message.archive')} title={withShortcut(t('message.archive'), 'archive')} touch={isMobile}>
+          <ArchiveIcon />
+        </ActionBtn>
 
         {/* Move to folder */}
-        <div style={{ position: 'relative' }} ref={moveBtnRef}>
-          <PaneBtn onClick={handleOpenMovePicker} title={t('contextMenu.moveToFolder')}>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-              <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
-            </svg>
-          </PaneBtn>
+        <div style={{ position: 'relative', display: 'flex', ...(isMobile ? { minWidth: TOUCH_MIN } : {}) }} ref={moveBtnRef}>
+          <ActionBtn onClick={handleOpenMovePicker} label={t('contextMenu.moveToFolder')} touch={isMobile} popup expanded={showMovePicker}>
+            <MoveIcon />
+          </ActionBtn>
           {/* Desktop dropdown */}
           {showMovePicker && !isMobile && (<>
             <div onClick={() => setShowMovePicker(false)} aria-hidden style={{ position: 'fixed', inset: 0, zIndex: 199 }} />
@@ -1769,13 +1458,13 @@ ${bodyContent}
                 <div style={{ padding: '20px 16px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
                   {t('contextMenu.folders.loading')}
                 </div>
-              ) : movePickerFolders.length === 0 ? (
+              ) : movePickerFolders.length === 0 && moveSections.length === 0 ? (
                 <div style={{ padding: '20px 16px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
                   {t('contextMenu.folders.empty')}
                 </div>
               ) : (
                 <>
-                  <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--border-subtle)' }}>
+                  {movePickerFolders.length > 0 && <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--border-subtle)' }}>
                     <input
                       autoFocus
                       value={moveSearch}
@@ -1789,90 +1478,42 @@ ${bodyContent}
                         outline: 'none',
                       }}
                     />
-                  </div>
+                  </div>}
                   <div style={{ maxHeight: 285, overflowY: 'auto' }}>
-                  {(() => {
-                    const q = moveSearch.trim().toLowerCase();
-                    if (q) {
-                      const filtered = movePickerFolders
-                        .filter(f => f.path !== message.folder && folderMatchesQuery(f, q));
-                      return filtered.length === 0 ? (
-                        <div style={{ padding: '12px 12px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
-                          {t('contextMenu.folders.empty')}
-                        </div>
-                      ) : filtered.map(f => (
-                        <button
-                          key={f.path}
-                          onClick={() => handleMoveToFolder(f.path)}
-                          style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px', background: 'none', border: 'none', color: 'var(--text-primary)', fontSize: 13, cursor: 'pointer', textAlign: 'left', transition: 'background 0.1s' }}
-                          onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
-                          onMouseLeave={e => e.currentTarget.style.background = 'none'}
-                        >
-                          <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                          <FolderPathLabel folder={f} />
-                        </button>
-                      ));
-                    }
+                  {moveSections.map((section, i) => {
+                    const heading = movePickerSectionHeading(section, t);
                     return (
-                      <>
-                        {recentForMove.length > 0 && (
-                          <>
-                            <div style={{ padding: '5px 12px 3px', fontSize: 10, fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                              {t('contextMenu.folders.recent')}
-                            </div>
-                            {recentForMove.map(f => (
-                              <button
-                                key={`recent-${f.path}`}
-                                onClick={() => handleMoveToFolder(f.path)}
-                                style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px', background: 'none', border: 'none', color: 'var(--text-primary)', fontSize: 13, cursor: 'pointer', textAlign: 'left', transition: 'background 0.1s' }}
-                                onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
-                                onMouseLeave={e => e.currentTarget.style.background = 'none'}
-                              >
-                                <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                                <FolderPathLabel folder={f} />
-                              </button>
-                            ))}
-                            <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
-                          </>
+                      <Fragment key={section.key}>
+                        {heading && (
+                          <div style={{ padding: '5px 12px 3px', fontSize: 10, fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                            {heading}
+                          </div>
                         )}
-                        {favoritesForMove.length > 0 && (
-                          <>
-                            <div style={{ padding: '5px 12px 3px', fontSize: 10, fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                              {t('contextMenu.folders.favorites')}
-                            </div>
-                            {favoritesForMove.map(f => (
-                              <button
-                                key={`fav-${f.path}`}
-                                onClick={() => handleMoveToFolder(f.path)}
-                                style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px', background: 'none', border: 'none', color: 'var(--text-primary)', fontSize: 13, cursor: 'pointer', textAlign: 'left', transition: 'background 0.1s' }}
-                                onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
-                                onMouseLeave={e => e.currentTarget.style.background = 'none'}
-                              >
-                                <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                                <FolderPathLabel folder={f} />
-                              </button>
-                            ))}
-                            <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
-                          </>
-                        )}
-                        {movePickerFolders
-                          .filter(f => f.path !== message.folder)
-                          .map(f => (
+                        {section.rows.map(row => {
+                          const isAction = row.kind === 'action';
+                          const f = row.folder;
+                          return (
                             <button
-                              key={f.path}
-                              onClick={() => handleMoveToFolder(f.path)}
+                              key={isAction ? `action-${row.item.key}` : f.path}
+                              onClick={isAction ? () => runMovePickerAction(row.item, closeMovePicker) : () => handleMoveToFolder(f.path)}
                               style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px', background: 'none', border: 'none', color: 'var(--text-primary)', fontSize: 13, cursor: 'pointer', textAlign: 'left', transition: 'background 0.1s' }}
                               onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
                               onMouseLeave={e => e.currentTarget.style.background = 'none'}
                             >
-                              <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                              <FolderPathLabel folder={f} />
+                              <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>{isAction ? row.item.renderIcon(13) : <FolderIcon specialUse={f.special_use} />}</span>
+                              {isAction ? <FolderPathLabel label={row.item.label} /> : <FolderPathLabel folder={f} label={f.favoriteLabel} />}
                             </button>
-                          ))
-                        }
-                      </>
+                          );
+                        })}
+                        {(i < moveSections.length - 1 || moveFoldersEmpty) && <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />}
+                      </Fragment>
                     );
-                  })()}
+                  })}
+                  {moveFoldersEmpty && (
+                    <div style={{ padding: '12px 12px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
+                      {t('contextMenu.folders.empty')}
+                    </div>
+                  )}
                   </div>
                 </>
               )}
@@ -1882,258 +1523,28 @@ ${bodyContent}
 
         <div style={{ flex: 1 }} />
 
-        {isMobile ? (
-          <div style={{ position: 'relative' }} ref={moreMenuRef}>
-            <PaneBtn onClick={() => setShowMoreMenu(v => !v)} title={t('message.more')}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-                <circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/>
-              </svg>
-            </PaneBtn>
-            {showMoreMenu && (<>
-              <div onClick={() => setShowMoreMenu(false)} aria-hidden style={{ position: 'fixed', inset: 0, zIndex: 99 }} />
-              <div style={{
-                position: 'absolute', top: '100%', right: 0, marginTop: 4,
-                background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-                borderRadius: 8, overflow: 'hidden', zIndex: 100,
-                boxShadow: '0 4px 20px rgba(0,0,0,0.4)', minWidth: 190,
-              }}>
-                {message.is_read && (
-                  <div
-                    onClick={() => { setShowMoreMenu(false); handleMarkUnread(); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: '1px solid var(--border-subtle)' }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                      <path style={{strokeLinecap: 'round'}} d="M22,10.91v7.09c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V6c0-1.1.9-2,2-2h11"/>
-                      <polyline style={{strokeLinecap: 'round'} } points="16.36 9.95 12 13 2 6"/>
-                      <circle style={{strokeMiterlimit: 10, fill: 'currentColor'}} cx="19.96" cy="6" r="3"/>
-                    </svg>
-                    {t('contextMenu.markUnread')}
-                  </div>
-                )}
-                {hasSpamFolder && !inSpamFolder && message && (
-                  <div
-                    onClick={() => { performSingleSpamLabel('spam'); setShowMoreMenu(false); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: '1px solid var(--border-subtle)' }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                      <path d="M12 3L4 7v5c0 5 3.5 9.3 8 10.3C16.5 21.3 20 17 20 12V7L12 3z"/>
-                      <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-                    </svg>
-                    {t('contextMenu.markAsSpam')}
-                  </div>
-                )}
-                {inSpamFolder && message && (
-                  <div
-                    onClick={() => { performSingleSpamLabel('ham'); setShowMoreMenu(false); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: '1px solid var(--border-subtle)' }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                      <path d="M12 3L4 7v5c0 5 3.5 9.3 8 10.3C16.5 21.3 20 17 20 12V7L12 3z"/>
-                      <polyline points="9 12 11 14 15 10"/>
-                    </svg>
-                    {t('contextMenu.markAsHam')}
-                  </div>
-                )}
-                {todoistConnected && (
-                  <div
-                    onClick={() => { setShowTodoistModal(true); setShowMoreMenu(false); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: '1px solid var(--border-subtle)' }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M21 0H3C1.35 0 0 1.35 0 3v3.858s3.854 2.24 4.098 2.38c.31.18.694.177 1.004 0 .26-.147 8.02-4.608 8.136-4.675.279-.161.58-.107.748-.01.164.097.606.348.84.48.232.134.221.502.013.622l-9.712 5.59c-.346.2-.69.204-1.048.002C3.478 10.907.998 9.463 0 8.882v2.02l4.098 2.38c.31.18.694.177 1.004 0 .26-.147 8.02-4.609 8.136-4.676.279-.16.58-.106.748-.008.164.096.606.347.84.48.232.133.221.5.013.62-.208.121-9.288 5.346-9.712 5.59-.346.2-.69.205-1.048.002C3.478 14.951.998 13.506 0 12.926v2.02l4.098 2.38c.31.18.694.177 1.004 0 .26-.147 8.02-4.609 8.136-4.676.279-.16.58-.106.748-.009.164.097.606.348.84.48.232.133.221.502.013.622l-9.712 5.59c-.346.199-.69.204-1.048.001C3.478 18.994.998 17.55 0 16.97V21c0 1.65 1.35 3 3 3h18c1.65 0 3-1.35 3-3V3c0-1.65-1.35-3-3-3z"/>
-                    </svg>
-                    {t('todoist.title')}
-                  </div>
-                )}
-                <div
-                  onClick={() => { setShowHeaderModal(true); setShowMoreMenu(false); }}
-                  style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: '1px solid var(--border-subtle)' }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                    <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
-                    <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
-                  </svg>
-                  {t('contextMenu.viewHeaders')}
-                </div>
-                <div
-                  onClick={() => { handlePrint(); setShowMoreMenu(false); }}
-                  style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: '1px solid var(--border-subtle)' }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                    <polyline points="6 9 6 2 18 2 18 9"/>
-                    <path d="M6 18H4a2 2 0 01-2-2v-5a2 2 0 012-2h16a2 2 0 012 2v5a2 2 0 01-2 2h-2"/>
-                    <rect x="6" y="14" width="12" height="8"/>
-                  </svg>
-                  {t('message.print')}
-                </div>
-                {/* Use the native download bridge for Android as well as desktop downloads. */}
-                <div
-                  onClick={async () => {
-                    setShowMoreMenu(false);
-                    try {
-                      await downloadMessageEml(message.id);
-                    } catch {
-                      addNotification({ type: 'error', title: t('message.downloadFailed.title'), body: t('message.downloadFailed.body') });
-                    }
-                  }}
-                  style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)', borderBottom: aiStatus?.enabled && aiStatus?.features?.summarize && body ? '1px solid var(--border-subtle)' : 'none' }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-                    <polyline points="7 10 12 15 17 10"/>
-                    <line x1="12" y1="15" x2="12" y2="3"/>
-                  </svg>
-                  {t('message.downloadEml')}
-                </div>
-                {aiStatus?.enabled && aiStatus?.features?.summarize && body && (
-                  <div
-                    onClick={() => { setShowMoreMenu(false); runAiAction(BUILTIN_SUMMARIZE); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)' }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>
-                      <path d="M5 3v4M19 17v4M3 5h4M17 19h4"/>
-                    </svg>
-                    {t('message.summarize')}
-                  </div>
-                )}
-                {aiStatus?.enabled && aiStatus?.features?.summarize && body && (aiActions || []).map(a => (
-                  <div
-                    key={a.id}
-                    onClick={() => { setShowMoreMenu(false); runAiAction(a); }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', cursor: 'pointer', fontSize: 13, color: 'var(--text-primary)' }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>
-                      <path d="M5 3v4M19 17v4M3 5h4M17 19h4"/>
-                    </svg>
-                    {a.label}
-                  </div>
-                ))}
-              </div>
-            </>)}
-          </div>
-        ) : (
-          <>
-            {hasSpamFolder && !inSpamFolder && message && (
-              <PaneBtn onClick={() => performSingleSpamLabel('spam')} title={t('contextMenu.markAsSpam')}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                  <path d="M12 3L4 7v5c0 5 3.5 9.3 8 10.3C16.5 21.3 20 17 20 12V7L12 3z"/>
-                  <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-                </svg>
-              </PaneBtn>
-            )}
-            {inSpamFolder && message && (
-              <PaneBtn onClick={() => performSingleSpamLabel('ham')} title={t('contextMenu.markAsHam')}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                  <path d="M12 3L4 7v5c0 5 3.5 9.3 8 10.3C16.5 21.3 20 17 20 12V7L12 3z"/>
-                  <polyline points="9 12 11 14 15 10"/>
-                </svg>
-              </PaneBtn>
-            )}
-            {todoistConnected && (
-              <PaneBtn onClick={() => setShowTodoistModal(true)} title={t('todoist.title')}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M21 0H3C1.35 0 0 1.35 0 3v3.858s3.854 2.24 4.098 2.38c.31.18.694.177 1.004 0 .26-.147 8.02-4.608 8.136-4.675.279-.161.58-.107.748-.01.164.097.606.348.84.48.232.134.221.502.013.622l-9.712 5.59c-.346.2-.69.204-1.048.002C3.478 10.907.998 9.463 0 8.882v2.02l4.098 2.38c.31.18.694.177 1.004 0 .26-.147 8.02-4.609 8.136-4.676.279-.16.58-.106.748-.008.164.096.606.347.84.48.232.133.221.5.013.62-.208.121-9.288 5.346-9.712 5.59-.346.2-.69.205-1.048.002C3.478 14.951.998 13.506 0 12.926v2.02l4.098 2.38c.31.18.694.177 1.004 0 .26-.147 8.02-4.609 8.136-4.676.279-.16.58-.106.748-.009.164.097.606.348.84.48.232.133.221.502.013.622l-9.712 5.59c-.346.199-.69.204-1.048.001C3.478 18.994.998 17.55 0 16.97V21c0 1.65 1.35 3 3 3h18c1.65 0 3-1.35 3-3V3c0-1.65-1.35-3-3-3z"/>
-                </svg>
-              </PaneBtn>
-            )}
-            {message.is_read && (
-              <PaneBtn onClick={handleMarkUnread} title={t('contextMenu.markUnread')}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                  <path style={{strokeLinecap: 'round'}} d="M22,10.91v7.09c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V6c0-1.1.9-2,2-2h11"/>
-                  <polyline style={{strokeLinecap: 'round'} } points="16.36 9.95 12 13 2 6"/>
-                  <circle style={{strokeMiterlimit: 10, fill: 'currentColor'}} cx="19.96" cy="6" r="3"/>
-                </svg>
-              </PaneBtn>
-            )}
-            <PaneBtn onClick={() => setShowHeaderModal(true)} title={t('contextMenu.viewHeaders')}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
-                <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
-              </svg>
-            </PaneBtn>
-            <PaneBtn onClick={async () => {
-              try {
-                await downloadMessageEml(message.id);
-              } catch {
-                addNotification({ type: 'error', title: t('message.downloadFailed.title'), body: t('message.downloadFailed.body') });
-              }
-            }} title={t('message.downloadEml')}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-            </PaneBtn>
-            <PaneBtn onClick={handlePrint} title={`${t('message.print')}${shortcutLabel('printMessage') ? ` (${shortcutLabel('printMessage')})` : ''}`}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                <polyline points="6 9 6 2 18 2 18 9"/>
-                <path d="M6 18H4a2 2 0 01-2-2v-5a2 2 0 012-2h16a2 2 0 012 2v5a2 2 0 01-2 2h-2"/>
-                <rect x="6" y="14" width="12" height="8"/>
-              </svg>
-            </PaneBtn>
-            {aiStatus?.enabled && aiStatus?.features?.summarize && body && (
-              <div style={{ position: 'relative' }} ref={aiMenuRef}>
-                <PaneBtn onClick={() => setShowAiMenu(v => !v)} title={t('message.aiActions')}
-                  style={Object.keys(aiResults).length ? { color: 'var(--accent)' } : {}}>
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>
-                    <path d="M5 3v4M19 17v4M3 5h4M17 19h4"/>
-                  </svg>
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-                </PaneBtn>
-                {showAiMenu && (<>
-                  <div onClick={() => setShowAiMenu(false)} aria-hidden style={{ position: 'fixed', inset: 0, zIndex: 49 }} />
-                  <div style={{
-                    position: 'absolute', top: '100%', right: 0, marginTop: 6, zIndex: 50, minWidth: 220,
-                    background: 'var(--bg-elevated, var(--bg-secondary))', border: '1px solid var(--border)',
-                    borderRadius: 8, boxShadow: '0 6px 20px rgba(0,0,0,0.25)', padding: 4,
-                  }}>
-                    {renderAiItem(BUILTIN_SUMMARIZE.id, t('message.summarize'), () => runAiAction(BUILTIN_SUMMARIZE))}
-                    {(aiActions || []).map(a => renderAiItem(a.id, a.label, () => runAiAction(a)))}
-                    <div style={{ height: 1, background: 'var(--border-subtle)', margin: '4px 0' }} />
-                    {renderAiItem('__manage', t('message.manageAiActions'), () => { setShowAiMenu(false); setAdminTab('ai-actions'); setShowAdmin(true); }, { muted: true })}
-                  </div>
-                </>)}
-              </div>
-            )}
-          </>
-        )}
+        {/* Keyed by message, so a menu left open does not carry over to the next one. */}
+        <MessageTools key={`tools-${message.id}-${menuEpoch}`} isMobile={isMobile} items={toolItems} ai={aiTools} />
 
-        <PaneBtn onClick={handleStarToggle} title={t('message.star')}>
-          <svg width="15" height="15" viewBox="0 0 24 24"
-            fill={message.is_starred ? 'var(--amber)' : 'none'}
-            stroke={message.is_starred ? 'var(--amber)' : 'currentColor'} strokeWidth="1.75">
-            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-          </svg>
-        </PaneBtn>
+        <ActionBtn onClick={handleStarToggle} label={t('message.star')} pressed={Boolean(message.is_starred)} touch={isMobile}>
+          <StarIcon filled={message.is_starred} />
+        </ActionBtn>
 
-        <PaneBtn onClick={handleDelete} title={t('message.delete')} danger>
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-            <polyline points="3 6 5 6 21 6"/>
-            <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
-          </svg>
-        </PaneBtn>
+        <ActionBtn onClick={handleDelete} label={t('message.delete')} danger touch={isMobile}>
+          <TrashIcon />
+        </ActionBtn>
       </div>
 
+      {/* Swiping between messages on a phone (#229): the next and previous rows of the list, opened
+          as a click on them does (utils/listSelection.js openAdjacentRow). */}
+      <SwipePager
+        enabled={isMobile && !windowMode}
+        prev={isMobile && !windowMode ? adjacentRow('prev') : null}
+        next={isMobile && !windowMode ? adjacentRow('next') : null}
+        navKey={selectedMessageId}
+        onNavigate={(dir) => openAdjacentRow(dir)}
+        onPrefetch={prefetchBody}
+      >
       {/* Single scroll container — sender card + email body scroll together */}
       <div
         ref={scrollContainerRef}
@@ -2237,6 +1648,16 @@ ${bodyContent}
                       </span>
                     </div>
                   )}
+                  {bccList.length > 0 && (
+                    <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span>Bcc </span>
+                      <span style={{ color: 'var(--text-secondary)' }}>
+                        {bccList.map((r, i) => (
+                          <span key={i}>{r.name || r.email}{i < bccList.length - 1 ? ', ' : ''}</span>
+                        ))}
+                      </span>
+                    </div>
+                  )}
                 </>
               ) : (
                 <>
@@ -2288,6 +1709,19 @@ ${bodyContent}
                       </span>
                     </div>
                   )}
+                  {bccList.length > 0 && (
+                    <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>
+                      <span>Bcc </span>
+                      <span style={{ color: 'var(--text-secondary)' }}>
+                        {bccList.map((r, i) => (
+                          <span key={i}>
+                            {r.name ? `${r.name} <${r.email}>` : r.email}
+                            {i < bccList.length - 1 ? ', ' : ''}
+                          </span>
+                        ))}
+                      </span>
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -2295,18 +1729,30 @@ ${bodyContent}
             {/* Date + account */}
             <div style={{ flexShrink: 0, textAlign: 'right' }}>
               <div style={{ fontSize: 12, color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>
-                {message.date ? format(new Date(message.date), isMobile ? 'MMM d, h:mm a' : 'MMM d, yyyy h:mm a') : ''}
+                {formatMessageDateTime(message.date, { withYear: !isMobile })}
               </div>
               <div style={{
                 fontSize: 11, marginTop: 4,
                 display: 'flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end',
               }}>
-                <div style={{
-                  width: 6, height: 6, borderRadius: '50%',
-                  background: message.account_color || 'var(--accent)',
-                }} />
+                <AccountMark accountId={message.account_id} color={message.account_color || 'var(--accent)'} size={6} />
                 <span style={{ color: 'var(--text-tertiary)' }}>{message.account_name}</span>
               </div>
+              {/* With images allowed, open-tracking images are still never loaded (the backend's
+                  image proxy): how many, with the email's other facts. */}
+              {!body?.hasBlockedRemoteImages && body?.trackersBlocked > 0 && (
+                <div title={t('message.trackersBlockedHint')} style={{
+                  fontSize: 11, marginTop: 4, marginLeft: 'auto', maxWidth: 170,
+                  display: 'flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end',
+                  color: 'var(--text-tertiary)',
+                }}>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" strokeWidth="2" style={{ flexShrink: 0 }} aria-hidden="true">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                  </svg>
+                  <span>{t('message.trackersBlocked', { count: body.trackersBlocked })}</span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -2315,90 +1761,7 @@ ${bodyContent}
         {/* Attachments */}
         {attachments.length > 0 && (
           <div style={{ marginBottom: 20 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', fontWeight: 500 }}>
-                {t('message.attachment', { count: attachments.length })}
-              </div>
-              {attachments.length > 1 && (
-                <button
-                  type="button"
-                  onClick={confirmDownloadAll}
-                  disabled={downloadingAll}
-                  style={{
-                    padding: 0, border: 'none', background: 'transparent',
-                    fontSize: 12, color: downloadAllArmed ? 'var(--red)' : 'var(--accent)', textDecoration: 'none',
-                    display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
-                  }}
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-                    <polyline points="7 10 12 15 17 10"/>
-                    <line x1="12" y1="15" x2="12" y2="3"/>
-                  </svg>
-                  {downloadAllArmed
-                    ? t('message.attachmentRisk.armed', { label: t('message.downloadAll') })
-                    : downloadingAll ? t('message.downloading') : t('message.downloadAll')}
-                </button>
-              )}
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {attachments.map((att, i) => {
-                const risk = classifyAttachmentRisk(att.filename, att.type);
-                const risky = risk.level === 'block' || risk.level === 'warn';
-                const riskColor = risk.level === 'block' ? 'var(--red)' : risk.level === 'warn' ? 'var(--amber)' : 'var(--text-tertiary)';
-                const armed = riskArmed === att.part;
-                const riskText = risk.level === 'ok' ? '' : risk.doubleExt
-                  ? t('message.attachmentRisk.doubleExt', { ext: risk.doubleExt })
-                  : t(`message.attachmentRisk.${risk.level}`, { ext: risk.ext });
-                return (
-                <button
-                  key={i}
-                  onClick={() => {
-                    if (risky && !armed) { setRiskArmed(att.part); return; }
-                    setRiskArmed(null);
-                    handleDownload(message.id, att.part, att.filename, att.type);
-                  }}
-                  disabled={downloadingPart === att.part}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 8,
-                    padding: '8px 12px', borderRadius: 8,
-                    background: 'var(--bg-secondary)',
-                    border: `1px solid ${risky ? riskColor : 'var(--border)'}`,
-                    cursor: downloadingPart === att.part ? 'wait' : 'pointer',
-                    color: 'var(--text-primary)',
-                    transition: 'background 0.1s',
-                    maxWidth: 240,
-                  }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'var(--bg-secondary)'}
-                >
-                  <span style={{ display: 'flex', flexShrink: 0, color: 'var(--text-secondary)' }}>{fileIcon(att.type)}</span>
-                  <div style={{ minWidth: 0, textAlign: 'left' }}>
-                    <div style={{
-                      fontSize: 12, fontWeight: 500,
-                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    }}>
-                      {att.filename}
-                    </div>
-                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-                      {downloadingPart === att.part ? t('message.downloading') : formatBytes(att.size)}
-                    </div>
-                    {risk.level !== 'ok' && (
-                      <div style={{ fontSize: 11, color: riskColor, fontWeight: risk.level === 'block' ? 600 : 400, whiteSpace: 'normal' }}>
-                        {armed ? t('message.attachmentRisk.armed', { label: riskText }) : riskText}
-                      </div>
-                    )}
-                  </div>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-                    stroke="var(--text-tertiary)" strokeWidth="2" style={{ flexShrink: 0 }}>
-                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-                    <polyline points="7 10 12 15 17 10"/>
-                    <line x1="12" y1="15" x2="12" y2="3"/>
-                  </svg>
-                </button>
-                );
-              })}
-            </div>
+            <AttachmentStrip key={message.id} messageId={message.id} attachments={attachments} />
           </div>
         )}
 
@@ -2454,7 +1817,7 @@ ${bodyContent}
               </div>
             </div>
             <button
-              onClick={() => { delete bodyCache.current[selectedMessageId]; setRetryKey(k => k + 1); }}
+              onClick={() => { bodyCache.delete(selectedMessageId); setRetryKey(k => k + 1); }}
               style={{
                 background: 'var(--bg-secondary)', border: '1px solid var(--border)',
                 borderRadius: 6, padding: '6px 14px', cursor: 'pointer',
@@ -2475,7 +1838,7 @@ ${bodyContent}
               {t('message.noContent')}
             </div>
             <button
-              onClick={() => { delete bodyCache.current[selectedMessageId]; setRetryKey(k => k + 1); }}
+              onClick={() => { bodyCache.delete(selectedMessageId); setRetryKey(k => k + 1); }}
               style={{
                 background: 'var(--bg-secondary)', border: '1px solid var(--border)',
                 borderRadius: 6, padding: '6px 14px', cursor: 'pointer',
@@ -2495,33 +1858,7 @@ ${bodyContent}
         <div style={{ padding: isMobile ? '0 0 16px' : '0 28px 24px' }}>
           {/* Unsubscribe banner — shown for newsletter messages that have a List-Unsubscribe header */}
           {message.list_unsubscribe && !message.unsubscribed_at && unsubscribeStatus !== 'done' && (
-            <div className="msg-notice" style={{
-              marginBottom: 10, padding: '9px 14px',
-              background: 'var(--bg-secondary)',
-              border: '1px solid var(--border)',
-              borderLeft: '3px solid var(--text-tertiary)',
-              borderRadius: 8,
-              display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
-              fontSize: 12, color: 'var(--text-secondary)',
-            }}>
-              <span style={{ flex: 1 }}>{t('message.unsubscribe.info')}</span>
-              <button
-                onClick={handleUnsubscribe}
-                disabled={unsubscribeStatus === 'loading'}
-                style={{
-                  background: 'none', border: '1px solid var(--border)',
-                  borderRadius: 5, padding: '3px 9px',
-                  cursor: unsubscribeStatus === 'loading' ? 'default' : 'pointer',
-                  color: unsubscribeStatus === 'error' ? 'var(--red, #e53e3e)' : 'var(--text-primary)',
-                  fontSize: 11, fontWeight: 500,
-                  opacity: unsubscribeStatus === 'loading' ? 0.5 : 1,
-                }}
-              >
-                {unsubscribeStatus === 'loading' ? t('common.loading') :
-                 unsubscribeStatus === 'error' ? t('message.unsubscribe.error') :
-                 t('message.unsubscribe.button')}
-              </button>
-            </div>
+            <UnsubscribeNotice status={unsubscribeStatus} onUnsubscribe={handleUnsubscribe} />
           )}
 
           {/* AI classify banner — shown for messages with no category signal when AI is available */}
@@ -2554,52 +1891,22 @@ ${bodyContent}
           )}
 
           {body.hasBlockedRemoteImages && (
-            <div className="msg-notice" style={{
-              marginBottom: 10, padding: '9px 14px',
-              background: 'var(--bg-secondary)',
-              border: '1px solid var(--border)',
-              borderLeft: '3px solid var(--accent)',
-              borderRadius: 8,
-              display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
-              fontSize: 12, color: 'var(--text-secondary)',
-            }}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-                stroke="var(--accent)" strokeWidth="2" style={{ flexShrink: 0 }}>
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              </svg>
-              <span>{t('message.remoteImagesBlocked')}</span>
-              <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
-                {[
-                  { label: t('message.loadImages'), handler: handleLoadImages, disabled: false },
-                  message.from_email && {
-                    label: t('message.allowSender', { email: message.from_email }),
-                    handler: handleAllowSender, disabled: savingAllow,
-                  },
-                  (message.from_email?.includes('@')) && {
-                    label: t('message.allowDomain', { domain: message.from_email.split('@')[1] }),
-                    handler: handleAllowDomain, disabled: savingAllow,
-                  },
-                ].filter(Boolean).map(({ label, handler, disabled }) => (
-                  <button key={label} onClick={handler} disabled={disabled}
-                    style={{
-                      background: 'none', border: '1px solid var(--border)',
-                      borderRadius: 5, padding: '3px 9px', cursor: disabled ? 'default' : 'pointer',
-                      color: 'var(--accent)', fontSize: 11, fontWeight: 500,
-                      opacity: disabled ? 0.5 : 1,
-                    }}
-                    onMouseEnter={e => { if (!disabled) e.currentTarget.style.background = 'var(--bg-tertiary)'; }}
-                    onMouseLeave={e => { e.currentTarget.style.background = 'none'; }}
-                  >{label}</button>
-                ))}
-              </div>
-            </div>
+            <RemoteImagesNotice
+              fromEmail={message.from_email}
+              onLoad={handleLoadImages}
+              onAllowSender={handleAllowSender}
+              onAllowDomain={handleAllowDomain}
+              saving={savingAllow}
+            />
           )}
           <div className="msg-card" style={{
             position: 'relative',
             padding: '14px 16px 12px',
-            background: 'white',
+            // The frame's own background, so the card and the body read as one surface: the
+            // sender's dark background where their design sets one, otherwise the theme's.
+            background: shownDark ? (frameResult?.surface || 'var(--bg-primary)') : 'white',
             borderRadius: isMobile ? 0 : 10,
-            border: isMobile ? 'none' : '1px solid var(--border-subtle)',
+            border: isMobile || shownDark ? 'none' : '1px solid var(--border-subtle)',
             overflow: 'hidden',
             // contain:layout establishes a containing block for any position:fixed
             // descendants (including the inner email div if email CSS repositions it).
@@ -2626,6 +1933,7 @@ ${bodyContent}
                     ref={innerRef}
                     data-mailflow-email={prepared?.prefix}
                     className={prepared?.prefix ?? ''}
+                    translate="yes"
                     dangerouslySetInnerHTML={prepared ? { __html: prepared.html } : undefined}
                   />
                 </div>
@@ -2634,6 +1942,8 @@ ${bodyContent}
               <MessageBodyView
                 iframeRef={iframeRef}
                 body={body}
+                dark={bodyDark}
+                onDarkResult={result => setDarkResult({ id: selectedMessageId, ...result })}
                 messageId={selectedMessageId}
                 emailScaleRef={emailScaleRef}
                 hasNativeContextTarget={hasNativeContextTarget}
@@ -2650,26 +1960,7 @@ ${bodyContent}
           padding: isMobile ? '0 0px 16px' : '0 28px 24px',
         }}>
           {message.list_unsubscribe && !message.unsubscribed_at && unsubscribeStatus !== 'done' && (
-            <div className="msg-notice" style={{
-              marginBottom: 10, padding: '9px 14px',
-              background: 'var(--bg-secondary)', border: '1px solid var(--border)',
-              borderLeft: '3px solid var(--text-tertiary)', borderRadius: 8,
-              display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
-              fontSize: 12, color: 'var(--text-secondary)',
-            }}>
-              <span style={{ flex: 1 }}>{t('message.unsubscribe.info')}</span>
-              <button onClick={handleUnsubscribe} disabled={unsubscribeStatus === 'loading'}
-                style={{
-                  background: 'none', border: '1px solid var(--border)', borderRadius: 5,
-                  padding: '3px 9px', cursor: unsubscribeStatus === 'loading' ? 'default' : 'pointer',
-                  color: unsubscribeStatus === 'error' ? 'var(--red, #e53e3e)' : 'var(--text-primary)',
-                  fontSize: 11, fontWeight: 500, opacity: unsubscribeStatus === 'loading' ? 0.5 : 1,
-                }}>
-                {unsubscribeStatus === 'loading' ? t('common.loading') :
-                 unsubscribeStatus === 'error' ? t('message.unsubscribe.error') :
-                 t('message.unsubscribe.button')}
-              </button>
-            </div>
+            <UnsubscribeNotice status={unsubscribeStatus} onUnsubscribe={handleUnsubscribe} />
           )}
           {!message.category && (categorizationEnabled || accounts.find(a => a.id === message.account_id)?.categorization_enabled) && aiStatus?.enabled && (
             <div className="msg-notice" style={{
@@ -2694,17 +1985,23 @@ ${bodyContent}
           <div className="msg-card" style={{
             margin: 0, padding: '14px 16px 12px',
             whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-            fontSize: 14, color: '#1a1a1a', lineHeight: 1.7,
-            fontFamily: 'DM Sans, sans-serif', background: 'white',
+            fontSize: 14, color: bodyDark ? 'var(--text-primary)' : '#1a1a1a', lineHeight: 1.7,
+            fontFamily: 'DM Sans, sans-serif', background: bodyDark ? 'var(--bg-primary)' : 'white',
             borderRadius: isMobile ? 0 : 10,
-            border: isMobile ? 'none' : '1px solid var(--border-subtle)',
+            border: isMobile || bodyDark ? 'none' : '1px solid var(--border-subtle)',
             overflow: 'hidden',
           }}
+            // <body> is translate="no" so a browser translator cannot break React's DOM (see
+            // index.html). A message someone sent in another language should still translate,
+            // and React writes this body in one piece, so the translator has nothing of React's
+            // to break in here.
+            translate="yes"
             dangerouslySetInnerHTML={{ __html: linkifyText(body.text) }}
           />
         </div>
       )}
       </div>{/* end single scroll container */}
+      </SwipePager>
 
       {/* Mobile move-to-folder bottom sheet */}
       {showMovePicker && isMobile && (
@@ -2751,84 +2048,42 @@ ${bodyContent}
                 <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
                   {t('contextMenu.folders.loading')}
                 </div>
-              ) : movePickerFolders.length === 0 ? (
-                <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
-                  {t('contextMenu.folders.empty')}
-                </div>
-              ) : (() => {
-                const q = moveSearch.trim().toLowerCase();
-                if (q) {
-                  const filtered = movePickerFolders
-                    .filter(f => f.path !== message.folder && folderMatchesQuery(f, q));
-                  return filtered.length === 0 ? (
-                    <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
-                      {t('contextMenu.folders.empty')}
-                    </div>
-                  ) : filtered.map(f => (
-                    <button
-                      key={f.path}
-                      onClick={() => handleMoveToFolder(f.path)}
-                      style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
-                    >
-                      <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                      <FolderPathLabel folder={f} />
-                    </button>
-                  ));
-                }
-                return (
-                  <>
-                    {recentForMove.length > 0 && (
-                      <>
+              ) : (
+                <>
+                {moveSections.map((section, i) => {
+                  const heading = movePickerSectionHeading(section, t);
+                  return (
+                    <Fragment key={section.key}>
+                      {heading && (
                         <div style={{ padding: '8px 20px 4px', fontSize: 11, fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                          {t('contextMenu.folders.recent')}
+                          {heading}
                         </div>
-                        {recentForMove.map(f => (
+                      )}
+                      {section.rows.map(row => {
+                        const isAction = row.kind === 'action';
+                        const f = row.folder;
+                        return (
                           <button
-                            key={`recent-${f.path}`}
-                            onClick={() => handleMoveToFolder(f.path)}
+                            key={isAction ? `action-${row.item.key}` : f.path}
+                            onClick={isAction ? () => runMovePickerAction(row.item, closeMovePicker) : () => handleMoveToFolder(f.path)}
                             style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                           >
-                            <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                            <FolderPathLabel folder={f} />
+                            <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>{isAction ? row.item.renderIcon(18) : <FolderIcon specialUse={f.special_use} size={18} />}</span>
+                            {isAction ? <FolderPathLabel label={row.item.label} /> : <FolderPathLabel folder={f} label={f.favoriteLabel} />}
                           </button>
-                        ))}
-                        <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
-                      </>
-                    )}
-                    {favoritesForMove.length > 0 && (
-                      <>
-                        <div style={{ padding: '8px 20px 4px', fontSize: 11, fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                          {t('contextMenu.folders.favorites')}
-                        </div>
-                        {favoritesForMove.map(f => (
-                          <button
-                            key={`fav-${f.path}`}
-                            onClick={() => handleMoveToFolder(f.path)}
-                            style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
-                          >
-                            <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                            <FolderPathLabel folder={f} />
-                          </button>
-                        ))}
-                        <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
-                      </>
-                    )}
-                    {movePickerFolders
-                      .filter(f => f.path !== message.folder)
-                      .map(f => (
-                        <button
-                          key={f.path}
-                          onClick={() => handleMoveToFolder(f.path)}
-                          style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
-                        >
-                          <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                          <FolderPathLabel folder={f} />
-                        </button>
-                      ))
-                    }
-                  </>
-                );
-              })()}
+                        );
+                      })}
+                      {i < moveSections.length - 1 && <div style={{ height: 6 }} />}
+                    </Fragment>
+                  );
+                })}
+                {moveFoldersEmpty && (
+                  <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
+                    {t('contextMenu.folders.empty')}
+                  </div>
+                )}
+                </>
+              )}
             </div>
           </div>
         </>
@@ -2976,145 +2231,6 @@ ${bodyContent}
         <TodoistTaskModal
           message={message}
           onClose={() => setShowTodoistModal(false)}
-        />
-      )}
-    </div>
-  );
-}
-
-function PaneBtn({ children, onClick, title, danger, style: extraStyle }) {
-  const [hov, setHov] = useState(false);
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      className="btn-press"
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
-      style={{
-        background: hov ? (danger ? 'rgba(248,113,113,0.1)' : 'var(--bg-tertiary)') : 'transparent',
-        border: '1px solid ' + (hov ? (danger ? 'rgba(248,113,113,0.3)' : 'var(--border)') : 'transparent'),
-        borderRadius: 6, padding: '6px 8px',
-        color: danger ? (hov ? 'var(--red)' : 'var(--text-tertiary)') : 'var(--text-secondary)',
-        cursor: 'pointer', fontSize: 13,
-        display: 'flex', alignItems: 'center', gap: 5,
-        transition: 'all 0.1s',
-        ...extraStyle,
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-// A pinned AI result box shown above the message (#204). Collapsible to keep
-// multiple results from crowding the view; offers regenerate and dismiss.
-function AiResultBox({ result, canRegen, onRegen, onDismiss }) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  const loading = result.status === 'loading';
-  const error = result.status === 'error';
-  // Render the (markdown) AI output to sanitized HTML. Memoized on the text so toggling
-  // expand/collapse doesn't re-parse; re-runs as text streams in during generation (#215).
-  const html = useMemo(() => renderMarkdown(result.text || ''), [result.text]);
-  const [copied, setCopied] = useState(false);
-  const copyTimerRef = useRef(null);
-  useEffect(() => () => clearTimeout(copyTimerRef.current), []);
-  // Copy the output to the clipboard as BOTH rich text (the rendered HTML) and source
-  // (the raw markdown), so pasting into a rich editor gives formatting and pasting into a
-  // plain field gives the markdown source (#215). Falls back to plain text where the async
-  // clipboard / ClipboardItem isn't available (e.g. non-secure context).
-  const handleCopy = async () => {
-    const source = result.text || '';
-    const flash = () => {
-      setCopied(true);
-      clearTimeout(copyTimerRef.current);
-      copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
-    };
-    try {
-      if (navigator.clipboard?.write && window.ClipboardItem) {
-        await navigator.clipboard.write([new window.ClipboardItem({
-          'text/html': new Blob([html], { type: 'text/html' }),
-          'text/plain': new Blob([source], { type: 'text/plain' }),
-        })]);
-      } else {
-        const { ok } = await copyToClipboard(source);
-        if (!ok) return;
-      }
-      flash();
-    } catch {
-      // The rich path can fail on its own (no ClipboardItem, a rejected write). Fall back
-      // to plain text through the shared helper, which also covers non-secure contexts
-      // where navigator.clipboard does not exist at all.
-      const { ok } = await copyToClipboard(source);
-      if (ok) flash();
-    }
-  };
-  const iconBtn = {
-    background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)',
-    padding: '2px 4px', display: 'flex', alignItems: 'center', lineHeight: 1,
-  };
-  return (
-    <div style={{
-      padding: '12px 16px', background: 'var(--bg-secondary)',
-      border: '1px solid var(--border)', borderLeft: '3px solid var(--accent)',
-      borderRadius: 8, fontSize: 13, lineHeight: 1.55, color: 'var(--text-primary)',
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
-        <span style={{
-          fontSize: 11, fontWeight: 600, color: 'var(--accent)', textTransform: 'uppercase',
-          letterSpacing: '0.04em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-        }}>
-          {result.label}
-        </span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
-          {loading && (
-            <span style={{ fontSize: 11, color: 'var(--text-tertiary)', fontStyle: 'italic', marginRight: 4 }}>
-              {t('compose.toolbar.aiGenerating')}
-            </span>
-          )}
-          {canRegen && !loading && (
-            <button onClick={onRegen} title={t('message.aiRegenerate')} aria-label={t('message.aiRegenerate')} style={iconBtn}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
-                <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
-              </svg>
-            </button>
-          )}
-          {!error && !loading && result.text && (
-            <button onClick={handleCopy} title={copied ? t('message.aiCopied') : t('message.aiCopy')} aria-label={copied ? t('message.aiCopied') : t('message.aiCopy')} style={iconBtn}>
-              {copied ? (
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
-              ) : (
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                </svg>
-              )}
-            </button>
-          )}
-          {!error && !loading && (
-            <button onClick={() => setExpanded(v => !v)} title={expanded ? t('message.aiCollapse') : t('message.aiExpand')} aria-label={expanded ? t('message.aiCollapse') : t('message.aiExpand')} style={iconBtn}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-                style={{ transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>
-                <polyline points="6 9 12 15 18 9"/>
-              </svg>
-            </button>
-          )}
-          <button onClick={onDismiss} aria-label={t('message.summaryDismiss')} style={{ ...iconBtn, fontSize: 14 }}>×</button>
-        </div>
-      </div>
-      {loading && !result.text ? (
-        <span style={{ color: 'var(--text-tertiary)', fontStyle: 'italic' }}>{t('compose.toolbar.aiGenerating')}</span>
-      ) : error ? (
-        <span style={{ color: 'var(--red)' }}>{t('compose.toolbar.aiError', { message: result.text })}</span>
-      ) : (
-        <div
-          className="ai-markdown"
-          style={{ maxHeight: expanded ? 'none' : 220, overflowY: expanded ? 'visible' : 'auto' }}
-          dangerouslySetInnerHTML={{ __html: html }}
         />
       )}
     </div>

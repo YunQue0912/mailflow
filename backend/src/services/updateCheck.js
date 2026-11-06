@@ -7,7 +7,7 @@
 // UPDATE_CHECK_DISABLED=true to turn the check off entirely (air-gapped deployments).
 import { safeFetch } from './safeFetch.js';
 
-const REPO = (process.env.UPDATE_CHECK_REPO || 'maathimself/mailflow').replace(/[^\w./-]/g, '');
+const REPO = (process.env.UPDATE_CHECK_REPO || 'YunQue0912/mailflow').replace(/[^\w./-]/g, '');
 const RELEASES_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
 export const RELEASES_PAGE = `https://github.com/${REPO}/releases`;
 
@@ -19,14 +19,16 @@ let cache = { latest: null, url: null };
 let nextCheck = 0;
 
 function parse(v) {
-  const m = String(v || '').trim().replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)/);
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  const m = String(v || '').trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:-custom\.(\d+))?$/i);
+  if (!m) return null;
+  const parts = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4] || 0)];
+  return parts.every(Number.isSafeInteger) ? parts : null;
 }
 
 function isNewer(latest, current) {
   const a = parse(latest), b = parse(current);
   if (!a || !b) return false;
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < a.length; i++) {
     if (a[i] !== b[i]) return a[i] > b[i];
   }
   return false;
@@ -40,6 +42,7 @@ async function refresh() {
   if (!res.ok) throw new Error(`GitHub ${res.status}`);
   const data = await res.json();
   const tag = String(data.tag_name || '').trim().replace(/^v/i, '');
+  if (data.draft || data.prerelease || !parse(tag)) throw new Error('Invalid stable release');
   return { latest: tag || null, url: typeof data.html_url === 'string' ? data.html_url : null };
 }
 

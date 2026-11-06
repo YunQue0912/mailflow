@@ -53,16 +53,16 @@ npm test               # full suite
 
 Everything a plugin may do, grouped:
 
-- **Labels (read):** `listThreadHeadsByLabels`, `notifyOnLabelTouch`
-- **Labels (write):** `applyLabel`, `removeLabel`, `markThreadRead`, `ensureLabelFolders`, `resolveLabelCopyUid`
+- **Labels (read):** `listThreadHeadsByLabels`, `getLabelMetadata` (up to 100 account-scoped row IDs; live thread/message copies and oldest message date per folder), `notifyOnLabelTouch`, `hasMessageCopy` (checks one copy on the server), `isLabelStoreAccount` (Gmail: folders are labels), `supportsUidPlus` (whether a move names the new uid; false when unknown)
+- **Labels (write):** `applyLabel`, `removeLabel`, `markThreadRead`, `markCopySeen`, `ensureLabelFolders`, `resolveLabelCopyUid`
 - **Archive:** `archiveInboxCopy`
 - **Realtime:** `broadcast` (scoped to one user)
-- **Summarize:** `summarizeMessage`, `summarizeAvailable` (fails closed when the AI provider is off)
+- **Summarize:** `summarizeMessage({ userId, … })`, `summarizeAvailable(userId)` (both fail closed when the AI provider or summaries are off, or AI is turned off for that user)
 - **Per-plugin storage:** `storage.*` (the `plugin_data` table — KV + blobs, owner-scoped, cascade-cleaned)
 - **Per-account plugin config:** `getAccountConfig`, `setAccountConfig` (the `plugin_account_config` table)
 - **Per-message annotations:** `getMessageAnnotations`, `setMessageAnnotation` (namespaced `messages.plugin_annotations`)
 - **Activation:** `isPluginActivated`, `isPluginActivatedForAccount`
-- **Logging:** `logger` · **Auth middleware:** `requireAuth` · **Folder resolution:** `resolveAllDraftsPaths`
+- **Logging:** `logger` · **Auth middleware:** `requireAuth` · **Folder resolution:** `resolveAllDraftsPaths`, `resolveAllTrashPaths`, `resolveAllSpamPaths`
 - **Ownership-scoped mail/account reads:** `loadOwnedMessage`, `getOwnedAccount`, `listUserAccounts`, `getAccountAddresses`, `getMessagesByThreadKeys`, `getMessageCopyFolders`, `getMessageFields`, the thread-key resolvers, …
 
 If you need something not here, **don't reach around the boundary** — ask, and we add a reviewed
@@ -98,6 +98,12 @@ Core carries no plugin-specific UI code. A plugin registers into a small in-proc
 - `registerWsHandler(type, { pluginId, handler })` / `registerReconnectHandler(...)` — handle WS
   message types core doesn't, and resync on reconnect.
 - `registerPluginMeta(pluginId, meta)` — static metadata (e.g. where the plugin's settings live).
+
+The neutral `message-row-meta` slot receives `{ message }` on ordinary flat and threaded rows.
+GTD fills it for inbox/search with its own metadata endpoint, account gating and state chips;
+core message queries remain plugin-agnostic. Waiting ages use the oldest labeled message date,
+not a classification timestamp. GTD batches row IDs per account, refreshes after mutations and
+realtime events, and clears its cache when the plugin or session ends.
 
 **Caveat — the one place core still knows about GTD:** the inbox pill-tab strip (Inbox/Todo/Waiting/…)
 in `MessageList.jsx` is interleaved with the core *category* tabs (shared tab strip + active-tab

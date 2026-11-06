@@ -81,6 +81,12 @@ describe('scrubReport (safety net)', () => {
     expect(scrubbed.n).toBe(3);
     expect(counters.hitsRedacted).toBeGreaterThanOrEqual(6);
   });
+
+  it('redacts a MailFlow API token, which no other pattern catches', () => {
+    const token = `mfat_${'Ab3_-x'.repeat(7)}z`;
+    const { scrubbed } = scrubReport({ bare: token, inText: `token was ${token}`, header: `Bearer ${token}` });
+    expect(scrubbed).toEqual({ bare: '[redacted]', inText: '[redacted]', header: '[redacted]' });
+  });
 });
 
 describe('buildServerReport', () => {
@@ -203,5 +209,32 @@ describe('buildServerReport — unread counts INBOX only', () => {
     expect(unreadCall[0]).toMatch(/m\.folder = 'INBOX'/);
     expect(unreadCall[0]).toMatch(/is_read = false/);
     expect(unreadCall[1]).toEqual(['user-9']);
+  });
+});
+
+describe('buildServerReport: scheduled send (#543)', () => {
+  beforeEach(() => query.mockReset());
+
+  it('counts the user\'s scheduled messages by status, with nothing of the messages', async () => {
+    query.mockImplementation((sql) => {
+      if (/FROM scheduled_messages/.test(sql)) {
+        return Promise.resolve({ rows: [
+          { status: 'scheduled', count: 3, oldest_due_seconds: 7260 },
+          { status: 'failed', count: 1, oldest_due_seconds: null },
+        ] });
+      }
+      return Promise.resolve({ rows: [] });
+    });
+    const report = await buildServerReport('user-9', 'deadbeefdeadbeef');
+    expect(report.scheduledSend).toEqual({ lastTickAgeSeconds: null, counts: { scheduled: 3, failed: 1 }, oldestOverdueMinutes: 121 });
+    const call = query.mock.calls.find(c => /FROM scheduled_messages/.test(c[0]));
+    expect(call[0]).toMatch(/WHERE user_id = \$1/);
+    expect(call[0]).not.toMatch(/_enc/);
+    expect(call[1]).toEqual(['user-9']);
+  });
+
+  it('leaves the section out when it cannot be read', async () => {
+    query.mockImplementation((sql) => (/FROM scheduled_messages/.test(sql) ? Promise.reject(new Error('down')) : Promise.resolve({ rows: [] })));
+    expect((await buildServerReport('user-9', 'deadbeefdeadbeef')).scheduledSend).toBeNull();
   });
 });

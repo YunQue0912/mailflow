@@ -119,6 +119,9 @@ const SAME_VALUE_ALLOWED = {
   'admin.about.updates.cancel': [['es', 'ptBR']],
   'admin.about.updates.install': [['es', 'ptBR']],
   'admin.about.updates.installAndroid': [['es', 'ptBR']],
+  // ── List sort menu (#528) ───────────────────────────────────────────────────
+  'messageList.sortSummary':                'any', // "{{sort}}, {{dir}}": only the placeholders and a comma
+  'messageList.sortDate':                   [['en', 'fr'], ['it', 'ptBR', 'pl'], ['cs', 'de']], // Date / Data / Datum
   // ── Universal placeholders / brand names (all locales share) ───────────────
   'admin.about.kofi':                       'any', // Ko-fi — brand name, same everywhere
   'admin.about.githubSponsors':             'any', // GitHub Sponsors — product name, same everywhere
@@ -128,16 +131,21 @@ const SAME_VALUE_ALLOWED = {
   'admin.accounts.presetGmail':             'any', // Gmail
   'admin.accounts.presetIcloud':            'any', // iCloud
   'admin.accounts.presetYahoo':             'any', // Yahoo Mail
+  'addAccount.tile.outlook':                'any', // Outlook.com, Hotmail, Live, MSN
+  'addAccount.tile.gmail':                  'any', // Gmail
+  'addAccount.tile.yahoo':                  'any', // Yahoo Mail
+  'addAccount.tile.icloud':                 'any', // iCloud Mail
+  'mailSignIn.ms.title':                    'any', // Microsoft
   'admin.accounts.smtpHostPh':              'any', // smtp.gmail.com
   'admin.ai.baseUrlPh':                      'any', // http://localhost:11434/v1
   'admin.ai.chatgptModelPh':                 'any', // gpt-5.6-luna
   'admin.appearance.customCssPlaceholder':   'any', // CSS code snippet, same in all locales
   'admin.integrations.microsoft.clientIdPh':'any', // xxxxxxxx-xxxx-…
-  'admin.integrations.microsoft.title':     'any', // Microsoft 365 / Outlook.com
   'admin.integrations.google.title':        'any', // Gmail / Google Workspace — brand names
   'admin.integrations.google.clientIdPh':   'any', // xxxxxxxx.apps.googleusercontent.com
   'admin.integrations.google.clientSecretPh':'any', // GOCSPX-…
   'admin.security.totpVerifyPh':            'any', // 000000
+  'admin.security.ssoLinkContinue':         [['es', 'ptBR']], // Continuar
   'admin.sso.adminGroupClaimPh':            'any', // groups
   'admin.sso.adminGroupValuePh':            'any', // mailflow-admins
   'admin.sso.issuerUrlPh':                  'any', // https://accounts.google.com
@@ -149,6 +157,8 @@ const SAME_VALUE_ALLOWED = {
   'admin.about.version': [['de', 'en', 'fr']],
   // "via" (on-behalf-of sender, #366) — identical preposition in en and fr
   'message.via': [['en', 'fr', 'ptBR']],
+  // "por {{actor}}" (who made an admin change) — the same preposition in es and pt-BR
+  'admin.security.byActor': [['es', 'ptBR']],
   // "Account" — identical in en/it; "Konto" — identical in de/pl
   'admin.cleanup.account': [['en', 'it'], ['de', 'pl']],
   // "{{n}} min" — the "min" abbreviation is shared in en, es, fr, it
@@ -169,10 +179,10 @@ const SAME_VALUE_ALLOWED = {
   'admin.integrations.google.clientId': [['fr', 'it'], ['en', 'ptBR']],
 
 
-  // email placeholder — example.com address looks the same in en, ru, zhCN
-  'admin.accounts.emailPh':    [['en', 'ru', 'zhCN']],
-  'admin.aliases.emailPh':     [['de', 'en', 'ru', 'zhCN']],
-  'admin.privacy.addDomainPh': [['cs', 'de', 'en', 'pl', 'ru', 'zhCN']],
+  // email placeholder — example.com address looks the same across these locales
+  'admin.accounts.emailPh':    [['en', 'ko', 'ru', 'zhCN']],
+  'admin.aliases.emailPh':     [['de', 'en', 'ko', 'ru', 'zhCN']],
+  'admin.privacy.addDomainPh': [['cs', 'de', 'en', 'ko', 'pl', 'ru', 'zhCN']],
 
   // ── Antispam v0.2 ──────────────────────────────────────────────────────────
   // "Antispam" — international loanword, same spelling in en, it, de, es, fr, cs
@@ -192,14 +202,28 @@ const SAME_VALUE_ALLOWED = {
   'spam.verdict.spam':            [['cs', 'de', 'en', 'es', 'fr', 'it', 'pl', 'ptBR']],
   // authserv-id example — a literal hostname, identical in every locale
   'admin.accounts.trustedAuthservPlaceholder': 'any',
-  'admin.privacy.addSenderPh': [['en', 'ru', 'zhCN']],
+  'admin.privacy.addSenderPh': [['en', 'ko', 'ru', 'zhCN']],
+  'admin.blockList.emailPlaceholder': [['en', 'ko']],
   'admin.aliases.replyToLabel': [['en', 'pl']],
+  // Send later (#543): "Date" is spelled alike in en and fr, "Datum" in cs and de, "Data" in
+  // it, pl and pt-BR
+  'compose.scheduleSend.dateLabel': [['en', 'fr'], ['cs', 'de'], ['it', 'pl', 'ptBR']],
+  // The Scheduled view (#543): Spanish and Portuguese share "Editar", "Enviando", "Abrir" and
+  // "Para:"; a time with its zone in parentheses is a format, the same everywhere but Chinese,
+  // which uses full-width parentheses.
+  'scheduled.actions.edit': [['es', 'ptBR']],
+  'scheduled.actions.restore': [['es', 'ptBR']],
+  'scheduled.chip.sending': [['es', 'ptBR']],
+  'scheduled.toast.open': [['es', 'ptBR']],
+  'scheduled.to': [['es', 'ptBR']],
+  'scheduled.toMore': [['es', 'ptBR']],
+  'scheduled.zoneTime': [['cs', 'de', 'en', 'es', 'fr', 'it', 'ko', 'pl', 'ptBR', 'ru']],
 
   'admin.rules.actionForwardPlaceholder': [['es', 'it']],
-  'admin.sso.domainsPh':       [['de', 'en', 'pl', 'ru', 'zhCN']],
+  'admin.sso.domainsPh':       [['de', 'en', 'ko', 'pl', 'ru', 'zhCN']],
   'admin.users.invitePh':      [['cs', 'de', 'en', 'ru', 'zhCN']],
-  'compose.bccPh':             [['de', 'en', 'pl', 'ru', 'zhCN']],
-  'compose.ccPh':              [['de', 'en', 'pl', 'ru', 'zhCN']],
+  'compose.bccPh':             [['de', 'en', 'ko', 'pl', 'ru', 'zhCN']],
+  'compose.ccPh':              [['de', 'en', 'ko', 'pl', 'ru', 'zhCN']],
   'compose.toPh':              [['en', 'ru', 'zhCN']],
 
   // "Port" — universal technical term, same in de, en, fr
@@ -230,8 +254,6 @@ const SAME_VALUE_ALLOWED = {
   // "QR code" — same in en and es; de "QR-Code", fr "code QR", it "codice QR", ru "QR-код", zhCN "QR码"
   'admin.security.qrCodeAlt': [['en', 'es', 'ptBR']],
 
-  // "Visita:" — "Visit:" translates identically in es and it (Romance languages)
-  'admin.integrations.microsoft.deviceCodeVisit': [['es', 'it']],
 
   // "Notifications" — same spelling in en and fr
   'admin.notifications.title':  [['en', 'fr']],
@@ -270,8 +292,16 @@ const SAME_VALUE_ALLOWED = {
   // "Single Sign-On" — international term, same in de, en, it
   'admin.sso.title': [['de', 'en', 'it']],
 
-  // "SSO" — acronym, same in de, en, es, fr, it, ru
-  'admin.tabs.sso': [['cs', 'de', 'en', 'es', 'fr', 'it', 'pl', 'ptBR', 'ru']],
+  // "SSO" — international acronym
+  'admin.tabs.sso': [['cs', 'de', 'en', 'es', 'fr', 'it', 'ko', 'pl', 'ptBR', 'ru']],
+
+  // "Backup" — loanword used as-is in it and ptBR; "Restaurar…" is the same verb in es and ptBR
+  'admin.tabs.backup':    [['en', 'it', 'ptBR']],
+  // "Continuar", "Copiar código", "Copiado": the same words in Spanish and Portuguese
+  'addAccount.continue': [['es', 'ptBR']],
+  'msSignIn.copy':       [['es', 'ptBR']],
+  'msSignIn.copied':     [['es', 'ptBR']],
+  'admin.backup.restore': [['es', 'ptBR']],
 
   // "Telefon" / "Projekt" — established Polish/German technical loanwords
   'contacts.fields.phone': [['cs', 'de', 'pl']],
@@ -331,7 +361,7 @@ const SAME_VALUE_ALLOWED = {
   // "Permanent" — same in en and fr; "Permanente" same in es and it
   'admin.security.mfaDeviceTrustForever': [['en', 'fr'], ['es', 'it', 'ptBR']],
   // email placeholder — en and ru share same format
-  'admin.security.recoveryEmailPh': [['en', 'ru', 'zhCN']],
+  'admin.security.recoveryEmailPh': [['en', 'ko', 'ru', 'zhCN']],
 
   // ── Email categorization ───────────────────────────────────────────────────
   // URL placeholder — identical in all locales
@@ -411,9 +441,6 @@ const SAME_VALUE_ALLOWED = {
   'admin.integrations.carddav.disconnect':           [['es', 'ptBR']], // "Desconectar"
   'admin.integrations.carddav.syncing':              [['es', 'ptBR']], // "Sincronizando…"
   'admin.integrations.google.configured':            [['es', 'ptBR']], // "Configurado"
-  'admin.integrations.microsoft.configured':         [['es', 'ptBR']], // "Configurado"
-  'admin.integrations.microsoft.deviceCodeCancel':   [['es', 'ptBR']], // "Cancelar"
-  'admin.integrations.tabApps':                      [['en', 'ptBR']], // "Apps"
   'admin.integrations.todoist.connect':              [['es', 'ptBR']], // "Conectar"
   'admin.integrations.todoist.connected':            [['es', 'ptBR']], // "Conectado"
   'admin.integrations.todoist.connecting':           [['es', 'ptBR']], // "Conectando..."
@@ -535,6 +562,43 @@ const SAME_VALUE_ALLOWED = {
   // is the natural word for the wide preset in both Italian and Portuguese.
   'messageList.layouts.compact.label': [['en', 'fr'], ['es', 'ptBR']],
   'messageList.layouts.wide.label':    [['it', 'ptBR']],
+  // The same words as admin.appearance.layout and the usual "Menu"; "Favoritos" in both.
+  'messageList.layout': [['de', 'en', 'it', 'ptBR']],
+  'messageList.menu':   [['en', 'fr', 'it', 'pl', 'ptBR']],
+  'sidebar.favorites':  [['es', 'ptBR']],
+
+  // ── Attachment viewer ─────────────────────────────────────────────────────
+  // "Imprimir" / "Preparando…" / "Abrir" / "{{current}} de {{total}}" are spelled the same in
+  // Spanish and Portuguese; Czech and Polish share "{{current}} z {{total}}".
+  'message.preview.print':          [['es', 'ptBR']],
+  'message.preview.preparingPrint': [['es', 'ptBR']],
+  'message.preview.position':       [['es', 'ptBR'], ['cs', 'pl']],
+  'message.preview.passwordSubmit': [['es', 'ptBR']],
+
+  // ── Admin user editor ─────────────────────────────────────────────────────
+  // "Editar" is the same word in Spanish and Portuguese.
+  'admin.users.edit':      [['es', 'ptBR']],
+  'admin.users.editTitle': [['es', 'ptBR']],
+
+  // ── Blocked trackers ──────────────────────────────────────────────────────
+  // "rastreador(es) bloqueado(s)" is spelled the same in Spanish and Portuguese.
+  'message.trackersBlocked_one':   [['es', 'ptBR']],
+  'message.trackersBlocked_other': [['es', 'ptBR']],
+
+  // ── Mailbox icon ──────────────────────────────────────────────────────────
+  // "Ikona" is the word in both Czech and Polish.
+  'admin.accounts.icon': [['cs', 'pl']],
+  // "Mail" is the usual German word too.
+  'admin.tabs.groupMail': [['de', 'en']],
+  // "Comportamento" is the word in both Italian and Portuguese.
+  'admin.tabs.behavior': [['it', 'ptBR']],
+
+  // ── API tokens (#617) ─────────────────────────────────────────────────────
+  // "Tokens de API" in Spanish and Portuguese, "Tokeny API" in Czech and Polish; "Nome" in
+  // Italian and Portuguese; "Copiado" in Spanish and Portuguese, as for admin.sso.copiedUri.
+  'admin.apiTokens.title':     [['es', 'ptBR'], ['cs', 'pl']],
+  'admin.apiTokens.nameLabel': [['it', 'ptBR']],
+  'admin.apiTokens.copied':    [['es', 'ptBR']],
 };
 
 // Locale-specific plural forms are allowed per locale. A locale may add forms
@@ -586,6 +650,7 @@ const DYNAMIC_KEYS = new Set([
   'admin.tabs.integrations',
   'admin.tabs.users',
   'admin.tabs.sso',
+  'admin.tabs.backup',
   'admin.tabs.security',
   'admin.tabs.notifications',
   'admin.tabs.shortcuts',
@@ -791,10 +856,15 @@ function loadSourceText() {
   return out.join('\n');
 }
 
-function loadLiteralSourceTranslationKeys(prefix) {
+// The keys under these prefixes that the source names: in a t('…') call, or as a quoted string
+// kept in a table and handed to t() later (ApiTokensSection's scopes). The render tests echo keys
+// back, and "no unused keys" is a substring search, so neither notices a key that no locale has.
+function loadLiteralSourceTranslationKeys(prefixes) {
   const srcRoot = resolve(dir, '../..');
   const keys = new Set();
   const literalTranslationCall = /(?<![\w$.])t\(\s*['"]([^'"]+)['"]/g;
+  const quotedKey = /(['"])([\w.]+)\1/g;
+  const wanted = (key) => prefixes.some(prefix => key.startsWith(prefix));
 
   function walk(d) {
     for (const entry of readdirSync(d, { withFileTypes: true })) {
@@ -808,7 +878,10 @@ function loadLiteralSourceTranslationKeys(prefix) {
       ) {
         const source = readFileSync(full, 'utf8');
         for (const match of source.matchAll(literalTranslationCall)) {
-          if (match[1].startsWith(prefix)) keys.add(match[1]);
+          if (wanted(match[1])) keys.add(match[1]);
+        }
+        for (const match of source.matchAll(quotedKey)) {
+          if (wanted(match[2])) keys.add(match[2]);
         }
       }
     }
@@ -864,8 +937,8 @@ describe('i18n locale files', () => {
         `Unused keys (remove from all locale files or add to DYNAMIC_KEYS if referenced dynamically):\n${unused.map(k => `  - ${k}`).join('\n')}`);
     });
 
-    it('every literal admin.ai source translation key exists in every locale', () => {
-      const sourceKeys = loadLiteralSourceTranslationKeys('admin.ai.');
+    it('every admin.ai, admin.apiTokens and admin.security key the source names exists in every locale', () => {
+      const sourceKeys = loadLiteralSourceTranslationKeys(['admin.ai.', 'admin.apiTokens.', 'admin.security.']);
       const missing = [];
       for (const lang of langs) {
         const present = new Set(Object.keys(locales[lang]));

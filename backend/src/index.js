@@ -2,16 +2,19 @@ import express from 'express';
 import 'express-async-errors'; // route a rejected async handler to the error middleware (Express 4 doesn't)
 import session from 'express-session';
 import cors from 'cors';
+import { corsExceptDav } from './middleware/corsExceptDav.js';
 import { createServer } from 'http';
 import { readFileSync } from 'fs';
-import { WebSocketServer } from 'ws';
 import RedisStore from 'connect-redis';
 import 'dotenv/config';
 import { redisClient } from './services/redis.js';
+import { parseTrustProxyHops } from './utils/trustProxy.js';
 import { buildSessionOptions } from './utils/sessionConfig.js';
+import { mountApiAuth } from './middleware/apiChain.js';
 
 import sendRoutes from './routes/send.js';
 import draftRoutes from './routes/draft.js';
+import scheduledRoutes from './routes/scheduled.js';
 import oauthRoutes from './routes/oauth.js';
 import integrationsRoutes, { loadIntegrationConfigs } from './routes/integrations.js';
 import authRoutes from './routes/auth.js';
@@ -33,6 +36,8 @@ import { setMailEngine } from './plugins/mailEngine.js';
 import pluginsRoutes from './routes/plugins.js';
 import senderFaviconsRoutes from './routes/senderFavicons.js';
 import diagnosticsRoutes from './routes/diagnostics.js';
+import backupRoutes from './routes/backup.js';
+import apiTokenRoutes from './routes/apiTokens.js';
 import spamRoutes, { accountSpamRouter } from './routes/spam.js';
 import carddavRouter from './routes/carddav.js';
 import carddavAccountRouter from './routes/carddavAccount.js';
@@ -42,10 +47,12 @@ import { encryptExistingCredentials, query } from './services/db.js';
 import { runMigrations } from './services/migrations.js';
 import { parseVCard } from './utils/vcard.js';
 import { reloadAuthSettings } from './services/authLimiter.js';
-import { setupWebSocket } from './services/websocket.js';
+import { closeWebSocketClients, createWebSocketServer, setupWebSocket } from './services/websocket.js';
 import { ImapManager } from './services/imapManager.js';
 import { getUpdateStatus } from './services/updateCheck.js';
 import { recordHttp } from './services/performanceMetrics.js';
+import { shutDown } from './services/sendShutdown.js';
+import { startScheduledSender } from './services/scheduledSend.js';
 
 const packageMeta = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
 let buildMeta = {};
@@ -54,15 +61,21 @@ try {
 } catch {
   // Local dev runs may not have build metadata yet.
 }
-const APP_VERSION = (process.env.APP_VERSION || buildMeta.version || packageMeta.version).replace(/^v[.]?/, '');
+export const APP_VERSION = (process.env.APP_VERSION || buildMeta.version || packageMeta.version).replace(/^v[.]?/, '');
 
 const app = express();
 // Trust the nginx reverse proxy so req.secure reflects HTTPS correctly.
 // Without this, express-session sees HTTP (from nginx) and refuses to set
 // the Secure cookie, meaning the session cookie is never sent to the browser.
-app.set('trust proxy', 1);
+// The hop count also decides req.ip, which keys the login rate limit.
+const trustProxyHops = parseTrustProxyHops(process.env.TRUST_PROXY_HOPS);
+if (trustProxyHops === null) {
+  console.error(`FATAL: TRUST_PROXY_HOPS must be a whole number of at least 1 (the reverse proxies in front of the backend, counting nginx), got "${process.env.TRUST_PROXY_HOPS}". Exiting.`);
+  process.exit(1);
+}
+app.set('trust proxy', trustProxyHops);
 const httpServer = createServer(app);
-const wss = new WebSocketServer({ server: httpServer });
+const wss = createWebSocketServer(httpServer);
 
 // Redis — connect the shared client before any route or session middleware uses it.
 await redisClient.connect();
@@ -93,10 +106,11 @@ const sessionMiddleware = session(
   buildSessionOptions(new RedisStore({ client: redisClient }), process.env.SESSION_SECRET)
 );
 
-app.use(cors({
+// Not for /carddav, whose own OPTIONS answer tells contact apps it serves address books.
+app.use(corsExceptDav(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true
-}));
+})));
 
 // Performance baseline: time the full request lifecycle and record it under the
 // matched route *pattern* (never the concrete URL, so no ids/PII and bounded
@@ -121,47 +135,10 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'same-origin');
   next();
 });
-// 25 MB attachment limit → ~34 MB base64 on the wire; add headroom for the rest of the payload.
-app.use('/api/mail/send', express.json({ limit: '35mb' }));
-app.use('/api/mail/draft', express.json({ limit: '35mb' }));
-// A pet-import body carries a base64 spritesheet (~33% larger than the 5 MB sheet cap
-// enforced after decode in gtdPet.importPet), so it needs more than the global 1 MB.
-app.use('/api/gtd/pet/import', express.json({ limit: '8mb' }));
-app.use(express.json({ limit: '1mb' }));
-// Return a clean JSON error when the body parser rejects an oversized payload.
-app.use((err, req, res, next) => {
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'Request too large. Total attachment size must not exceed 25 MB.' });
-  }
-  next(err);
-});
-app.use(sessionMiddleware);
-
-// CSRF defense-in-depth for the cookie-authenticated /api surface. A mutating
-// request must carry a custom header that a cross-site <form> cannot set and a
-// cross-origin fetch cannot send without a CORS preflight — which the CORS policy
-// above restricts to FRONTEND_URL. SameSite=lax cookies are the primary defense;
-// this closes same-site/subdomain and legacy-browser gaps. The external DAV server
-// (/carddav) and OAuth flows (/oauth) are mounted outside /api and use their own
-// auth, so they are intentionally not gated here.
-const CSRF_SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
-app.use('/api', (req, res, next) => {
-  if (CSRF_SAFE_METHODS.has(req.method)) return next();
-  if (req.get('X-Requested-With')) return next();
-  return res.status(403).json({ error: 'Missing required X-Requested-With header' });
-});
-
-// Screen-lock enforcement (#235). A locked session may only reach the endpoints
-// needed to render the lock screen, unlock, or sign out; everything else returns
-// 423 Locked until the PIN is verified (routes/auth.js sets req.session.locked).
-// Matches the full path (minus query) so it can't fail open on mount-relative paths.
-const LOCK_ALLOWED = new Set(['/api/auth/unlock', '/api/auth/logout', '/api/auth/me', '/api/health', '/api/version']);
-app.use('/api', (req, res, next) => {
-  if (req.session?.locked && !LOCK_ALLOWED.has(req.originalUrl.split('?')[0])) {
-    return res.status(423).json({ error: 'Locked', locked: true });
-  }
-  next();
-});
+// Who a request is and whether it may go on: API tokens, the body parsers, the session, the CSRF
+// header check, the screen lock and the token guards, in that order (middleware/apiChain.js, so
+// the tests run the same chain).
+mountApiAuth(app, sessionMiddleware);
 
 // Make imap manager available globally
 export const imapManager = new ImapManager(wss);
@@ -184,9 +161,12 @@ app.use('/api/spam', spamRoutes);
 app.use('/api/mail', mailRoutes);
 app.use('/api/mail', sendRoutes);
 app.use('/api/mail', draftRoutes);
+app.use('/api/mail', scheduledRoutes);
 app.use('/api/search', searchRoutes);
+app.use('/api/admin/backup', backupRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/totp', totpRoutes);
+app.use('/api/api-tokens', apiTokenRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/block-list', blockListRoutes);
 app.use('/api/contacts', contactsRoutes);
@@ -268,6 +248,10 @@ await loadIntegrationConfigs();
 // Start background snooze watcher — polls every 60 seconds to restore snoozed messages
 imapManager.startSnoozeWatcher();
 
+// Send scheduled messages as they fall due (#543). Its first tick recovers sends a previous
+// process left unfinished, before it claims anything.
+startScheduledSender();
+
 // Schedule periodic CardDAV contact sync for any connected accounts.
 startCardavScheduler();
 
@@ -302,15 +286,31 @@ httpServer.listen(PORT, () => {
   console.log(`MailFlow backend running on port ${PORT}`);
 });
 
+function exitAfterClose(code, { wsCode = 1001, wsReason = 'Shutting down' } = {}) {
+  // A send held for its undo window lives only in this process: it is delivered now rather than
+  // lost with the restart, and the scheduled sender's sends in flight finish (sendShutdown.js).
+  shutDown({
+    code,
+    httpServer,
+    closeClients: () => closeWebSocketClients(wss, wsCode, wsReason),
+    quit: () => redisClient.quit(),
+    exit: c => process.exit(c),
+  });
+}
+
 process.on('SIGTERM', () => {
   console.log('SIGTERM received — shutting down gracefully');
-  httpServer.close(async () => {
-    try { await redisClient.quit(); } catch { /* ignore */ }
-    process.exit(0);
-  });
-  // Force exit if graceful shutdown takes more than 10 s
-  setTimeout(() => process.exit(1), 10_000).unref();
+  exitAfterClose(0);
 });
+
+// A restore has replaced the rows every IMAP connection, scheduler and cache was built from,
+// so the process starts over. The exit code is non-zero because systemd's Restart=on-failure
+// (contrib/mailflow.service) leaves a clean exit down; Docker's unless-stopped and pm2 restart
+// either way.
+export function restartAfterRestore() {
+  console.log('Restore complete — restarting so every connection and cache starts from the restored data');
+  exitAfterClose(3, { wsCode: 1012, wsReason: 'Restarting' });
+}
 
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled promise rejection:', reason);

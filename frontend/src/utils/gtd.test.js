@@ -1,3 +1,4 @@
+import { getGtdMetadataRefreshGeneration, patchGtdMetadata, getGtdMetadata } from '../plugins/gtd/metadataStore.js';
 // Run with: node --test src/utils/gtd.test.js
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,7 +20,6 @@ import {
   openGtdThreadWithAutoRead,
   sectionBadge,
   openDeepLinkMessage,
-  classifyThread,
   unclassifyThread,
   pickThreadMessage,
   isSelectedRow,
@@ -442,6 +442,23 @@ describe('pickThreadMessage', () => {
     assert.equal(pickThreadMessage([{ message_id: '<x>' }], '<x>'), null);
     assert.equal(pickThreadMessage([], '<a>'), null);
     assert.equal(pickThreadMessage(undefined, '<a>'), null);
+  });
+
+  it('prefers the given account\'s copy of the matching message (#476)', () => {
+    const theirs = { id: 'b', account_id: 'acct-b', message_id: '<a>' };
+    const ours = { id: 'a', account_id: 'acct-a', message_id: '<a>' };
+    assert.equal(pickThreadMessage([theirs, ours], '<a>', 'acct-a').id, 'a');
+    assert.equal(pickThreadMessage([theirs], '<a>', 'acct-a').id, 'b', 'another account\'s copy rather than nothing');
+    assert.equal(pickThreadMessage([theirs, ours], '<a>').id, 'b', 'with no account, the first match as before');
+  });
+
+  it('keeps to the given account\'s rows while the thread holds any (#476)', () => {
+    // The account's copy of the head is gone, but the thread still holds an older message of its.
+    const ours = { id: 'a1', account_id: 'acct-a', message_id: '<1@x>', date: '2026-01-01T00:00:00Z' };
+    const theirHead = { id: 'b3', account_id: 'acct-b', message_id: '<3@x>', date: '2026-01-03T00:00:00Z' };
+    const theirNewest = { id: 'b5', account_id: 'acct-b', message_id: '<5@x>', date: '2026-01-05T00:00:00Z' };
+    assert.equal(pickThreadMessage([ours, theirHead], '<3@x>', 'acct-a').id, 'a1', 'not another account\'s copy of the head');
+    assert.equal(pickThreadMessage([ours, theirNewest], '<3@x>', 'acct-a').id, 'a1', 'not another account\'s newer row');
   });
 });
 
@@ -1017,6 +1034,46 @@ describe('openDeepLinkMessage — stale-id recovery', () => {
     assert.ok(!calls.some(c => c[0] === 'get')); // a falsy id skips the doomed fetch
   });
 
+  it('recovers the GTD row\'s own account\'s copy when another account received the same email', async () => {
+    // The thread spans accounts (#476) and is ordered by date, so the other account's copy
+    // comes first when it was delivered there first. The parked copy is the one the reader
+    // reads, and the conversation pane acts for its account.
+    const { calls, base } = stash();
+    const theirs = { id: 'b3', account_id: 'acct-b', message_id: '<3@x>', date: '2026-07-01T00:00:00Z' };
+    const ours = { id: 'a3', account_id: 'acct-a', message_id: '<3@x>', date: '2026-07-01T00:00:04Z' };
+    const deps = {
+      ...base,
+      getMessage: async () => { throw new Error('404'); },
+      getThread: async () => ({ messages: [theirs, ours] }),
+      thread: { id: 'stale', account_id: 'acct-a', message_id: '<3@x>', thread_key: '<1@x>' },
+    };
+    const { result } = await withWarnCaptured(() => openDeepLinkMessage('stale', deps));
+    assert.equal(result, ours);
+    assert.deepEqual(calls, [['stash', '__dl_a3', [ours]], ['select', 'a3']]);
+  });
+
+  it('in one account\'s view opens nothing of another account\'s when the thread holds none of the row\'s', async () => {
+    // Parked, acct-b's copy would have the conversation pane act for acct-b from acct-a's row.
+    const theirs = { id: 'b3', account_id: 'acct-b', message_id: '<3@x>', date: '2026-07-01T00:00:00Z' };
+    const recover = async (singleAccountView) => {
+      const { calls, base } = stash();
+      const deps = {
+        ...base,
+        getMessage: async () => { throw new Error('404'); },
+        getThread: async () => ({ messages: [theirs] }),
+        thread: { id: 'stale', account_id: 'acct-a', message_id: '<3@x>', thread_key: '<1@x>' },
+        singleAccountView,
+      };
+      return { calls, ...await withWarnCaptured(() => openDeepLinkMessage('stale', deps)) };
+    };
+    const scoped = await recover(true);
+    assert.equal(scoped.result, null);
+    assert.deepEqual(scoped.calls, [], 'nothing is parked or selected');
+    assert.equal(scoped.warned.length, 2, 'the miss and the refusal are both logged');
+    // The unified inbox acts for every unified account's copies, so the copy still opens there.
+    assert.equal((await recover(false)).result, theirs);
+  });
+
   it('warns and self-heals even when thread recovery finds nothing (never a silent no-op)', async () => {
     const { calls, base } = stash();
     let refetched = 0;
@@ -1531,41 +1588,6 @@ describe('openGtdThreadWithAutoRead', () => {
   });
 });
 
-// Classify = COPY into the state's label folder; unclassify strips one. Both just fire the
-// API call, reconverge the GTD sections store, and notify — deps injected (like openDeepLinkMessage)
-// so the success and failure-notification paths are unit-testable without a real store/API.
-describe('classifyThread', () => {
-  const t = (key) => key;
-
-  it('classifies, reconverges the GTD sections store, then notifies success', async () => {
-    const calls = [];
-    const deps = {
-      gtdClassify: async (id, state) => { calls.push(['classify', id, state]); },
-      addNotification: (n) => calls.push(['notify', n.title, n.body]),
-      scheduleGtdSectionsFetch: () => calls.push(['schedule']),
-      t,
-    };
-    await classifyThread('m1', 'todo', deps);
-    assert.deepEqual(calls, [
-      ['classify', 'm1', 'todo'],
-      ['schedule'],
-      ['notify', 'gtd.classified', 'gtd.state.todo'],
-    ]);
-  });
-
-  it('notifies a classify failure instead of the GTD sections store when the API call rejects', async () => {
-    const calls = [];
-    const deps = {
-      gtdClassify: async () => { throw new Error('boom'); },
-      addNotification: (n) => calls.push(['notify', n.title, n.body]),
-      scheduleGtdSectionsFetch: () => calls.push(['schedule']),
-      t,
-    };
-    await classifyThread('m1', 'todo', deps);
-    assert.deepEqual(calls, [['notify', 'gtd.classifyFailed', 'gtd.state.todo']]);
-  });
-});
-
 describe('unclassifyThread', () => {
   const t = (key) => key;
 
@@ -1596,4 +1618,42 @@ describe('unclassifyThread', () => {
     await unclassifyThread('m1', 'todo', deps);
     assert.deepEqual(calls, [['notify', 'gtd.removeFailed', 'gtd.state.todo']]);
   });
+  it('says why when the server refuses because the GTD folder holds the only copy', async () => {
+    const calls = [];
+    const deps = {
+      gtdUnclassify: async () => { throw Object.assign(new Error('only copy'), { status: 409 }); },
+      addNotification: (n) => calls.push(['notify', n.title, n.body]),
+      scheduleGtdSectionsFetch: () => calls.push(['schedule']),
+      t,
+    };
+    await unclassifyThread('m1', 'todo', deps);
+    assert.deepEqual(calls, [['notify', 'gtd.removeFailed', 'gtd.onlyCopy']]);
+  });
+  it('says the label changed on the server, not that it is the only copy, for that 409', async () => {
+    const calls = [];
+    const deps = {
+      gtdUnclassify: async () => { throw Object.assign(new Error('changed'), { status: 409, changed: true }); },
+      addNotification: (n) => calls.push(['notify', n.title, n.body]),
+      scheduleGtdSectionsFetch: () => calls.push(['schedule']),
+      t,
+    };
+    await unclassifyThread('m1', 'todo', deps);
+    assert.deepEqual(calls, [['notify', 'gtd.removeFailed', 'gtd.labelChanged']]);
+  });
+});
+
+
+it('unclassification clears cached thread metadata and refetches on success and uncertain failure', async () => {
+  const { unclassifyThread } = await import('./gtd.js');
+  const message = { id: 'unclassify-row', account_id: 'account' };
+  const deps = { message, gtdUnclassify: async () => ({ removed: true }), addNotification() {}, scheduleGtdSectionsFetch() {}, t: key => key };
+  const before = getGtdMetadataRefreshGeneration();
+  patchGtdMetadata(message, 'watch', null);
+  await unclassifyThread(message.id, 'watch', deps);
+  assert.equal(getGtdMetadata(message.id), null);
+  assert.equal(getGtdMetadataRefreshGeneration(), before + 1);
+  patchGtdMetadata(message, 'watch', null);
+  await unclassifyThread(message.id, 'watch', { ...deps, gtdUnclassify: async () => { throw new Error('offline'); } });
+  assert.equal(getGtdMetadata(message.id), null);
+  assert.equal(getGtdMetadataRefreshGeneration(), before + 2);
 });

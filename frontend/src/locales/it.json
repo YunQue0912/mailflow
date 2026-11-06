@@ -89,9 +89,12 @@
       "tooShort": "La password deve contenere almeno 8 caratteri",
       "doneDesc": "La tua password è stata aggiornata. Ora puoi accedere.",
       "backToLogin": "← Torna al login"
-    }
+    },
+    "showPassword": "Mostra password",
+    "hidePassword": "Nascondi password"
   },
   "compose": {
+    "unsupportedDraftFrom": "Scegli un mittente configurato prima di salvare o inviare questa bozza.",
     "newMessage": "Nuovo messaggio",
     "reply": "Rispondi",
     "replyAll": "Rispondi a tutti",
@@ -107,9 +110,11 @@
     "bccPh": "bcc@esempio.com",
     "bodyPh": "Scrivi il tuo messaggio…",
     "send": "Invia",
+    "insertSignature": "Inserisci firma",
     "sendTooltip": "Invia (Ctrl+Invio)",
     "sending": "Invio…",
     "discard": "Scarta",
+    "discardFailed": "Impossibile eliminare la bozza. Riprova.",
     "saveDraft": "Salva bozza",
     "savingDraft": "Salvataggio…",
     "draftSaved": "Bozza salvata",
@@ -125,6 +130,7 @@
       "keepEditing": "Continua a modificare"
     },
     "draftHasAttachments": "Gli allegati non vengono salvati con le bozze. Dovranno essere ricollegati alla riapertura.",
+    "dropToAttach": "Rilascia i file per allegarli",
     "emptySubject": {
       "title": "Inviare senza oggetto?",
       "sendAnyway": "Invia comunque",
@@ -140,7 +146,20 @@
     "sent": {
       "title": "Messaggio inviato",
       "noCopy": "Inviato, ma non salvato in Inviati",
+      "someRejected": "Il server di posta ha rifiutato la consegna a {{addresses}}.",
       "action": "Visualizza"
+    },
+    "undoSend": {
+      "sending": "Invio di \"{{subject}}\"…",
+      "undone": "Invio annullato",
+      "reopenLater": "Si riaprirà quando chiuderai il messaggio che stai scrivendo",
+      "notSent": "Il tuo messaggio non è stato inviato",
+      "lost": "Il server si è riavviato prima dell'invio, quindi il messaggio non è stato recapitato.",
+      "unknown": "Impossibile confermare l'invio del messaggio",
+      "unknownBody": "Controlla la cartella Inviati prima di inviarlo di nuovo.",
+      "reopen": "Riapri",
+      "tooLate": "Troppo tardi per annullare: il messaggio è già in fase di invio",
+      "undoFailed": "Impossibile annullare: il server non ha risposto"
     },
     "toolbar": {
       "removeTable": "Rimuovi tabella",
@@ -171,7 +190,17 @@
       "aiApply": "Applica",
       "aiDismiss": "Ignora",
       "aiGenerating": "Generazione in corso…",
-      "aiError": "Errore IA: {{message}}"
+      "aiError": "Errore IA: {{message}}",
+      "aiReply": "Rispondi con l'IA",
+      "aiReplyPlaceholder": "Cosa deve dire la risposta? Es.: approva la grafica",
+      "aiReplyInstruction": "Istruzione per la risposta dell'IA",
+      "aiReplyGenerate": "Genera",
+      "aiReplyReading": "Lettura della conversazione…",
+      "aiReplyPartial": "Basata sulla parte più recente della conversazione: il resto era troppo lungo da inviare all'IA.",
+      "aiReplyLeftOut": "Basata sui {{count}} messaggi più recenti della conversazione: i più vecchi sono stati esclusi.",
+      "aiTooLong": "questa bozza ha {{count}} caratteri, più dei {{max}} che l'IA può gestire. Accorciala o rimuovi il testo citato, poi riprova.",
+      "aiNotAllowed": "il tuo amministratore ha disattivato l'IA per il tuo account.",
+      "aiFeatureOff": "il tuo amministratore ha disattivato l'assistente di redazione IA."
     },
     "priority": "Priorità",
     "priorityHigh": "Alta priorità",
@@ -180,7 +209,81 @@
     "recipientMenu": {
       "copy": "Copia indirizzo",
       "copyAll": "Copia tutti in questo campo"
-    }
+    },
+    "scheduleSend": {
+      "title": "Invia più tardi",
+      "tooltip": "Invia più tardi (Ctrl+Maiusc+Invio)",
+      "tomorrowMorning": "Domani mattina",
+      "tomorrowAfternoon": "Domani pomeriggio",
+      "mondayMorning": "Lunedì mattina",
+      "pick": "Scegli data e ora",
+      "dateLabel": "Data",
+      "timeLabel": "Ora",
+      "dateTimeLabel": "Data e ora",
+      "sendsAt": "Invio: {{when}}",
+      "timeZone": "Fuso orario: {{zone}}",
+      "schedule": "Programma invio",
+      "scheduledFor": "Programmato per {{when}}",
+      "change": "Cambia",
+      "changeTime": "Cambia orario",
+      "errors": {
+        "invalid": "Inserisci una data e un'ora.",
+        "past": "Quel momento è già passato.",
+        "tooSoon": "Scegli un momento ad almeno un minuto da adesso.",
+        "tooFar": "Scegli un momento entro i prossimi 366 giorni.",
+        "clockBehind": "L'orologio di questo dispositivo è indietro di {{minutes}} min rispetto a quello del server, secondo cui sono le {{time}}.",
+        "clockAhead": "L'orologio di questo dispositivo è avanti di {{minutes}} min rispetto a quello del server, secondo cui sono le {{time}}.",
+        "holdLost": "Questo messaggio è stato aperto in un'altra finestra e non può più essere salvato qui. Il tuo testo resta qui da copiare.",
+        "deletedElsewhere": "Questo messaggio è stato eliminato altrove, quindi non può più essere salvato qui. Il tuo testo è ancora qui da copiare.",
+        "sentElsewhere": "Questo messaggio è stato inviato da un'altra finestra, quindi non può più essere salvato qui. Il tuo testo è ancora qui da copiare.",
+        "versionConflict": "Questo messaggio è stato modificato altrove. Chiudilo e riaprilo da Programmati per vedere la versione più recente.",
+        "notHeld": "Questo messaggio non è aperto per la modifica qui. Chiudilo e riaprilo da Programmati.",
+        "pickNewTime": "L'orario programmato è passato. Scegline uno nuovo.",
+        "failed": "Impossibile programmare il messaggio.",
+        "tooMany": "Hai già il numero massimo di messaggi programmati. Inviane o eliminane prima qualcuno.",
+        "tooMuchStorage": "I tuoi messaggi programmati occupano già tutto lo spazio disponibile. Inviane o eliminane prima qualcuno.",
+        "rateLimited": "Troppi messaggi programmati in poco tempo. Riprova tra un minuto.",
+        "payloadTooLarge": "Questo messaggio è troppo grande per essere programmato: testo e immagini incorporate occupano troppo spazio.",
+        "heldElsewhere": "Questo messaggio è aperto in un'altra finestra."
+      },
+      "edit": {
+        "update": "Aggiorna",
+        "updating": "Salvataggio…",
+        "options": "Opzioni di programmazione",
+        "unschedule": "Annulla programmazione (salva come bozza)",
+        "unscheduleTitle": "Spostare questo messaggio nelle bozze?",
+        "unscheduleGo": "Salva come bozza",
+        "unscheduled": "Spostato nelle bozze",
+        "unscheduleKept": "Salvato nelle bozze, ma il messaggio programmato è ancora programmato: questa finestra non lo teneva più. Eliminalo da Programmati se non deve partire.",
+        "closeTitle": "Salvare le modifiche a questo messaggio programmato?",
+        "saveChanges": "Salva modifiche",
+        "discardChanges": "Scarta modifiche",
+        "switchBlocked": "Prima aggiorna o chiudi il messaggio programmato che stai modificando.",
+        "sendNow": "Invia ora",
+        "pickNewTime": "Scegli un nuovo orario",
+        "keepPaused": "Lascia in pausa",
+        "dueTitle": "Questo messaggio era previsto per {{when}}.",
+        "dueBody": "Se lo chiudi ora resta in pausa e non parte mai senza di te.",
+        "keptPaused": "In pausa. Riprendilo da Programmati quando deve partire.",
+        "heldElsewhereBody": "Modificalo qui invece, e l'altra finestra non potrà più salvarlo.",
+        "takeOver": "Modifica qui invece",
+        "close": "Chiudi"
+      },
+      "confirm": {
+        "title": "Programmarlo di nuovo?",
+        "go": "Programma comunque"
+      },
+      "laterToday": "Più tardi oggi",
+      "undoFailed": "Impossibile annullare la programmazione",
+      "sendNow": {
+        "undone": "Non inviato. È di nuovo in Programmati come prima.",
+        "undoFailed": "Impossibile annullare l'invio immediato"
+      },
+      "scheduleAnyway": "Programma lo stesso",
+      "undoFailedOpen": "Annullamento non riuscito. Aprilo da Programmati."
+    },
+    "selectAccount": "Scegli un account da cui inviare",
+    "smtpAuthDisabled": "Microsoft ha disattivato l'invio dalle app di posta (SMTP) per questo account. Puoi comunque inviare da Outlook sul web. Per un account aziendale o scolastico, l'amministratore può riattivarlo."
   },
   "message": {
     "find": {
@@ -203,6 +306,9 @@
     "noContent": "Nessun contenuto trovato nel messaggio.",
     "remoteImagesBlocked": "Le immagini remote sono state bloccate.",
     "loadImages": "Carica immagini",
+    "trackersBlocked_one": "{{count}} tracker bloccato",
+    "trackersBlocked_other": "{{count}} tracker bloccati",
+    "trackersBlockedHint": "Le immagini che segnalano al mittente l'apertura di questa email non sono state caricate.",
     "allowSender": "Consenti sempre da {{email}}",
     "allowDomain": "Consenti sempre da @{{domain}}",
     "downloading": "Download in corso…",
@@ -211,8 +317,7 @@
       "warn": "Tipo di file rischioso (.{{ext}}): può contenere macro o una pagina di accesso falsa",
       "notice": "Archivio: il contenuto non può essere ispezionato",
       "doubleExt": "Estensione nascosta: .{{ext}} — il tipo reale è l'ultimo",
-      "armed": "{{label}} — fai di nuovo clic per scaricare comunque",
-      "confirm": "fai di nuovo clic per scaricare comunque"
+      "armed": "{{label}} — fai di nuovo clic per scaricare comunque"
     },
     "downloadAll": "Scarica tutto",
     "reply": "Rispondi",
@@ -224,6 +329,12 @@
     "delete": "Elimina",
     "downloadEml": "Scarica come .eml",
     "print": "Stampa",
+    "showDark": "Mostra in colori scuri",
+    "showOriginal": "Mostra i colori originali",
+    "cannotShowDark": "Questa email non può essere mostrata scura senza rendere il testo difficile da leggere",
+    "printConversation": "Stampa conversazione",
+    "conversationActions": "Azioni sulla conversazione",
+    "preparingPrint": "Preparazione della stampa…",
     "more": "Altro",
     "summarize": "Riassumi",
     "summary": "Riepilogo",
@@ -231,10 +342,13 @@
     "aiActions": "Azioni IA",
     "manageAiActions": "Gestisci azioni…",
     "aiRegenerate": "Rigenera",
+    "aiTruncated": "Basato sul primo {{percent}}% di questa email. Il resto era troppo lungo per essere inviato all'IA.",
     "aiExpand": "Espandi",
     "aiCollapse": "Comprimi",
     "aiCopy": "Copia",
     "aiCopied": "Copiato",
+    "aiNotAllowed": "il tuo amministratore ha disattivato l'IA per il tuo account.",
+    "aiFeatureOff": "il tuo amministratore ha disattivato i riepiloghi e le azioni IA.",
     "previousMessage": "Messaggio precedente",
     "nextMessage": "Messaggio successivo",
     "archived": {
@@ -243,19 +357,26 @@
       "failBody": "Impossibile archiviare il messaggio.",
       "noFolderTitle": "Nessuna cartella di archivio",
       "noFolderBody": "Nessuna cartella di archivio configurata per questo account. Impostane una in Impostazioni → Account → Mappatura cartelle.",
-      "conversationTitle": "Conversazione archiviata"
+      "conversationTitle": "Conversazione archiviata",
+      "nothingFromAccount": "Nessun messaggio di questo account da archiviare in questa conversazione",
+      "otherAccountMessage": "Non è stato archiviato nulla: il messaggio aperto appartiene a un altro account",
+      "otherAccountDraft": "Non è stato archiviato nulla: la bozza aperta appartiene a un altro account"
     },
     "moved": {
       "title": "Messaggio spostato",
       "failTitle": "Spostamento fallito",
       "failBody": "Impossibile spostare il messaggio.",
-      "conversationTitle": "Conversazione spostata"
+      "conversationTitle": "Conversazione spostata",
+      "nothingFromAccount": "Nessun messaggio di questo account da spostare in questa conversazione",
+      "otherAccountDraft": "Non è stato spostato nulla: la bozza aperta appartiene a un altro account"
     },
     "snoozed": {
       "title": "Messaggio posticipato",
       "failTitle": "Posticipa fallito",
       "failBody": "Impossibile posticipare questo messaggio.",
-      "conversationTitle": "Conversazione posticipata"
+      "conversationTitle": "Conversazione posticipata",
+      "nothingFromAccount": "Nessun messaggio di questo account da posticipare in questa conversazione",
+      "nothingInConversation": "Nessun messaggio da posticipare in questa conversazione"
     },
     "whitelistFail": {
       "title": "Impossibile salvare la preferenza",
@@ -275,12 +396,49 @@
       "done": "Classificato come {{category}}",
       "error": "Classificazione IA fallita."
     },
+    "preview": {
+      "open": "Anteprima",
+      "label": "Anteprima di {{name}}",
+      "position": "{{current}} di {{total}}",
+      "download": "Scarica",
+      "print": "Stampa",
+      "preparingPrint": "Preparazione… {{done}}/{{total}}",
+      "close": "Chiudi",
+      "zoomIn": "Ingrandisci",
+      "zoomOut": "Riduci",
+      "fit": "Adatta allo schermo",
+      "previous": "Allegato precedente",
+      "next": "Allegato successivo",
+      "failed": "Impossibile visualizzare questo file.",
+      "unsupported": "Questo file non sembra un PDF o un’immagine validi, quindi non viene mostrato qui.",
+      "password": "Questo PDF è protetto da password. Inserisci la password per aprirlo.",
+      "passwordLabel": "Password del PDF",
+      "passwordSubmit": "Apri",
+      "passwordIncorrect": "Password errata. Riprova."
+    },
+    "unsnoozed": {
+      "title": "Posticipo annullato",
+      "failTitle": "Impossibile annullare il posticipo",
+      "failBody": "Resta posticipato. Riprova."
+    },
+    "snoozeChanged": {
+      "title": "Posticipato fino a {{when}}",
+      "failTitle": "Impossibile cambiare l'orario",
+      "failBody": "Resta l'orario precedente. Riprova."
+    },
     "downloadFailed": {
       "title": "Download non riuscito",
       "body": "Impossibile scaricare questo allegato. Riprova."
     }
   },
   "messageList": {
+    "replyDraftChanged": "La bozza di risposta è cambiata. Prova ad aprirla di nuovo.",
+    "replyDraftKeepCurrent": "Salva il messaggio attuale e gestisci i suoi allegati prima di aprire questa bozza.",
+    "replyDraftUnavailable": "Questa bozza di risposta non è più disponibile.",
+    "replyDraftCancelled": "L’apertura della bozza di risposta è stata annullata perché la selezione o il compositore è cambiato. Prova ad aprirla di nuovo.",
+    "replyDraftRetry": "Cerca di nuovo la bozza di risposta",
+    "openReplyDraft": "Apri la bozza di risposta",
+    "replyDraft": "Bozza di risposta",
     "search": "Cerca…",
     "unread": "Non letti",
     "showAll": "Mostra tutto",
@@ -314,7 +472,8 @@
       "body": "Spostato nel Cestino.",
       "failTitle": "Eliminazione fallita",
       "failBody": "Impossibile eliminare il messaggio.",
-      "conversationTitle": "Conversazione eliminata"
+      "conversationTitle": "Conversazione eliminata",
+      "nothingFromAccount": "Nessun messaggio di questo account da eliminare in questa conversazione"
     },
     "draftBcc": {
       "failTitle": "Bozza aperta in sola lettura",
@@ -354,6 +513,7 @@
     "pullToSync": "Trascina per sincronizzare",
     "releaseToSync": "Rilascia per sincronizzare",
     "noSearchResults": "Nessun risultato trovato",
+    "searching": "Ricerca in corso…",
     "noSearchResultsDesc": "Nessun risultato per {{query}}",
     "searchFailed": "Ricerca non riuscita",
     "clearSearch": "Cancella ricerca",
@@ -384,7 +544,13 @@
       "automated": "Automatico",
       "social": "Social"
     },
+    "categoryAlways": {
+      "done": "La posta da {{value}} ora va in {{category}}",
+      "doneBody": "Salvato come regola della posta in arrivo; aggiornati anche i messaggi già ricevuti.",
+      "failed": "Impossibile salvare la categoria per questo mittente"
+    },
     "changeLayout": "Cambia disposizione",
+    "layout": "Layout",
     "layouts": {
       "focused": {
         "label": "Concentrato",
@@ -405,8 +571,33 @@
       "vertical": {
         "label": "Divisione verticale",
         "description": "Elenco messaggi sopra il riquadro di lettura"
+      },
+      "list": {
+        "label": "Prima l'elenco",
+        "description": "Elenco a tutta larghezza; un messaggio si apre da solo"
       }
-    }
+    },
+    "snoozedUntil": "Posticipato fino a {{when}}",
+    "snoozedEmpty": "Niente posticipato",
+    "snoozedEmptyDesc": "Le email posticipate aspettano qui finché non tornano.",
+    "menu": "Menu",
+    "sort": "Ordina",
+    "sortBy": "Ordina per",
+    "sortDate": "Data",
+    "sortSender": "Mittente",
+    "sortSubject": "Oggetto",
+    "sortNewestFirst": "Più recenti prima",
+    "sortOldestFirst": "Meno recenti prima",
+    "sortAToZ": "Dalla A alla Z",
+    "sortZToA": "Dalla Z alla A",
+    "starredOnTop": "Con stella in alto",
+    "sortReset": "Torna a più recenti prima",
+    "sortedBy": "Ordinati: {{order}}",
+    "sortSummary": "{{sort}}, {{dir}}",
+    "categoryCountTitle": "Messaggi: {{total}} · Da leggere: {{unread}}",
+    "emptyCategory": "Niente in {{category}}",
+    "emptyCategoryOthers": "Le altre categorie contengono ancora messaggi.",
+    "emptyCategoryNone": "La posta in arrivo è vuota."
   },
   "lockScreen": {
     "subtitle": "Inserisci il PIN per sbloccare",
@@ -432,11 +623,12 @@
     "settings": "Impostazioni",
     "lock": "Blocca schermo",
     "signOut": "Esci",
-    "connectionError": "Errore di connessione",
     "folderMenu": {
       "markAllRead": "Segna tutto come letto",
       "syncFolder": "Sincronizza cartella",
       "renameFavorite": "Rinomina preferito",
+      "favorite": "Aggiungi ai preferiti",
+      "unfavorite": "Rimuovi dai preferiti",
       "rename": "Rinomina",
       "createSubfolder": "Crea sottocartella",
       "hide": "Nascondi cartella",
@@ -450,7 +642,8 @@
       "syncNow": "Sincronizza ora",
       "syncFoldersNow": "Sincronizza cartelle ora",
       "settings": "Impostazioni account",
-      "reconnect": "Riconnetti",
+      "tryAgain": "Riprova",
+      "signInAgain": "Accedi di nuovo",
       "moveUp": "Sposta su",
       "moveDown": "Sposta giù",
       "moveFailed": "Impossibile riordinare gli account"
@@ -464,7 +657,143 @@
     "emptying": "Svuotamento di \"{{name}}\"…",
     "emptied": "Cartella svuotata",
     "backToAccounts": "Torna agli account",
-    "updateAvailable": "Aggiornamento disponibile: v{{version}}"
+    "updateAvailable": "Aggiornamento disponibile: v{{version}}",
+    "snoozed": "Posticipati",
+    "scheduled": "Programmati",
+    "scheduledPending": "In attesa di invio: {{n}}",
+    "scheduledAttention": "Richiedono attenzione: {{n}}",
+    "favorites": "Preferiti",
+    "reorderFolder": "Trascina per riordinare la cartella",
+    "draftsTotal": "Bozze: {{n}}"
+  },
+  "scheduled": {
+    "refresh": "Aggiorna",
+    "loadFailed": "Impossibile caricare i messaggi programmati.",
+    "empty": "Niente di programmato",
+    "emptyDesc": "Usa Invia più tardi nell'editor.",
+    "moreSent": "I messaggi inviati meno recenti non sono mostrati.",
+    "sentMessage": "Messaggio inviato",
+    "to": "A: {{names}}",
+    "toMore": "A: {{names}} +{{more}}",
+    "detail": "Motivo indicato: {{detail}}",
+    "zoneTime": "{{time}} ({{zone}})",
+    "sections": {
+      "attention": "Richiede attenzione",
+      "scheduled": "Programmato",
+      "sent": "Inviati",
+      "deleted": "Eliminati"
+    },
+    "when": {
+      "today": "Oggi {{time}}",
+      "tomorrow": "Domani {{time}}",
+      "yesterday": "Ieri {{time}}"
+    },
+    "chip": {
+      "sending": "Invio in corso",
+      "editing": "In modifica",
+      "failed": "Non riuscito",
+      "paused": "In pausa",
+      "uncertain": "Verifica la consegna",
+      "sent": "Inviato",
+      "sentLate": "Inviato in ritardo",
+      "retrying": "Nuovo tentativo",
+      "deleted": "Eliminato"
+    },
+    "reason": {
+      "overdue": "Era in ritardo di oltre 6 ore, quindi MailFlow l'ha trattenuto. Invialo ora o scegli un nuovo orario.",
+      "restored": "È stato messo in pausa al ripristino di un backup.",
+      "editAbandoned": "Era aperto in modifica quando doveva partire.",
+      "accountDisabled": "Il suo account è disattivato.",
+      "needsReauth": "Accedi di nuovo all'account per inviarlo.",
+      "user": "L'hai messo in pausa tu.",
+      "paused": "È in pausa.",
+      "smtpRejected": "Il server di posta l'ha rifiutato.",
+      "tooLarge": "È troppo grande per il server di posta.",
+      "config": "Le impostazioni di invio dell'account vanno controllate.",
+      "tls": "La connessione sicura al server di posta non è riuscita.",
+      "invalidMessage": "Non è stato possibile comporre il messaggio.",
+      "aliasMissing": "L'indirizzo da cui doveva partire non esiste più.",
+      "decryptFailed": "Non è stato possibile decifrarlo su questo server.",
+      "accountMissing": "Il suo account non esiste più.",
+      "gaveUp": "Il server di posta ha continuato a non rispondere, quindi MailFlow ha smesso di riprovare.",
+      "failed": "Non è stato possibile inviarlo.",
+      "uncertain": "MailFlow si è fermato durante l'invio. Potrebbe essere stato consegnato oppure no. Controlla la cartella Posta inviata.",
+      "retrying": "L'ultimo tentativo non è riuscito. Prossimo tentativo: {{when}}.",
+      "deleted": "Si può ripristinare fino a {{when}}."
+    },
+    "sent": {
+      "markedSent": "L'hai segnato come inviato.",
+      "late": "Inviato in ritardo: programmato per {{scheduled}}, inviato {{sent}}.",
+      "lateOffline": "Inviato in ritardo: programmato per {{scheduled}}, inviato {{sent}} perché MailFlow era offline.",
+      "refused": "Rifiutato dal server di posta per: {{list}}",
+      "deferred": "Non consegnato a {{list}}: il loro server ha chiesto di riprovare più tardi e MailFlow non riprova. Invialo di nuovo a loro.",
+      "noSentFolder": "Nessuna copia salvata: l'account non ha una cartella Posta inviata.",
+      "noSentCopy": "Non è stato possibile salvare una copia in Posta inviata."
+    },
+    "a11y": {
+      "scheduledFor": "Programmato per {{when}}",
+      "sentAt": "Inviato {{when}}",
+      "to": "a {{names}}",
+      "toMore": "a {{names}} e altri {{more}}",
+      "subject": "oggetto {{subject}}"
+    },
+    "actions": {
+      "edit": "Modifica",
+      "reschedule": "Riprogramma",
+      "sendNow": "Invia ora",
+      "resume": "Riprendi",
+      "retry": "Riprova",
+      "sendAnyway": "Invia comunque",
+      "markSent": "Segna come inviato",
+      "cancel": "Elimina",
+      "delete": "Elimina definitivamente",
+      "viewSent": "Vedi in Posta inviata",
+      "remove": "Rimuovi dall'elenco",
+      "more": "Altre azioni",
+      "menu": "Azioni del messaggio programmato",
+      "restore": "Ripristina"
+    },
+    "confirm": {
+      "uncertainTitle": "Potrebbe essere già stato consegnato",
+      "uncertainBody": "MailFlow si è fermato durante l'invio. Controlla prima la cartella Posta inviata. Inviarlo di nuovo comunque?",
+      "restoredTitle": "In pausa per un ripristino",
+      "restoredBody": "È stato messo in pausa al ripristino di un backup. Se il vecchio server è ancora attivo, potrebbe inviarlo anche lui. Inviarlo da qui?",
+      "restoredGo": "Invia da qui",
+      "sendAnywayTitle": "Inviarlo di nuovo?",
+      "sendAnywayBody": "Potrebbe essere già stato consegnato: MailFlow si è fermato durante l'invio. Controlla prima la cartella Posta inviata. Se è partito, i destinatari lo riceveranno due volte.",
+      "markSentTitle": "Segnarlo come inviato?",
+      "markSentBody": "Fallo se l'hai trovato nella cartella Posta inviata. MailFlow ne elimina il contenuto e non lo invia mai.",
+      "deleteTitle": "Eliminarlo definitivamente?",
+      "deleteBody": "Non verrà inviato e non potrà essere ripristinato."
+    },
+    "toast": {
+      "resumed": "Ripreso. Viene inviato ora.",
+      "sendingNow": "Viene inviato ora.",
+      "markedSent": "Segnato come inviato",
+      "deleted": "Messaggio programmato eliminato",
+      "deletedForGood": "Eliminato definitivamente",
+      "restored": "Ripristinato",
+      "sent": "Messaggio programmato inviato",
+      "notSent": "Non inviato: {{reason}}",
+      "open": "Apri",
+      "restoredPaused": "Ripristinato e in pausa. Riprendilo quando deve partire."
+    },
+    "errors": {
+      "needsReauth": "Prima accedi di nuovo all'account, poi riprendilo.",
+      "accountDisabled": "Prima riattiva l'account, poi riprendilo.",
+      "undoExpired": "Troppo tardi per annullare: il messaggio sta partendo.",
+      "notFound": "Questo messaggio programmato non esiste più.",
+      "sending": "È in fase di invio proprio ora.",
+      "aboutToSend": "Sta per essere inviato.",
+      "sent": "È già stato inviato.",
+      "cancelled": "È stato eliminato.",
+      "editing": "È aperto in modifica in un'altra finestra.",
+      "failed": "Non è stato possibile modificare il messaggio programmato.",
+      "restoreFailed": "Impossibile ripristinarlo",
+      "restoreExpired": "Non può più essere ripristinato.",
+      "linkNotFound": "Quel messaggio programmato non è stato trovato."
+    },
+    "serverReply": "Risposta del server: {{detail}}"
   },
   "contextMenu": {
     "find": "Trova",
@@ -478,6 +807,7 @@
     "reply": "Rispondi",
     "replyAll": "Rispondi a tutti",
     "forward": "Inoltra",
+    "forwardAsAttachment": "Inoltra come allegato",
     "moveToFolder": "Sposta",
     "archive": "Archivia",
     "snooze": {
@@ -485,9 +815,14 @@
       "threeHours": "Tra 3 ore",
       "tomorrowMorning": "Domani mattina",
       "nextWeek": "La settimana prossima",
-      "custom": "Personalizzato..."
+      "custom": "Personalizzato...",
+      "change": "Cambia l'orario",
+      "unsnooze": "Annulla posticipo"
     },
     "categorize": "Categorizza come…",
+    "categoryAlwaysSender": "Sempre per questo mittente",
+    "categoryAlwaysDomain": "Sempre per questo dominio",
+    "categoryAlwaysFor": "Sempre per {{value}}",
     "createRule": "Crea regola da questo messaggio",
     "addToBlockList": "Aggiungi alla lista blocchi",
     "markAsSpam": "Segnala come Spam",
@@ -656,6 +991,15 @@
         "label": "Segna Delegato",
         "description": "Classifica il messaggio selezionato come Delegato"
       },
+      "gtdReference": {
+        "description": "Classifica il messaggio selezionato come Riferimento"
+      },
+      "gtdSomeday": {
+        "description": "Classifica il messaggio selezionato come Un giorno"
+      },
+      "gtdDone": {
+        "description": "Completa il messaggio GTD selezionato"
+      },
       "toggleRightSidebar": {
         "label": "Mostra o nascondi la barra laterale destra",
         "description": "Nascondi o mostra la barra laterale destra"
@@ -716,6 +1060,11 @@
     },
     "title": "Impostazioni",
     "close": "Chiudi",
+    "behavior": {
+      "reading": "Lettura",
+      "writing": "Scrittura",
+      "sync": "Sincronizzazione"
+    },
     "tabs": {
       "cleanup": "Pulizia",
       "accounts": "Account",
@@ -735,11 +1084,14 @@
       "aiActions": "Azioni IA",
       "antispam": "Antispam",
       "categories": "Categorie",
-      "groupAccountMail": "Account e posta",
-      "groupDisplay": "Schermo",
-      "groupSecurityIntegrations": "Sicurezza e integrazioni",
+      "groupMail": "Posta",
+      "groupPreferences": "Preferenze",
+      "groupAiExtensions": "IA ed estensioni",
       "groupAdmin": "Amministrazione",
-      "plugins": "Plugin"
+      "behavior": "Comportamento",
+      "plugins": "Plugin",
+      "backup": "Backup",
+      "mailSignIn": "Provider di posta"
     },
     "rules": {
       "title": "Regole posta in arrivo",
@@ -780,6 +1132,10 @@
       "actionMove": "Sposta nella cartella",
       "actionForward": "Inoltra a",
       "actionForwardPlaceholder": "destinatario@example.com",
+      "actionSetCategory": "Imposta categoria",
+      "actionNotify": "Avvisami",
+      "actionNotifyHint": "Avvisami anche se la regola sposta l'email o la segna come letta.",
+      "actionSetCategorySelect": "Seleziona una categoria…",
       "actionMovePlaceholder": "Nome cartella",
       "stopProcessing": "Interrompi l'elaborazione delle regole successive se questa corrisponde",
       "stopProcessingHint": "Se questa regola corrisponde, le regole successive non verranno eseguite per lo stesso messaggio.",
@@ -823,6 +1179,10 @@
       "editTitle": "Modifica account",
       "addTitle": "Aggiungi account",
       "color": "Colore account",
+      "icon": "Icona",
+      "iconNone": "Nessuna (punto colorato)",
+      "iconCustom": "Oppure digita un'emoji",
+      "iconHint": "Mostrata al posto del punto colorato.",
       "displayName": "Nome visualizzato",
       "displayNamePh": "es. Gmail Lavoro",
       "email": "Indirizzo email",
@@ -847,6 +1207,9 @@
       "smtpAuthUserPh": "Uguale al nome utente sopra",
       "smtpAuthPass": "Password SMTP",
       "signatureSection": "Firma",
+      "signatureEnabledDefault": "Mostra la firma per impostazione predefinita",
+      "autoRecipientsSection": "Cc e Bcc automatici",
+      "autoRecipientsDesc": "Questi indirizzi vengono aggiunti come destinatari normali, che puoi rimuovere, a ogni nuovo messaggio, risposta e inoltro che scrivi da questo account o dai suoi alias. Separa gli indirizzi con una virgola.",
       "saveChanges": "Salva modifiche",
       "addAccount": "Aggiungi account",
       "saving": "Salvataggio…",
@@ -857,7 +1220,8 @@
       "errorRequired": "Email, nome utente e host IMAP sono obbligatori",
       "errorPasswordRequired": "La password è richiesta per i nuovi account",
       "microsoftImapUnsupported": "Outlook.com / Hotmail richiede OAuth2 (Modern Auth)",
-      "microsoftImapNote": "Microsoft ha disattivato l'IMAP con password (autenticazione di base) per gli account personali Outlook.com, Hotmail e Live. Puoi comunque collegare questi account tramite Microsoft OAuth2 (Modern Auth): configuralo in Integrazioni → Microsoft 365 / Outlook.com. L'accesso tramite codice dispositivo è il più adatto agli account personali e non richiede alcuna password per l'app.",
+      "microsoftImapNote": "Microsoft non accetta più password per le caselle Outlook.com, Hotmail, Live e MSN, e l'accesso con Microsoft non è configurato su questo server. Chiedi al tuo amministratore di attivarlo in Provider di posta.",
+      "microsoftImapNoteReady": "Microsoft non accetta più password per le caselle Outlook.com, Hotmail, Live e MSN. Aggiungi invece questa casella con «Accedi con Microsoft» in Aggiungi account.",
       "reindex": "Reindicizza per la ricerca",
       "reindexing": "Indicizzazione messaggi...",
       "reindexProgress": "{{synced}} / {{total}} messaggi indicizzati",
@@ -881,7 +1245,12 @@
       "trustedAuthservDetected": "Visti sui messaggi recenti (clicca per usare):",
       "trustedAuthservDetectedNone": "Nessun dato ancora: i messaggi vengono esaminati quando l'antispam è attivo per questo account.",
       "trustedAuthservWarn": "Considera attendibile solo un ID che riconosci come il server di ricezione del tuo provider.",
-      "enabledGlobally": "Abilitato globalmente"
+      "enabledGlobally": "Abilitato globalmente",
+      "microsoftImapNoteSignIn": "Microsoft non accetta più password per le caselle Outlook.com, Hotmail, Live e MSN. Accedi invece con Microsoft: non serve una password per le app.",
+      "deleteScheduled": "Messaggi programmati non ancora inviati che vengono eliminati con esso: {{n}}.",
+      "deleteTitle": "Rimuovere l'account?",
+      "deleteBody": "Tutti i messaggi sincronizzati di questo account verranno eliminati. L'operazione non può essere annullata.",
+      "deleteConfirm": "Rimuovi"
     },
     "folderMappings": {
       "title": "Mappatura cartelle",
@@ -923,6 +1292,8 @@
     "appearance": {
       "title": "Aspetto",
       "description": "Scegli un tema colore per l'interfaccia",
+      "darkEmailBodies": "Corpo delle email scuro",
+      "darkEmailBodiesDesc": "Con un tema scuro, mostra in colori scuri anche le email HTML: con il design scuro del mittente se c'è, altrimenti ricolorate da MailFlow. Un'email resta come inviata quando lo chiede o quando mostrarla scura renderebbe il testo difficile da leggere. Ogni messaggio può essere cambiato singolarmente.",
       "typography": "Tipografia",
       "typographyDescription": "Scegli una combinazione di font per l'interfaccia",
       "typographyLoading": "Caricamento font…",
@@ -943,6 +1314,7 @@
       "customCssSaved": "Salvato"
     },
     "messageList": {
+      "autoOpenReplyDrafts": "Apri automaticamente le risposte salvate quando selezioni i messaggi in arrivo",
       "title": "Elenco messaggi",
       "senderFavicons": "Favicon dei mittenti",
       "senderFaviconsDesc": "Mostra le icone dei siti web per i mittenti senza foto del contatto. A Twenty Icons viene inviato solo il dominio del mittente, mai l'indirizzo email completo.",
@@ -991,8 +1363,16 @@
       "defaultReplyAll": "Rispondi a tutti",
       "defaultReplyAllDesc": "Il pulsante Rispondi invia a tutti i destinatari",
       "defaultSender": "Mittente predefinito",
-      "defaultSenderDesc": "Da quale indirizzo vengono inviati i nuovi messaggi quando scrivi al di fuori di un account specifico, ad esempio dalla posta unificata. Le risposte usano sempre l'account che ha ricevuto il messaggio.",
+      "defaultSenderDesc": "Da quale indirizzo vengono inviati i nuovi messaggi, qualunque sia l'account che stai visualizzando. Le risposte e gli inoltri usano sempre l'account che ha ricevuto il messaggio.",
       "defaultSenderLastUsed": "Ultimo account usato",
+      "afterRemove": "Dopo l'eliminazione o l'archiviazione",
+      "afterRemoveNext": "Apri il messaggio successivo",
+      "afterRemoveNextDesc": "Apre il messaggio sotto quello rimosso.",
+      "afterRemovePrevious": "Apri il messaggio precedente",
+      "afterRemovePreviousDesc": "Apre il messaggio sopra quello rimosso.",
+      "afterRemoveList": "Torna all'elenco",
+      "afterRemoveListDesc": "Lascia vuoto il riquadro di lettura.",
+      "afterRemoveMobile": "Sul telefono si torna sempre all'elenco.",
       "markReadBehavior": "Segna come letto",
       "markReadImmediate": "Immediatamente",
       "markReadImmediateDesc": "Segna le email come lette non appena le apri.",
@@ -1066,7 +1446,7 @@
     },
     "security": {
       "title": "Sicurezza",
-      "description": "Gestisci l'autenticazione a due fattori per il tuo account.",
+      "description": "Gestisci l'autenticazione a due fattori e i token API del tuo account.",
       "totpTitle": "App di autenticazione",
       "totpNotConfigured": "Non configurata",
       "totpEnabled": "Abilitata",
@@ -1081,7 +1461,7 @@
       "totpVerifyButton": "Abilita 2FA",
       "totpVerifyLoading": "Verifica in corso…",
       "totpBack": "← Indietro",
-      "totpDisableInstructions": "Inserisci la tua password per disabilitare l'autenticazione a due fattori.",
+      "totpDisableInstructions": "Inserisci la tua password per disabilitare l'autenticazione a due fattori. Vengono eliminati anche i token API che hai confermato con la tua app di autenticazione.",
       "totpDisablePh": "La tua password",
       "totpDisableConfirm": "Disabilita 2FA",
       "totpDisableLoading": "Disabilitazione…",
@@ -1092,9 +1472,18 @@
       "ssoLink": "Collega {{provider}}",
       "ssoUnlink": "Scollega",
       "ssoUnlinkTitle": "Scollegare {{provider}}?",
-      "ssoUnlinkBody": "Non potrai più accedere con questo provider. Assicurati di avere un altro metodo di accesso.",
+      "ssoUnlinkBody": "Non potrai più accedere con questo provider. Assicurati di avere un altro metodo di accesso. Se è la tua ultima identità presso questo provider, vengono eliminati anche i token API confermati tramite esso.",
       "ssoUnlinkConfirm": "Scollega",
       "ssoNoProviders": "Nessun provider SSO è configurato su questo server.",
+      "ssoLinkConfirmPassword": "Inserisci la tua password per collegare {{provider}}.",
+      "ssoLinkConfirmTotp": "Inserisci il codice della tua app di autenticazione per collegare {{provider}}.",
+      "ssoLinkConfirmOidc": "Accedi di nuovo tramite SSO per confermare che sei tu, poi collega {{provider}} da qui.",
+      "ssoLinkConfirmOidcButton": "Conferma con {{provider}}",
+      "ssoLinkConfirmNoProvider": "Il tuo account non ha alcuna identità SSO con cui confermare né l'accesso con password. Rivolgiti a un amministratore.",
+      "ssoLinkConfirmTotpSetup": "Questo server richiede l'autenticazione a due fattori. Configura un'app di autenticazione qui sopra prima di collegare.",
+      "ssoLinkConfirmed": "Confermato con SSO fino alle {{time}}. Ora puoi collegare un altro provider.",
+      "ssoLinkContinue": "Continua",
+      "ssoLinkChecking": "Controllo in corso…",
       "activityColEvent": "Evento",
       "activityColStatus": "Stato",
       "activityColTime": "Ora",
@@ -1117,6 +1506,16 @@
       "activityBlocked": "Bloccato",
       "savingProtection": "Salvataggio…",
       "eventSsoLogin": "Accesso SSO",
+      "eventAdminPasswordSet": "Password impostata",
+      "eventAdminUserUpdate": "Account modificato",
+      "eventAdminTotpDisable": "2FA disattivato",
+      "eventAdminUserDelete": "Account eliminato",
+      "eventIdentityLinked": "Account SSO collegato",
+      "eventIdentityUnlinked": "Account SSO scollegato",
+      "eventApiTokenCreated": "Token API creato",
+      "eventApiTokenRevoked": "Token API revocato",
+      "eventApiTokenAuthFail": "Token API non valido",
+      "byActor": "da {{actor}}",
       "activityTitle": "Attività di accesso",
       "loginProtectionTitle": "Protezione accesso",
       "qrCodeAlt": "codice QR",
@@ -1129,7 +1528,7 @@
       "allowNonstandardPorts": "Consenti porte non standard",
       "allowNonstandardPortsDesc": "Consente qualsiasi porta IMAP o SMTP, non solo 143/993 (IMAP) e 465/587 (SMTP). Necessario per server come protonmail-bridge che utilizzano porte non standard.",
       "mfaEnforcementTitle": "Applicazione MFA",
-      "mfaEnforcementDesc": "Richiedere a tutti gli utenti di verificare con un secondo fattore al momento del login.",
+      "mfaEnforcementDesc": "Richiedere a tutti gli utenti di verificare con un secondo fattore al momento del login. Renderlo obbligatorio elimina i token API confermati solo con la password.",
       "mfaEnforcementOff": "Facoltativo",
       "mfaEnforcementRequired": "Obbligatorio",
       "mfaDeviceTrustTitle": "Durata affidabilità dispositivo",
@@ -1142,6 +1541,53 @@
       "recoveryEmailTitle": "Email di recupero",
       "recoveryEmailDesc": "Ricevi un codice di accesso via email se perdi l’accesso alla tua app di autenticazione.",
       "recoveryEmailPh": "tua@email.it"
+    },
+    "apiTokens": {
+      "title": "Token API",
+      "description": "I token permettono a script e strumenti, come un server MCP, di usare MailFlow senza la tua password. Un token può fare solo ciò che i suoi ambiti consentono e non può mai inviare, eliminare o modificare le impostazioni.",
+      "loadFailed": "Impossibile caricare i token API: {{message}}",
+      "disabledNotice": "I token API sono disattivati su questo server. Un amministratore deve attivarli prima che tu possa crearne uno.",
+      "disabledNoticeAdmin": "I token API sono disattivati su questo server. Attivali con l'interruttore qui sopra per crearne uno.",
+      "serverSwitchLabel": "Consenti i token API su questo server",
+      "serverSwitchDesc": "Disattivato per impostazione predefinita. Disattivandolo, i token di tutti gli utenti smettono subito di funzionare, senza essere eliminati.",
+      "newToken": "Nuovo token",
+      "nameLabel": "Nome",
+      "namePh": "ad es. server MCP sul PC dell'ufficio",
+      "scopesLabel": "Ambiti",
+      "scopeReadLabel": "Lettura",
+      "scopeReadDesc": "Elencare, leggere e cercare la tua posta.",
+      "scopeOrganizeLabel": "Organizzazione",
+      "scopeOrganizeDesc": "Segnare come letto, aggiungere stelle, archiviare, spostare, posticipare e impostare categorie. Niente può essere spostato nel Cestino o nella posta indesiderata.",
+      "scopeDraftLabel": "Bozze",
+      "scopeDraftDesc": "Salvare nuove bozze che rivedi e invii tu.",
+      "readLocked": "Organizzazione e Bozze richiedono Lettura per trovare i messaggi, quindi Lettura resta attiva.",
+      "readWarning": "Lettura vede ogni messaggio per intero, compresi i link per reimpostare la password e i codici di accesso di altri servizi. Dai un token solo a strumenti di cui ti fidi.",
+      "expiryLabel": "Scade dopo",
+      "totpLabel": "Conferma con il codice della tua app di autenticazione",
+      "passwordLabel": "Conferma con la tua password",
+      "reauthOidcHint": "Conferma prima con SSO. Il pulsante Conferma ti porta al provider per accedere di nuovo; ogni conferma crea un token, vale 10 minuti e richiede che il provider invii l'ora di quell'accesso (auth_time). Un token confermato così dura al massimo 30 giorni.",
+      "reauthOidcButton": "Conferma con {{provider}}",
+      "reauthOidcDone": "Confermato con SSO fino alle {{time}}.",
+      "reauthOidcNoProvider": "Per creare un token serve un accesso recente con SSO, ma il tuo account non ha un'identità SSO con cui accedere né l'accesso con password. Rivolgiti a un amministratore.",
+      "createButton": "Crea token",
+      "creating": "Creazione…",
+      "createdTitle": "Token «{{name}}» creato",
+      "secretWarning": "Copialo ora e conservalo in un posto sicuro. Non verrà mostrato di nuovo.",
+      "copied": "Copiato",
+      "done": "Fatto",
+      "listEmpty": "Non hai token API.",
+      "maxReached": "Hai {{max}} token, il massimo consentito. Revocane uno per crearne un altro.",
+      "totpSetupNotice": "Questo server richiede l'autenticazione a due fattori. Configura un'app di autenticazione qui sopra per creare token API.",
+      "createdAt": "Creato il {{date}}",
+      "expiresAt": "Scade il {{date}}",
+      "expired": "Scaduto",
+      "lastUsedAt": "Ultimo utilizzo: {{date}}",
+      "lastUsedFrom": "Ultimo utilizzo: {{date}} da {{ip}}",
+      "neverUsed": "Mai usato",
+      "revokeButton": "Revoca",
+      "revokeAsk": "Revocare questo token? Tutto ciò che lo usa smetterà subito di funzionare.",
+      "revokeYes": "Sì, revoca",
+      "revoking": "Revoca in corso…"
     },
     "privacy": {
       "title": "Privacy",
@@ -1162,7 +1608,7 @@
       "description": "Fai clic su un tasto per riassegnarlo. Premi Esc per annullare la registrazione.",
       "resetAll": "Ripristina tutto ai valori predefiniti",
       "recording": "Premi un tasto…",
-      "conflict": "Il tasto {{key}} era già assegnato a {{action}} — è stato riassegnato.",
+      "conflict": "Il tasto {{key}} è assegnato a più azioni. {{action}} ha la precedenza.",
       "resetDefault": "Ripristina predefinito",
       "remove": "Rimuovi scorciatoia",
       "footer": "Premi ? ovunque nell'app per vedere le scorciatoie attuali."
@@ -1175,6 +1621,12 @@
       "adminBadge": "Admin",
       "makeAdmin": "Rendi amministratore",
       "removeAdmin": "Rimuovi amministratore",
+      "aiOn": "IA attiva",
+      "aiOff": "IA disattivata",
+      "aiAccessLabel": "IA per {{username}}",
+      "aiOnHint": "Questo utente può usare l'assistente IA. Disattivala per rifiutare le sue richieste IA: assistente di redazione, riepiloghi, azioni IA e categorizzazione con IA.",
+      "aiOffHint": "Questo utente non può usare l'assistente IA. Attivala per consentirlo.",
+      "aiToggleFailed": "Impossibile modificare l'accesso all'IA di {{username}}",
       "disable2fa": "Disabilita 2FA",
       "deleteUser": "Elimina utente",
       "registrationOpen": "Registrazione aperta",
@@ -1203,8 +1655,34 @@
       "deleteConfirmBody": "Questo account utente verrà eliminato in modo permanente. Questa operazione non può essere annullata.",
       "deleteConfirmLabel": "Elimina utente",
       "disable2faConfirmTitle": "Disabilitare la 2FA per \"{{username}}\"?",
-      "disable2faConfirmBody": "Questa operazione rimuoverà il requisito dell'app di autenticazione. L'utente potrà riabilitarla da solo.",
-      "disable2faConfirmLabel": "Disabilita 2FA"
+      "disable2faConfirmBody": "Questa operazione rimuoverà il requisito dell'app di autenticazione. L'utente potrà riabilitarla da solo. Vengono eliminati anche i token API dell'utente.",
+      "disable2faConfirmLabel": "Disabilita 2FA",
+      "lastSeen": "Ultimo accesso {{when}}",
+      "neverSeen": "Mai connesso",
+      "edit": "Modifica",
+      "editTitle": "Modifica {{username}}",
+      "username": "Nome utente",
+      "usernameHint": "Usato per accedere a MailFlow.",
+      "recoveryEmail": "Email di recupero",
+      "recoveryEmailHint": "Riceve il link \"Password dimenticata?\". Lascia vuoto per rimuoverla.",
+      "newPassword": "Nuova password",
+      "newPasswordHint": "Lascia vuoto per mantenere quella attuale. Salvandone una nuova, l’utente viene disconnesso da tutti i dispositivi. Vengono eliminati anche i suoi token API.",
+      "newPasswordHintSelf": "Lascia vuoto per mantenere quella attuale. Gli altri tuoi dispositivi vengono disconnessi; questo resta connesso. Vengono eliminati anche i tuoi token API.",
+      "newPasswordRemovesIdentities": "Finché l’accesso con password è attivo, una nuova password scollega anche i suoi account di accesso singolo qui sotto.",
+      "identitiesTitle": "Accesso singolo (SSO)",
+      "identitiesHint": "Account presso un provider di accesso con cui questo utente può entrare. Scollega quello che non riconosce; viene anche disconnesso ovunque.",
+      "identityLastUsed": "Ultimo uso {{when}}",
+      "identityNeverUsed": "Non ancora usato per accedere",
+      "unlinkIdentity": "Scollega",
+      "unlinkIdentityConfirm": "Conferma",
+      "identityUnlinkFailed": "Impossibile scollegare: {{message}}",
+      "confirmPassword": "Conferma nuova password",
+      "passwordTooShort": "La password deve contenere almeno 8 caratteri.",
+      "passwordMismatch": "Le password non coincidono.",
+      "usernameTaken": "Questo nome utente è già in uso.",
+      "invalidEmail": "Questo indirizzo email non è valido.",
+      "saveFailed": "Impossibile salvare: {{message}}",
+      "passwordNotSet": "Le altre modifiche sono state salvate, ma la password non è stata impostata: {{message}}"
     },
     "ai": {
       "title": "Assistente IA",
@@ -1219,6 +1697,9 @@
       "features": "Funzionalità",
       "featureCompose": "Assistente di redazione (bozza e miglioramento)",
       "featureSummarize": "Riepilogo email",
+      "access": "Accesso",
+      "newUsersEnabled": "Consenti l'IA ai nuovi utenti",
+      "newUsersEnabledHint": "Si applica agli account creati da ora in poi. Gli utenti esistenti mantengono la propria impostazione, che puoi modificare nell'elenco utenti.",
       "saved": "Configurazione IA salvata.",
       "testOk": "Connesso con successo.",
       "testFail": "Connessione fallita",
@@ -1346,7 +1827,7 @@
     },
     "sso": {
       "title": "Single Sign-On",
-      "description": "Configura provider OIDC esterni per permettere agli utenti di accedere con i propri account aziendali.",
+      "description": "Come si accede a MailFlow stesso, tramite il provider di identità della tua organizzazione (OIDC). Il collegamento delle caselle si trova in Provider di posta.",
       "empty": "Nessun provider SSO configurato ancora.",
       "addProvider": "+ Aggiungi provider SSO",
       "templatePickerTitle": "Scegli un modello di provider",
@@ -1401,7 +1882,7 @@
       "adminGroupValueDesc": "Il nome del gruppo che concede l'accesso amministratore. Gli utenti in questo gruppo diventano admin ad ogni accesso SSO; gli utenti non in questo gruppo perdono l'accesso admin.",
       "loginMatchClaim": "Abbina gli account esistenti tramite",
       "loginMatchClaimDesc": "Claim OIDC confrontato con il nome utente di ogni account MailFlow quando un accesso SSO viene collegato per la prima volta a un account esistente (modalità di provisioning «solo accesso ad account esistenti»). Il valore predefinito è email. Usa preferred_username, upn, ecc. per provider di identità i cui nomi utente non sono indirizzi e-mail, solo se il provider garantisce che il claim sia univoco e non modificabile dall’utente.",
-      "passwordLoginDisableMsg": "Gli utenti potranno accedere solo tramite SSO. Se il provider SSO non è disponibile, sarà necessario l'accesso diretto al database per riabilitare l'accesso con password.",
+      "passwordLoginDisableMsg": "Gli utenti potranno accedere solo tramite SSO. Se il provider SSO non è disponibile, sarà necessario l'accesso diretto al database per riabilitare l'accesso con password. I token API non confermati con SSO vengono eliminati.",
       "passwordLoginDisableTitle": "Disabilitare l'accesso con password?",
       "passwordLoginDisabled": "L'accesso con password è disabilitato",
       "passwordLoginTitle": "Accesso con password",
@@ -1414,22 +1895,14 @@
     "integrations": {
       "title": "Integrazioni",
       "loading": "Caricamento…",
-      "tabEmailProviders": "Provider email",
-      "tabApps": "App",
       "microsoft": {
-        "title": "Microsoft 365 / Outlook.com",
-        "description": "OAuth2 per account Microsoft aziendali, scolastici o personali (Outlook.com, Hotmail)",
-        "configured": "Configurato",
-        "notConfigured": "Non configurato",
-        "redirecting": "Reindirizzamento…",
-        "connect": "Connetti account Microsoft",
         "setupTitle": "Configurazione registrazione app Azure",
         "step1": "Vai su portal.azure.com → Microsoft Entra ID → Registrazioni app → Nuova registrazione. In 'Tipi di account supportati', seleziona 'Account in qualsiasi directory organizzativa e account Microsoft personali' per consentire i login di Outlook.com/Hotmail",
         "step2": "Imposta il tipo di URI di reindirizzamento su Web e incolla l'URI mostrato qui sotto",
         "step3": "Autorizzazioni API → Aggiungi autorizzazione → API utilizzate dalla mia organizzazione (cerca 'Exchange' se non elencata) → Office 365 Exchange Online → Delegata → IMAP.AccessAsUser.All e SMTP.Send",
         "step4": "Autorizzazioni API → Aggiungi autorizzazione → Microsoft Graph → Delegata → offline_access, openid, email, profile",
-        "step5": "Fai clic su Concedi consenso amministratore per la tua organizzazione (solo account aziendali — gli account personali saltano questo passaggio)",
-        "step6": "Certificati e segreti → Nuovo segreto client — copia il Valore (non l'ID)",
+        "step5": "Fai clic su Concedi consenso amministratore per la tua organizzazione (solo account aziendali, gli account personali saltano questo passaggio)",
+        "step6": "Certificati e segreti → Nuovo segreto client: copia il Valore (non l'ID)",
         "clientId": "ID applicazione (client)",
         "clientIdPh": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
         "tenantId": "ID directory (tenant)",
@@ -1440,30 +1913,13 @@
         "redirectUri": "URI di reindirizzamento",
         "redirectUriNote": "Deve corrispondere esattamente all'URI di reindirizzamento registrato in Azure. Suggerito: {{uri}}",
         "save": "Salva configurazione",
-        "savedNote": "Configurazione salvata. Fai clic su \"Connetti account\" per autorizzare.",
-        "connectedNote": "Account Microsoft 365 connesso con successo! Controlla la scheda Account.",
-        "userNoteConfigured": "Il tuo amministratore ha configurato l'accesso a Microsoft 365. Collega qui sotto il tuo account Outlook.com, Hotmail o Microsoft 365.",
-        "userNoteNotConfigured": "L'accesso a Microsoft 365 non è ancora stato configurato da un amministratore. Chiedi al tuo amministratore di configurarlo.",
-        "remove": "Rimuovi",
-        "deviceCodeTitle": "Connetti con codice dispositivo",
-        "deviceCodeNote": "Nessun URI di reindirizzamento o segreto client richiesto. In Azure, vai su Autenticazione e imposta 'Consenti flussi di client pubblici' su Sì. Ideale per account personali Outlook.com / Hotmail.",
-        "deviceCodeStart": "Avvia flusso codice dispositivo",
-        "deviceCodeInstructions": "Visita il link qui sotto su qualsiasi dispositivo e inserisci il codice per autorizzare MailFlow:",
-        "deviceCodeVisit": "Visita:",
-        "deviceCodeEnter": "Inserisci il codice:",
-        "deviceCodeWaiting": "In attesa di autorizzazione…",
-        "deviceCodeExpired": "Codice scaduto. Riprova.",
-        "deviceCodeDeclined": "L'autorizzazione è stata rifiutata.",
-        "deviceCodeError": "Si è verificato un errore. Riprova.",
-        "deviceCodeCancel": "Annulla"
+        "remove": "Rimuovi"
       },
       "google": {
         "title": "Gmail / Google Workspace",
         "description": "OAuth2 per caselle Gmail e Google Workspace — necessario quando un amministratore ha disattivato le password per le app",
         "configured": "Configurato",
         "notConfigured": "Non configurato",
-        "redirecting": "Reindirizzamento…",
-        "connect": "Collega account Google",
         "setupTitle": "Configurazione del client OAuth di Google Cloud",
         "step1": "Vai su console.cloud.google.com e seleziona (o crea) un progetto. Per un dominio Workspace, accedi con un account di quel dominio affinché il progetto appartenga all'organizzazione",
         "step2": "API e servizi → Libreria → abilita l'API Gmail",
@@ -1477,10 +1933,6 @@
         "redirectUri": "URI di reindirizzamento",
         "redirectUriNote": "Deve corrispondere esattamente a un URI di reindirizzamento autorizzato sul client OAuth. Suggerito: {{uri}}",
         "save": "Salva configurazione",
-        "savedNote": "Configurazione salvata. Fai clic su «Collega account Google» per autorizzare.",
-        "connectedNote": "Account Google collegato correttamente! Controlla la scheda Account.",
-        "userNoteConfigured": "L'amministratore ha configurato l'accesso con Google. Collega qui sotto il tuo account Gmail o Google Workspace.",
-        "userNoteNotConfigured": "L'accesso con Google non è ancora stato configurato da un amministratore. Chiedi al tuo amministratore.",
         "remove": "Rimuovi"
       },
       "todoist": {
@@ -1527,6 +1979,10 @@
       "title": "Identità SSO collegata",
       "body": "Il tuo account è ora collegato al provider SSO."
     },
+    "ssoReauth": {
+      "title": "Confermato con SSO",
+      "body": "Nei prossimi 10 minuti puoi creare un token API o collegare un altro account SSO."
+    },
     "ssoError": {
       "title": "Errore SSO"
     },
@@ -1567,7 +2023,7 @@
           "idle": "Pronto per il controllo degli aggiornamenti.",
           "checking": "Controllo aggiornamenti...",
           "up-to-date": "L’app è aggiornata.",
-          "available": "È disponibile una versione firmata più recente.",
+          "available": "È disponibile una versione più recente.",
           "downloading": "Download e verifica dell’aggiornamento...",
           "downloaded": "L’aggiornamento è verificato e pronto.",
           "installing": "Riavvio per l’installazione...",
@@ -1583,6 +2039,14 @@
           "packagedOnly": "Il controllo aggiornamenti è disponibile nell’app installata."
         }
       }
+    },
+    "businessNotice": {
+      "title": "Usi MailFlow in azienda?",
+      "body": "MailFlow è gratuito con licenza AGPL ed è sviluppato da una sola persona. Chiediamo alle aziende che lo usano di acquistare una licenza aziendale, 100 $ per istanza all'anno, tasse escluse. È facoltativa e MailFlow non la verifica.",
+      "learnMore": "Vedi la licenza aziendale",
+      "haveOne": "Ne abbiamo già una",
+      "notBusiness": "Non siamo un'azienda",
+      "later": "Ricordamelo più tardi"
     },
     "search": {
       "placeholder": "Cerca impostazioni…",
@@ -1609,6 +2073,29 @@
       "autoLockNeedsPin": "Imposta un PIN per abilitare il blocco automatico",
       "autoLockOff": "Disattivato",
       "autoLockMin": "{{n}} min"
+    },
+    "backup": {
+      "title": "Backup e ripristino",
+      "intro": "Un backup contiene i dati di questo MailFlow: utenti, account email, regole, contatti, impostazioni, dati dei plugin e addestramento antispam. La posta in cache viene scaricata di nuovo dai tuoi server di posta dopo un ripristino, a meno che non venga inclusa. Il file non contiene ciò che è impostato in .env: un nuovo server ha bisogno della stessa ENCRYPTION_KEY e, se le hai impostate lì, delle stesse chiavi VAPID e impostazioni del client OAuth.",
+      "sensitive": "Il file contiene gli hash delle password, i link di invito in sospeso e le credenziali dei tuoi account. Le credenziali sono cifrate con la ENCRYPTION_KEY di questo server; il resto è leggibile, così come ogni messaggio se la posta in cache è inclusa. Conserva il file in un luogo sicuro. Può essere ripristinato solo su un server che usa la stessa chiave.",
+      "includeMail": "Includi la posta in cache",
+      "includeMailDesc": "Salva anche la copia locale di ogni messaggio sincronizzato, il che rende il file molto più grande. Senza di essa, un ripristino scarica di nuovo la posta e i messaggi non letti più recenti di ogni posta in arrivo arrivano come posta nuova: le regole della posta in arrivo vengono applicate di nuovo, inoltri compresi. La scelta vale per ogni backup finché non la cambi.",
+      "includeMailSaveError": "Impossibile salvare l'impostazione.",
+      "create": "Scarica il backup",
+      "restoreTitle": "Ripristina un backup",
+      "restoreIntro": "Il ripristino sostituisce tutti gli utenti, gli account, le impostazioni e i messaggi in cache di questo server con il contenuto del file. Poi MailFlow si riavvia. Chi non ha un account nel backup viene disconnesso, e le password diventano quelle del backup. Il ripristino rimuove anche tutti i token API, quindi gli strumenti che ne usavano uno avranno bisogno di un nuovo token.",
+      "versionNote": "Un backup si ripristina solo su una versione di MailFlow con lo stesso schema del database di quella che l'ha creato. Se lo schema di questa versione è più recente, ripristina il backup sulla versione che l'ha creato, poi aggiorna.",
+      "chooseFile": "Scegli un file di backup",
+      "restore": "Ripristina…",
+      "confirmWarn": "Tutto ciò che si trova su questo server verrà sostituito da {{name}}. L'operazione non può essere annullata.",
+      "confirmYes": "Ripristina e riavvia",
+      "restoring": "Ripristino in corso… righe scritte: {{rows}}",
+      "done": "Ripristino completato. MailFlow si sta riavviando; questa pagina si ricaricherà quando sarà di nuovo raggiungibile.",
+      "restartTimeout": "Dopo due minuti MailFlow non è ancora disponibile. Riavvialo, poi ricarica questa pagina.",
+      "failed": "Ripristino non riuscito: {{message}}",
+      "downloadFailed": "Impossibile avviare il backup.",
+      "connectionLost": "La connessione si è interrotta durante il ripristino, quindi l'esito è sconosciuto. Questa pagina si ricaricherà quando MailFlow risponderà di nuovo; verifica poi che i dati siano quelli ripristinati.",
+      "tooLarge": "Il file è più grande di quanto consenta il proxy davanti a MailFlow."
     },
     "plugins": {
       "title": "Plugin",
@@ -1695,7 +2182,9 @@
     "noRulesFired": "Nessuna regola attivata",
     "mlTokensTitle": "Token principali",
     "noMlTokens": "Nessun token ML",
-    "conversationMovedToSpam": "Conversazione spostata in Spam"
+    "conversationMovedToSpam": "Conversazione spostata in Spam",
+    "nothingFromAccount": "Nessun messaggio di questo account da segnalare come spam in questa conversazione",
+    "nothingInConversation": "Nessun messaggio da segnalare come spam in questa conversazione"
   },
   "contacts": {
     "title": "Contatti",
@@ -1761,6 +2250,7 @@
     "show": "Mostra la barra laterale destra"
   },
   "gtd": {
+    "oldestLabeledAge": "{{state}}: età del messaggio più vecchio con questa etichetta (giorni): {{count}}",
     "title": "GTD",
     "inbox": "Posta in arrivo",
     "waiting": "In attesa",
@@ -1774,13 +2264,18 @@
     "tabEmpty": "Ancora niente qui",
     "removeFrom": "Rimuovi da {{state}}",
     "classified": "Etichetta applicata",
+    "classifiedMany": "{{count}} etichettati come {{state}}",
+    "classifiedSome": "{{count}} di {{total}} etichettati come {{state}}",
     "classifyFailed": "Impossibile applicare l'etichetta",
     "undoFailed": "Impossibile annullare l'etichetta",
     "removed": "Etichetta rimossa",
     "removeFailed": "Impossibile rimuovere l'etichetta",
+    "onlyCopy": "È l'unica copia del messaggio: rimuovere l'etichetta lo eliminerebbe. Archivialo o spostalo invece.",
+    "labelChanged": "Questa etichetta è cambiata sul server e non è stata rimossa. Aggiorna e riprova.",
     "done": "Segna come completato",
     "doneFailed": "Impossibile segnare come completato",
     "doneArchiveFailed": "Segnato come completato, ma archiviazione non riuscita: è ancora nella posta in arrivo",
+    "doneThreadRemains": "Alcuni messaggi di questa conversazione non sono stati rimossi, quindi resta nella sua sezione GTD",
     "state": {
       "todo": "Da fare",
       "watch": "Osservare",
@@ -1813,5 +2308,155 @@
     "trash": "Cestino",
     "spam": "Spam",
     "archive": "Archivio"
+  },
+  "accountErrors": {
+    "label": {
+      "turnOnImap": "Attiva IMAP",
+      "imapOff": "IMAP disattivato",
+      "signInAgain": "Accedi di nuovo",
+      "cantConnect": "Connessione non riuscita",
+      "openRow": "Mostra il problema e come risolverlo"
+    },
+    "imapOffPersonal": {
+      "title": "Outlook.com sta bloccando le app di posta",
+      "body": "Microsoft ti ha fatto accedere, ma IMAP è disattivato per questa casella. Per attivarlo:",
+      "step1": "Apri Outlook.com e accedi.",
+      "step2": "Vai a Impostazioni > Posta > Inoltro e IMAP.",
+      "step3": "Attiva «Consenti a dispositivi e app di usare IMAP», poi seleziona Salva.",
+      "outro": "Poi torna qui e seleziona Riprova."
+    },
+    "imapOffWork": {
+      "title": "IMAP è disattivato per questa casella",
+      "body": "Microsoft ti ha fatto accedere, ma la tua organizzazione ha disattivato IMAP per {{email}}. Chiedi al tuo reparto IT di attivarlo, poi seleziona Riprova."
+    },
+    "signIn": {
+      "title": "Accedi di nuovo a Microsoft",
+      "titleGoogle": "Accedi di nuovo a Google",
+      "body": "L'accesso salvato da MailFlow per questo account non funziona più. Succede dopo un cambio di password, dopo un lungo periodo di inutilizzo o quando l'accesso è stato revocato nelle impostazioni del tuo account."
+    },
+    "appConfig": {
+      "title": "L'accesso per questo account non è configurato correttamente",
+      "bodyUser": "Il provider di posta ha rifiutato l'app con cui MailFlow accede. Chiedi al tuo amministratore di controllare le impostazioni di accesso.",
+      "bodyAdmin": "Il provider di posta ha rifiutato l'app con cui MailFlow accede. Controlla le sue impostazioni in Provider di posta. I dettagli qui sotto mostrano la risposta del provider."
+    },
+    "authFailed": {
+      "title": "Il server ha rifiutato la password",
+      "body": "Il server di posta non ha accettato il nome utente o la password di questo account. Se hai cambiato password o usi una password per le app, aggiornala con Modifica account."
+    },
+    "connection": {
+      "title": "MailFlow non riesce a connettersi a questo account",
+      "body": "MailFlow continua a riprovare da solo. I dettagli qui sotto mostrano la risposta del server."
+    },
+    "action": {
+      "openOutlook": "Apri Outlook.com",
+      "retry": "Riprova",
+      "signIn": "Accedi di nuovo",
+      "edit": "Modifica account"
+    },
+    "details": "Dettagli",
+    "wrongAccount": "Hai effettuato l'accesso come {{signedInAs}}, non come {{expected}}. Accedi con {{expected}} per sistemare questo account.",
+    "signInDialog": {
+      "title": "Accedi di nuovo",
+      "body": "Accedi come {{email}} per riconnettere questo account.",
+      "success": "Accesso effettuato. MailFlow sta riconnettendo questo account.",
+      "continueGoogle": "Continua su Google",
+      "waitingGoogle": "Completa l'accesso nella pagina di Google, poi torna qui."
+    },
+    "signInFailed": "L'accesso non è riuscito",
+    "signInFailedBody": "Ricomincia dall'account in Impostazioni > Account."
+  },
+  "addAccount": {
+    "title": "Aggiungi un account di posta",
+    "emailLabel": "Il tuo indirizzo email",
+    "continue": "Continua",
+    "invalidEmail": "Inserisci un indirizzo email come tu@example.com.",
+    "orChoose": "Oppure scegli il tuo provider",
+    "tile": {
+      "outlook": "Outlook.com, Hotmail, Live, MSN",
+      "outlookSub": "Accedi con Microsoft",
+      "work": "Microsoft 365 (lavoro o scuola)",
+      "workSub": "Accedi con l'account Microsoft della tua organizzazione",
+      "gmail": "Gmail",
+      "gmailSub": "Usa una password per le app",
+      "gmailSignIn": "Accedi con Google",
+      "yahoo": "Yahoo Mail",
+      "yahooSub": "Usa una password per le app",
+      "icloud": "iCloud Mail",
+      "icloudSub": "Usa una password specifica per le app",
+      "other": "Altro (IMAP)",
+      "otherSub": "Inserisci le impostazioni del server"
+    },
+    "personalOff": "Non disponibile su questo server.",
+    "workOff": "Non disponibile su questo server.",
+    "openSettings": "Apri le impostazioni dei provider di posta"
+  },
+  "msSignIn": {
+    "titlePersonal": "Accedi con Microsoft",
+    "titleWork": "Accedi con il tuo account di lavoro o della scuola",
+    "beforeTitle": "Prima di iniziare",
+    "beforeBody": "Outlook.com deve consentire le app di posta. Se non l'hai mai fatto:",
+    "step1": "Apri la pagina di accesso di Microsoft.",
+    "step1Button": "Apri l'accesso Microsoft",
+    "step2": "Inserisci lì questo codice, poi segui i passaggi nella pagina di Microsoft.",
+    "copy": "Copia codice",
+    "copied": "Copiato",
+    "waiting": "In attesa che completi l'accesso nella pagina di Microsoft…",
+    "starting": "Richiesta di un codice a Microsoft…",
+    "checking": "Verifica che MailFlow possa raggiungere la tua casella…",
+    "connected": "{{email}} è connesso. La posta si sta sincronizzando.",
+    "stillConnecting": "Accesso effettuato come {{email}}. MailFlow si sta ancora connettendo e continua a riprovare da solo. L'elenco degli account mostra quando è pronto.",
+    "declined": "Hai annullato l'accesso nella pagina di Microsoft.",
+    "expired": "Il codice è scaduto prima della fine dell'accesso. I codici durano 15 minuti.",
+    "error": "L'accesso a Microsoft non è riuscito.",
+    "newCode": "Ottieni un nuovo codice",
+    "startOver": "Ricomincia",
+    "done": "Fatto",
+    "finePrintShared": "Microsoft potrebbe indicare MailFlow come app non verificata. È normale: l'app condivisa di MailFlow serve solo a identificare MailFlow presso Microsoft. Accedi nella pagina di Microsoft, e Microsoft invia l'accesso direttamente a questo server.",
+    "finePrintOwn": "Accedi nella pagina di Microsoft, e Microsoft invia l'accesso direttamente a questo server.",
+    "continueMicrosoft": "Continua su Microsoft",
+    "redirectWaiting": "Completa l'accesso nella pagina di Microsoft che si è aperta, poi torna qui.",
+    "useCode": "Usa invece un codice",
+    "useRedirect": "Accedi invece nella pagina di Microsoft",
+    "back": "Indietro",
+    "lost": "MailFlow ha perso traccia di questo accesso, ad esempio perché il server è stato riavviato. Se hai completato l'accesso nella pagina di Microsoft, l'account potrebbe essere già nel tuo elenco.",
+    "checkAccounts": "Controlla i tuoi account"
+  },
+  "mailSignIn": {
+    "title": "Provider di posta",
+    "description": "Come MailFlow si collega alle caselle Microsoft e Google. È diverso dal Single Sign-On (SSO), con cui si accede a MailFlow stesso. Ognuno aggiunge i propri account in Account > Aggiungi account.",
+    "required": "Compila prima i campi obbligatori.",
+    "redirectRequired": "Google richiede un URI di reindirizzamento: quello registrato sul client OAuth, che termina con /oauth/google/callback.",
+    "saved": "Salvato.",
+    "ms": {
+      "title": "Microsoft",
+      "description": "Caselle Outlook.com, Hotmail, Live, MSN e Microsoft 365",
+      "personalTitle": "Account personali (Outlook.com, Hotmail, Live, MSN)",
+      "statusShared": "Usa l'app condivisa di MailFlow",
+      "statusOwn": "Usa la tua app",
+      "statusOff": "Disattivato",
+      "sharedSwitch": "Consenti l'accesso con l'app condivisa di MailFlow",
+      "sharedSwitchDesc": "Nessuna configurazione necessaria. Gli account già connessi continuano a funzionare se lo disattivi.",
+      "ownHandlesPersonal": "La tua app gestisce gli account personali, quindi l'app condivisa di MailFlow non viene usata.",
+      "workTitle": "Account di lavoro e della scuola (Microsoft 365)",
+      "workOff": "Non configurato",
+      "setupToggle": "Configura la tua app Microsoft Entra"
+    },
+    "google": {
+      "setupToggle": "Configura il tuo client OAuth Google"
+    }
+  },
+  "accountForm": {
+    "signedInMicrosoft": "Accesso con Microsoft come {{email}}",
+    "signedInGoogle": "Accesso con Google come {{email}}",
+    "signedInNote": "Il server proviene da questo accesso. Se l'account smette di connettersi, accedi di nuovo.",
+    "mailboxLabel": "Casella da aprire",
+    "mailboxHelp": "Per una casella condivisa o delegata, inserisci il suo indirizzo. Lascia così per la tua casella."
+  },
+  "googleSignIn": {
+    "title": "Accedi con Google",
+    "finePrint": "Accedi nella pagina di Google, e Google invia l'accesso direttamente a questo server.",
+    "formNote": "Le caselle Gmail e Google Workspace possono accedere con Google invece di usare una password per le app.",
+    "appPasswordNote": "Gmail richiede una password per le app, non la tua password abituale. Attiva la verifica in due passaggi per il tuo account Google, poi crea una password per le app e inseriscila nel campo della password.",
+    "createAppPassword": "Crea una password per le app"
   }
 }

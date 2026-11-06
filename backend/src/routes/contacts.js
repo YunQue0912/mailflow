@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { query } from '../services/db.js';
+import { findOwnedContact, CONTACT_READ_ONLY } from '../services/ownership.js';
 import { requireAuth } from '../middleware/auth.js';
-import { generateVCard } from '../utils/vcard.js';
+import { generateVCard, photoContentType } from '../utils/vcard.js';
 import { safeFetch } from '../services/safeFetch.js';
 import crypto from 'crypto';
 
@@ -108,6 +109,15 @@ router.get('/', async (req, res) => {
 // GET /api/contacts/photo?email=:email
 // Returns the contact photo for the given sender email as image bytes.
 // This route must remain ABOVE /:id to prevent Express matching "photo" as an id.
+// Contact photos and Gravatar images are served from MailFlow's own origin: never as anything but
+// an image, whatever proxy sits in front (nginx adds nosniff too, a custom one may not), and never
+// run as a page if opened on their own. The image proxy sends the same.
+const IMAGE_SAFETY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Content-Security-Policy': "default-src 'none'; sandbox",
+  'Cross-Origin-Resource-Policy': 'same-origin',
+};
+
 router.get('/photo', async (req, res) => {
   const { email } = req.query;
   const userId = req.session.userId;
@@ -126,14 +136,20 @@ router.get('/photo', async (req, res) => {
 
     const photoData = result.rows[0].photo_data;
     res.set('Cache-Control', 'private, max-age=86400');
+    res.set(IMAGE_SAFETY_HEADERS);
 
     if (photoData.startsWith('data:')) {
       const commaIdx = photoData.indexOf(',');
       if (commaIdx < 0) return res.status(404).end();
       const mimeMatch = photoData.slice(0, commaIdx).match(/data:([^;]+)/);
-      const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+      // Rows saved before parseVCard checked the type can still say text/html or script.
+      const mimeType = photoContentType(mimeMatch?.[1]);
+      const bytes = Buffer.from(photoData.slice(commaIdx + 1), 'base64');
+      // Express's default ETag hashes only the bytes, so a browser holding a copy that was
+      // served as text/html before this check would get a 304 and keep using it as HTML.
+      res.set('ETag', `W/"${crypto.createHash('sha1').update(`${mimeType}\0`).update(bytes).digest('base64url')}"`);
       res.set('Content-Type', mimeType);
-      return res.send(Buffer.from(photoData.slice(commaIdx + 1), 'base64'));
+      return res.send(bytes);
     }
 
     // Fallback: treat as raw base64 JPEG (shouldn't occur after vcard.js fix).
@@ -166,6 +182,7 @@ router.get('/gravatar', async (req, res) => {
   if (cached && cached.expires > now) {
     if (cached.miss) return res.status(404).end();
     res.set('Cache-Control', 'private, max-age=86400');
+    res.set(IMAGE_SAFETY_HEADERS);
     res.set('Content-Type', cached.type);
     return res.send(cached.buf);
   }
@@ -189,6 +206,7 @@ router.get('/gravatar', async (req, res) => {
     if (buf.length === 0 || buf.length > 512 * 1024) return res.status(502).end();
     gravatarCacheSet(hash, { buf, type, expires: now + GRAVATAR_TTL_MS });
     res.set('Cache-Control', 'private, max-age=86400');
+    res.set(IMAGE_SAFETY_HEADERS);
     res.set('Content-Type', type);
     return res.send(buf);
   } catch {
@@ -200,19 +218,14 @@ router.get('/gravatar', async (req, res) => {
 router.get('/:id', async (req, res) => {
   const userId = req.session.userId;
   try {
-    const result = await query(
-      `SELECT c.id, c.uid, c.display_name, c.first_name, c.last_name,
+    const contact = await findOwnedContact(userId, req.params.id, {
+      columns: `c.id, c.uid, c.display_name, c.first_name, c.last_name,
               c.primary_email, c.emails, c.phones, c.organization,
               c.notes, c.photo_data, c.is_auto, c.send_count, c.last_sent,
-              c.etag, c.vcard, c.created_at, c.updated_at,
-              (ab.source = 'carddav') AS read_only
-       FROM contacts c
-       JOIN address_books ab ON ab.id = c.address_book_id
-       WHERE c.id = $1 AND c.user_id = $2`,
-      [req.params.id, userId]
-    );
-    if (!result.rows.length) return res.status(404).json({ error: 'Contact not found' });
-    res.json(result.rows[0]);
+              c.etag, c.vcard, c.created_at, c.updated_at, ${CONTACT_READ_ONLY}`,
+    });
+    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+    res.json(contact);
   } catch (err) {
     console.error('Contact get error:', err);
     res.status(500).json({ error: 'Failed to fetch contact' });
@@ -283,14 +296,8 @@ router.patch('/:id', async (req, res) => {
 
   try {
     // Load current contact (with its book source to block edits to synced contacts)
-    const cur = await query(
-      `SELECT c.*, ab.source AS book_source FROM contacts c
-       JOIN address_books ab ON ab.id = c.address_book_id
-       WHERE c.id = $1 AND c.user_id = $2`,
-      [req.params.id, userId]
-    );
-    if (!cur.rows.length) return res.status(404).json({ error: 'Contact not found' });
-    const c = cur.rows[0];
+    const c = await findOwnedContact(userId, req.params.id, { columns: 'c.*, ab.source AS book_source' });
+    if (!c) return res.status(404).json({ error: 'Contact not found' });
     if (c.book_source === 'carddav') {
       return res.status(403).json({ error: 'This contact is synced from CardDAV and is read-only' });
     }
@@ -352,13 +359,9 @@ router.delete('/:id', async (req, res) => {
   const userId = req.session.userId;
   try {
     // Block deletion of CardDAV-synced (read-only) contacts; they reappear on next sync anyway.
-    const owner = await query(
-      `SELECT ab.source FROM contacts c JOIN address_books ab ON ab.id = c.address_book_id
-       WHERE c.id = $1 AND c.user_id = $2`,
-      [req.params.id, userId]
-    );
-    if (!owner.rows.length) return res.status(404).json({ error: 'Contact not found' });
-    if (owner.rows[0].source === 'carddav') {
+    const owned = await findOwnedContact(userId, req.params.id, { columns: 'ab.source' });
+    if (!owned) return res.status(404).json({ error: 'Contact not found' });
+    if (owned.source === 'carddav') {
       return res.status(403).json({ error: 'This contact is synced from CardDAV and is read-only' });
     }
     const result = await query(

@@ -7,6 +7,8 @@ import { playNotificationSound } from '../utils/notificationSounds.js';
 import { accountAffectsUnifiedInbox } from '../utils/unifiedInbox.js';
 import { dispatchPluginWsMessage, dispatchPluginReconnect } from '../plugins/events.js';
 import { recordDiagEvent } from '../utils/diagEvents.js';
+import { scheduledFeed } from '../utils/scheduledFeed.js';
+import { SOCKET_CAUGHT_UP_EVENT } from '../utils/resumeRefresh.js';
 
 function _applyServerCounts(counts) {
   useStore.getState().setUnreadCounts(counts);
@@ -34,6 +36,13 @@ let backfillRefreshTimer = null;
 let flagCountRefreshTimer = null;
 const BACKOFF_BASE = 1000;
 const BACKOFF_MAX = 30000;
+// How long a socket must stay open before the backoff starts over. One the server accepts and then
+// closes at once (an address other than APP_URL is refused, 1008) otherwise reset it on every open
+// and was retried every second or two, each retry refetching the message list.
+const STABLE_MS = 10000;
+// How long a socket that still says OPEN has to answer a ping when the tab comes back. A
+// connection that died while the device slept leaves the socket OPEN with no close to come.
+const PROBE_MS = 8000;
 
 export function useWebSocket() {
   const { t } = useTranslation();
@@ -55,7 +64,10 @@ export function useWebSocket() {
     // connections if connect() is called while a previous socket is still open.
     if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
       wsRef.current.onclose = null;  // prevent old socket's close from scheduling another reconnect
+      wsRef.current.onmessage = null;
       clearInterval(wsRef.current._pingInterval);
+      clearTimeout(wsRef.current._stableTimer);
+      clearTimeout(wsRef.current._probeTimer);
       wsRef.current.close();
     }
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -64,15 +76,17 @@ export function useWebSocket() {
     ws.onopen = () => {
       const wasReconnect = hasConnectedBefore.current;
       hasConnectedBefore.current = true;
-      reconnectAttempt.current = 0;
+      ws._stableTimer = setTimeout(() => { reconnectAttempt.current = 0; }, STABLE_MS);
       ws._lastActivity = Date.now();
       // Ping every 30s. If no message (including the server's pong) has arrived in ~2.5 intervals,
       // the socket is half-open — common after sleep/network blips, where onclose never fires and
-      // the tab silently stops receiving updates. Force-close it so onclose schedules a reconnect.
+      // the tab silently stops receiving updates. Replace it now: close() on a dead connection
+      // waits on a closing handshake that never completes, so its onclose may never come either.
       const pingInterval = setInterval(() => {
         if (ws.readyState !== WebSocket.OPEN) return;
         if (Date.now() - (ws._lastActivity || 0) > 75000) {
-          try { ws.close(); } catch { /* onclose reconnects */ }
+          clearTimeout(reconnectTimer.current);
+          connect();
           return;
         }
         ws.send(JSON.stringify({ type: 'ping' }));
@@ -84,11 +98,17 @@ export function useWebSocket() {
         window.dispatchEvent(new CustomEvent('mailflow:refresh'));
         api.getUnreadCounts().then(counts => {
           useStore.getState().setUnreadCounts(counts);
+          // The counts stand for the whole catch-up, as they do for a resume resync: once they
+          // are in, a resume resync still being retried is settled. Not before, or a failed
+          // catch-up would cancel the retry and leave the list stale.
+          window.dispatchEvent(new CustomEvent(SOCKET_CAUGHT_UP_EVENT));
         }).catch(() => {});
         // A plugin's rail/derived data can drift during the outage — events fired while the socket
         // was down are lost, not buffered. Let each activated plugin resync (GTD refetches its
         // sections). Core stays plugin-agnostic.
         dispatchPluginReconnect();
+        // Scheduled messages that changed during the outage (#543): their list, once it is loaded.
+        if (useStore.getState().scheduledList) scheduledFeed.changed();
       }
     };
 
@@ -102,6 +122,7 @@ export function useWebSocket() {
 
     ws.onclose = (event) => {
       clearInterval(ws._pingInterval);
+      clearTimeout(ws._stableTimer);
       if (!mountedRef.current || NO_RECONNECT_CODES.has(event.code)) return;
       const attempt = reconnectAttempt.current;
       const delay = Math.min(BACKOFF_BASE * 2 ** attempt, BACKOFF_MAX);
@@ -133,32 +154,34 @@ export function useWebSocket() {
         // and the scrub net only catches emails/IPs/tokens. isInbox is the safe signal.
         recordDiagEvent({ category: 'event', type: 'new_messages', accountId, isInbox, count, alertCount });
 
-        if (messages && messages.length > 0) {
-          // In-app notifications and sounds are inbox-only — non-inbox folder syncs
-          // (Archive, Spam, on-demand syncs) should not trigger alerts for old mail.
-          // Also skipped when all messages were silenced by a mark_read rule (alertCount === 0).
-          if (isInbox && alertCount > 0) {
-            const latest = alertMessages[0];
-            const notification = {
-              type: 'new_mail',
-              accountId,
-              folder: folder || 'INBOX',
-              messageId: latest.id,
-              message: latest,
-              title: latest.fromName || latest.fromEmail || t('notifications.newMessage'),
-              body: latest.subject || t('common.noSubject'),
-              count: alertCount,
-            };
+        // In-app notifications and sounds are inbox-only — non-inbox folder syncs
+        // (Archive, Spam, on-demand syncs) should not trigger alerts for old mail.
+        // Also skipped when all messages were silenced by a mark_read rule (alertCount === 0).
+        // An alert can come with no new Inbox mail at all: mail a "Notify me" rule filed
+        // elsewhere (#588), which is opened in the folder it went to.
+        if (isInbox && alertCount > 0 && alertMessages?.length) {
+          const latest = alertMessages[0];
+          const notification = {
+            type: 'new_mail',
+            accountId,
+            folder: latest.folder || folder || 'INBOX',
+            messageId: latest.id,
+            message: latest,
+            title: latest.fromName || latest.fromEmail || t('notifications.newMessage'),
+            body: latest.subject || t('common.noSubject'),
+            count: alertCount,
+          };
 
-            if (document.visibilityState === 'visible') {
-              addNotification(notification);
-              const { notificationSound, customSoundDataUrl } = useStore.getState();
-              playNotificationSound(notificationSound, customSoundDataUrl);
-            }
-
-            _forwardNativeNewMailNotification(notification);
+          if (document.visibilityState === 'visible') {
+            addNotification(notification);
+            const { notificationSound, customSoundDataUrl } = useStore.getState();
+            playNotificationSound(notificationSound, customSoundDataUrl);
           }
 
+          _forwardNativeNewMailNotification(notification);
+        }
+
+        if (messages && messages.length > 0) {
           // Refresh the message list when the affected folder is visible
           const store = useStore.getState();
           const isRelevant =
@@ -191,7 +214,7 @@ export function useWebSocket() {
         break;
 
       case 'account_connected': {
-        updateAccount(data.accountId, { sync_error: null });
+        updateAccount(data.accountId, { sync_error: null, sync_error_code: null });
         break;
       }
 
@@ -205,7 +228,7 @@ export function useWebSocket() {
       }
 
       case 'account_error': {
-        updateAccount(data.accountId, { sync_error: data.error });
+        updateAccount(data.accountId, { sync_error: data.error, sync_error_code: data.code ?? null });
         break;
       }
 
@@ -275,6 +298,14 @@ export function useWebSocket() {
         break;
       }
 
+      case 'drafts_changed': {
+        // A Drafts folder gained or lost a draft: synced from another client (which saves it
+        // read, so no new_messages), or saved, discarded or sent from another tab or device.
+        // The Inbox re-checks its reply-draft markers; the visible list does not reload.
+        useStore.getState().invalidateReplyDrafts();
+        break;
+      }
+
       case 'folder_emptied': {
         // Background empty finished (see mail.js /folders/empty). Toast the outcome and refresh
         // the view and counts either way — on failure the messages are still on the server and
@@ -309,6 +340,15 @@ export function useWebSocket() {
         api.getUnreadCounts().then(counts => {
           useStore.getState().setUnreadCounts(counts);
         }).catch(() => {});
+        break;
+      }
+
+      // A scheduled message changed (#543, design 5.3): the event says only which one, so the
+      // Scheduled view's list and the counts are fetched again, once for a burst of changes. A
+      // composer editing that message checks its hold (mailflow:scheduled_changed).
+      case 'scheduled_changed': {
+        scheduledFeed.changed();
+        window.dispatchEvent(new CustomEvent('mailflow:scheduled_changed', { detail: { id: data.id, status: data.status } }));
         break;
       }
 
@@ -362,16 +402,30 @@ export function useWebSocket() {
   }, [connect]);
 
   // Revive a dropped socket the moment the user returns to the tab or the network comes back,
-  // instead of waiting out the reconnect backoff. (Half-open sockets are handled by the heartbeat.)
+  // instead of waiting out the reconnect backoff. One that still says OPEN is asked for a pong
+  // first: the heartbeat would only notice a dead one after 75s of silence, and its timer was
+  // frozen while the tab was away.
   useEffect(() => {
+    const reviveNow = () => {
+      clearTimeout(reconnectTimer.current);
+      reconnectAttempt.current = 0;
+      connect();
+    };
     const revive = () => {
       if (document.visibilityState !== 'visible') return;
       const ws = wsRef.current;
       if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-        clearTimeout(reconnectTimer.current);
-        reconnectAttempt.current = 0;
-        connect();
+        reviveNow();
+        return;
       }
+      if (ws.readyState !== WebSocket.OPEN || ws._probeTimer) return;
+      const askedAt = Date.now();
+      try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* no answer either way */ }
+      ws._probeTimer = setTimeout(() => {
+        ws._probeTimer = null;
+        if (wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) return;
+        if ((ws._lastActivity || 0) < askedAt) reviveNow();
+      }, PROBE_MS);
     };
     document.addEventListener('visibilitychange', revive);
     window.addEventListener('online', revive);
