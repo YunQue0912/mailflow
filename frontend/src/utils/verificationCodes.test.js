@@ -1,7 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
-import { extractVerificationCodes } from './verificationCodes.js';
+import { extractReliableVerificationCodes, extractVerificationCodes } from './verificationCodes.js';
 
 const dom = new JSDOM();
 globalThis.DOMParser = dom.window.DOMParser;
@@ -15,6 +15,101 @@ describe('verification code extraction', () => {
     assert.deepEqual(extractVerificationCodes({ text: 'Your verification code is aB9k2P. Do not share it.' }), ['aB9k2P']);
     assert.deepEqual(extractVerificationCodes({ text: 'One-time passcode: 8392' }), ['8392']);
     assert.deepEqual(extractVerificationCodes({ text: 'Security code: ABCD-EFGH' }), ['ABCD-EFGH']);
+  });
+
+  test('a direct input operation and authentication purpose identify an unlabelled code', () => {
+    for (const input of [
+      { subject: 'Sign in to your account', text: 'Enter 046281 to finish signing in. This expires in 10 minutes.' },
+      { subject: 'Account authentication', text: 'Enter 004782 for authentication.' },
+      { subject: '身份认证', text: '请输入 058214 进行身份认证。' },
+      { subject: 'Your Example code', text: 'Your code is 004782. Enter it in the browser to continue signing in.' },
+      { subject: 'New login attempt', text: 'Your one-time PIN is 004782. If you did not request it, ignore this email.' },
+    ]) {
+      const manual = extractVerificationCodes(input);
+      assert.equal(manual.length, 1);
+      assert.deepEqual(extractReliableVerificationCodes(input), manual);
+    }
+  });
+
+  test('HTML layout supports identity instructions without relying on a literal code keyword', () => {
+    const input = {
+      subject: 'Confirm it is you',
+      html: '<p>Use the following numbers to verify your identity.</p>'
+        + '<div style="font-size:28px;font-weight:700;letter-spacing:3px;background:url(https://example.test/image)">058214</div>'
+        + '<p>Valid for 10 minutes. If you did not request this, ignore this email.</p>',
+    };
+    assert.deepEqual(extractVerificationCodes(input), ['058214']);
+    assert.deepEqual(extractReliableVerificationCodes(input), ['058214']);
+  });
+
+  test('identity context and prominent typography without an instruction remain manual only', () => {
+    const input = { subject: 'Confirm it is you', html: '<p>Your number is <span style="font-size:28px;font-weight:700">058214</span>.</p>' };
+    assert.deepEqual(extractVerificationCodes(input), ['058214']);
+    assert.deepEqual(extractReliableVerificationCodes(input), []);
+    assert.deepEqual(extractVerificationCodes({ subject: 'Your weekly statistics', html: '<h2>058214</h2>' }), []);
+  });
+
+  test('a high-evidence value cannot become auto-copyable by discarding a weaker candidate', () => {
+    const input = { subject: 'Confirm your identity', text: 'Security code: 111111\n\n222222' };
+    assert.deepEqual(extractVerificationCodes(input), ['111111', '222222']);
+    assert.deepEqual(extractReliableVerificationCodes(input), []);
+    assert.deepEqual(extractReliableVerificationCodes({ text: 'Verification code: 001234' }), ['001234']);
+  });
+
+  test('the reliable helper independently rejects every participating truncated input', () => {
+    for (const input of [
+      { subject: `Verification code: 001234 ${'x'.repeat(60_000)}` },
+      { text: `Verification code: 001234 ${'x'.repeat(60_000)}` },
+      { html: `<p>Verification code: 001234</p>${' '.repeat(60_000)}` },
+      { snippet: `Verification code: 001234 ${'x'.repeat(60_000)}` },
+    ]) {
+      assert.deepEqual(extractVerificationCodes(input), ['001234']);
+      assert.deepEqual(extractReliableVerificationCodes(input), []);
+    }
+    assert.deepEqual(extractReliableVerificationCodes({ text: 'Verification code: 001234', snippet: 'x'.repeat(60_000) }), ['001234']);
+  });
+
+  test('security news, tutorials, examples, metadata and login alerts do not become challenges', () => {
+    for (const input of [
+      { subject: 'Security news', html: '<p>Account authentication report.</p><h2>123456</h2><p>New sign-in events this year.</p>' },
+      { subject: 'Tutorial: sign-in confirmation', text: 'Enter 123456 to finish signing in.' },
+      { text: 'For example, your verification code might be 123456.' },
+      { subject: 'Sign in to your account', text: 'Enter order number 123456 to continue signing in.' },
+      { subject: 'New login alert', text: 'Use case number 123456 when contacting support. Login was successful.' },
+      { subject: 'Account sign-in notification', text: 'You signed in successfully.\nExample Corporation\nOne Example Way\nRedmond, WA 98052' },
+    ]) {
+      assert.deepEqual(extractVerificationCodes(input), [], JSON.stringify(input));
+      assert.deepEqual(extractReliableVerificationCodes(input), []);
+    }
+  });
+
+  test('support references and permanent account identifiers are not sign-in codes', () => {
+    for (const input of [
+      { subject: 'New login attempt', text: 'Your account was accessed. If you contact support, use reference 123456.' },
+      { subject: 'Sign in to your account', text: 'We sent you a link. To contact support, use 123456 as your reference.' },
+      { subject: 'Sign in to your account', text: 'Please use customer reference 654321 when you contact our support team.' },
+      { subject: 'Welcome - sign in to your account', text: 'Account number: 123456. Use this number to sign in.' },
+      { subject: 'Welcome - sign in to your account', text: 'User ID: 654321. Use this ID to sign in to your account.' },
+      { subject: '登录到您的账户', text: '请使用 123456 作为您的客服参考号。' },
+      { subject: '登录到您的账户', text: '账户编号：123456。请使用此编号登录。' },
+      { subject: 'Sign in to your account', text: 'Use 123456 to view the company profile.' },
+    ]) {
+      assert.deepEqual(extractVerificationCodes(input), [], JSON.stringify(input));
+      assert.deepEqual(extractReliableVerificationCodes(input), []);
+    }
+  });
+
+  test('specific code-use and sign-in input instructions retain reliable evidence', () => {
+    for (const input of [
+      { subject: 'Sign in to your account', text: 'Use code 046281 to continue.' },
+      { subject: 'Sign in to your account', text: 'Enter 046281 to finish signing in.' },
+      { subject: 'Verification code', text: 'Use 046281.' },
+      { subject: 'Sign in to your account', text: '046281\nUse this code to sign in.' },
+      { subject: 'Sign in to your account', text: 'Security code: 046281. Your customer reference is 654321.' },
+    ]) {
+      assert.deepEqual(extractVerificationCodes(input), ['046281'], JSON.stringify(input));
+      assert.deepEqual(extractReliableVerificationCodes(input), ['046281']);
+    }
   });
 
   test('recognizes code before its label', () => {

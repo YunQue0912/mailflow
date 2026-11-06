@@ -1,4 +1,6 @@
-import { extractVerificationCodes, VERIFICATION_CODE_MAX_INPUT } from './verificationCodes.js';
+import {
+  extractVerificationCodes, extractReliableVerificationCodes, VERIFICATION_CODE_MAX_INPUT,
+} from './verificationCodes.js';
 import { getAutoCopyVerificationCodes } from './verificationCodePreferences.js';
 
 const MAX_AGE_MS = 10 * 60 * 1000;
@@ -40,6 +42,7 @@ export function createVerificationCodeAutoCopy({
   isDocumentReady = documentReady,
   copyText = writeClipboard,
   extractCodes = extractVerificationCodes,
+  extractReliableCodes = extractCodes === extractVerificationCodes ? extractReliableVerificationCodes : extractCodes,
   now = Date.now,
 } = {}) {
   let generation = 0;
@@ -110,6 +113,10 @@ export function createVerificationCodeAutoCopy({
         // Ambiguity is left for the user; never pick one of several plausible codes.
         if (codes.length > 1) return false;
         if (codes.length !== 1) continue;
+        // A plausible manual suggestion is not enough to replace the clipboard.
+        // Stop this batch rather than falling back to an older, more confident code.
+        const reliable = extractReliableCodes(input);
+        if (reliable.length !== 1 || reliable[0] !== codes[0]) return false;
         const code = codes[0];
         const write = writeQueue.catch(() => {}).then(async () => {
           if (ticket !== generation || !eligible(userId) || !fresh(message)) return false;

@@ -85,6 +85,47 @@ test('breaks equal-timestamp ties using the last appended mail', async () => {
   assert.deepEqual(f.writes, ['001234']);
 });
 
+test('a plausible but uncertain latest code does not auto-copy an older code instead', async () => {
+  const f = setup({ extractReliableCodes: input => {
+    const codes = syntheticCodes(input);
+    return codes.includes('654321') ? [] : codes;
+  } });
+  assert.equal(await f.engine.handleNewMessages(event([
+    mail('old', -1000), mail('latest-uncertain', 0, { subject: 'CODE[654321]' }),
+  ])), false);
+  assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.fetches, ['latest-uncertain']);
+});
+
+test('the default detector auto-copies an unlabelled code tied to a sign-in instruction', async () => {
+  const f = setup({ extractCodes: undefined, fetchBody: async () => ({
+    text: 'Enter 046281 to finish signing in. This expires in 10 minutes.',
+  }) });
+  assert.equal(await f.engine.handleNewMessages(event([
+    mail('context-code', 0, { subject: 'Sign in to your account' }),
+  ])), true);
+  assert.deepEqual(f.writes, ['046281']);
+});
+
+test('the default detector leaves a structural suggestion without an input instruction for manual copying', async () => {
+  const previousParser = Object.getOwnPropertyDescriptor(globalThis, 'DOMParser');
+  const dom = new JSDOM('');
+  Object.defineProperty(globalThis, 'DOMParser', { configurable: true, value: dom.window.DOMParser });
+  try {
+    const body = { html: '<p>Sign in to your account.</p><h2>046281</h2>' };
+    const f = setup({ extractCodes: undefined, fetchBody: async () => body });
+    assert.deepEqual(extractVerificationCodes({ subject: 'Confirm it is you', ...body }), ['046281']);
+    assert.equal(await f.engine.handleNewMessages(event([
+      mail('structural-only', 0, { subject: 'Confirm it is you' }),
+    ])), false);
+    assert.deepEqual(f.writes, []);
+  } finally {
+    if (previousParser) Object.defineProperty(globalThis, 'DOMParser', previousParser);
+    else delete globalThis.DOMParser;
+    dom.window.close();
+  }
+});
+
 test('reads the full body without changing mail flags', async () => {
   const fetches = [];
   const f = setup({ fetchBody: async id => { fetches.push(id); return { text: 'CODE[001234]' }; } });
