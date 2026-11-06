@@ -265,6 +265,14 @@ describe('API-key provider regression', () => {
     model: 'legacy-model',
     features: { compose: true, summarize: true },
   };
+  const unsupportedTokenLimit = {
+    error: {
+      message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
+      type: 'invalid_request_error',
+      param: 'max_tokens',
+      code: 'unsupported_parameter',
+    },
+  };
 
   it('completes text with the legacy OpenAI-compatible request contract', async () => {
     const fetchFn = vi.fn().mockResolvedValue(jsonResponse({
@@ -283,6 +291,99 @@ describe('API-key provider regression', () => {
       max_tokens: 12,
       stream: false,
     });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('tests a modern model by retrying its explicit token parameter rejection once', async () => {
+    vi.useFakeTimers();
+    const rejected = jsonResponse(unsupportedTokenLimit, 400);
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(rejected)
+      .mockImplementationOnce(async () => {
+        // The failed response has been consumed and its timeout cleared before retrying.
+        expect(rejected.bodyUsed).toBe(true);
+        expect(vi.getTimerCount()).toBe(1);
+        return jsonResponse({ choices: [{ finish_reason: 'length', message: { content: null } }] });
+      });
+    const { provider } = factory({ initial: { ...legacy, model: 'gpt-6.1-terra' }, fetchFn });
+
+    await expect(provider.testAiProvider()).resolves.toEqual({ ok: true });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    const [first, second] = fetchFn.mock.calls.map(([url, init]) => ({ url, init, body: JSON.parse(init.body) }));
+    expect(first.body.max_tokens).toBe(16);
+    expect(second.body).toEqual({
+      model: 'gpt-6.1-terra',
+      messages: [{ role: 'user', content: 'Reply with only the word "ok".' }],
+      max_completion_tokens: 16,
+      stream: false,
+    });
+    expect(second.url).toBe(first.url);
+    expect(second.init.headers).toEqual(first.init.headers);
+    expect(second.init.redirect).toBe('manual');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps the caller token budget when a compatible provider requires the modern parameter', async () => {
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(unsupportedTokenLimit, 400))
+      .mockResolvedValueOnce(jsonResponse({ choices: [{ message: { content: 'completed' } }] }));
+    const { provider } = factory({ initial: legacy, fetchFn });
+    await expect(provider.completeText([{ role: 'user', content: 'Hi' }], { maxTokens: 123 }))
+      .resolves.toBe('completed');
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetchFn.mock.calls[1][1].body)).toMatchObject({ max_completion_tokens: 123 });
+    expect(JSON.parse(fetchFn.mock.calls[1][1].body)).not.toHaveProperty('max_tokens');
+  });
+
+  it('does not add a token budget or retry when the caller supplied none', async () => {
+    const fetchFn = vi.fn().mockResolvedValue(jsonResponse(unsupportedTokenLimit, 400));
+    const { provider } = factory({ initial: legacy, fetchFn });
+    await expect(provider.completeText([{ role: 'user', content: 'Hi' }]))
+      .rejects.toThrow(/Unsupported parameter/);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(fetchFn.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty('max_tokens');
+    expect(body).not.toHaveProperty('max_completion_tokens');
+  });
+
+  it.each([
+    ['authentication', 401, unsupportedTokenLimit],
+    ['upstream failure', 502, unsupportedTokenLimit],
+    ['model access', 400, { error: { code: 'model_not_found', param: 'model', message: 'Model not available' } }],
+    ['another parameter', 400, { error: { ...unsupportedTokenLimit.error, param: 'temperature' } }],
+    ['no replacement requested', 400, { error: { ...unsupportedTokenLimit.error, message: 'Unsupported parameter: max_tokens' } }],
+    ['unstructured failure', 400, { error: unsupportedTokenLimit.error.message }],
+  ])('does not replay a rejected generation for %s', async (_name, status, payload) => {
+    const fetchFn = vi.fn().mockResolvedValue(jsonResponse(payload, status));
+    const { provider } = factory({ initial: legacy, fetchFn });
+    await expect(provider.testAiProvider()).rejects.toThrow(/AI provider error/);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not loop when the replacement request also fails and still redacts the key', async () => {
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(unsupportedTokenLimit, 400))
+      .mockResolvedValueOnce(jsonResponse({
+        error: { ...unsupportedTokenLimit.error, message: `${unsupportedTokenLimit.error.message} api-secret` },
+      }, 400));
+    const { provider } = factory({ initial: legacy, fetchFn });
+    const error = await provider.testAiProvider().catch((cause) => cause);
+    expect(error.message).toMatch(/AI provider error \(400\)/);
+    expect(error.message).not.toContain('api-secret');
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry after the caller aborts during a rejected request', async () => {
+    const controller = new AbortController();
+    const fetchFn = vi.fn().mockImplementationOnce(async () => {
+      controller.abort();
+      return jsonResponse(unsupportedTokenLimit, 400);
+    });
+    const { provider } = factory({ initial: legacy, fetchFn });
+    await expect(provider.completeText([{ role: 'user', content: 'Hi' }], {
+      maxTokens: 16, signal: controller.signal,
+    })).rejects.toThrow(/aborted/i);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
   it('supports providers with no API key', async () => {
