@@ -19,6 +19,41 @@ function buildApp() {
   return app;
 }
 
+describe('GET /api/mail/unread-counts scheduled (#543)', () => {
+  let server;
+  let base;
+  beforeAll(async () => {
+    await new Promise(resolve => { server = buildApp().listen(0, resolve); });
+    base = `http://127.0.0.1:${server.address().port}`;
+  });
+  afterAll(async () => { await new Promise(resolve => server.close(resolve)); });
+  beforeEach(() => { query.mockReset(); });
+
+  it('counts the user\'s pending scheduled messages and those that need attention', async () => {
+    query.mockImplementation(async sql => (/FROM scheduled_messages/.test(sql)
+      ? { rows: [{ pending: 3, attention: 1 }] }
+      : { rows: [] }));
+    const body = await (await fetch(`${base}/api/mail/unread-counts`)).json();
+    expect(body.scheduled).toEqual({ pending: 3, attention: 1 });
+    const [sql, params] = query.mock.calls.find(([s]) => /FROM scheduled_messages/.test(s));
+    expect(sql).toMatch(/WHERE user_id = \$1/);
+    // A deleted message waiting out its restore window counts in neither.
+    expect(sql).not.toMatch(/cancelled/);
+    expect(params).toEqual(['user-1']);
+  });
+
+  it('reports none rather than failing the counts', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    query.mockImplementation(async sql => {
+      if (/FROM scheduled_messages/.test(sql)) throw new Error('down');
+      return { rows: [] };
+    });
+    const res = await fetch(`${base}/api/mail/unread-counts`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).scheduled).toEqual({ pending: 0, attention: 0 });
+  });
+});
+
 describe('GET /api/mail/unread-counts unified total', () => {
   let server;
   let base;
@@ -70,6 +105,33 @@ describe('GET /api/mail/unread-counts unified total', () => {
     expect(query.mock.calls[0][1]).toEqual(['user-1']);
     expect(query.mock.calls[0][0]).toContain('LEFT JOIN folders');
     expect(query.mock.calls[0][0]).not.toContain('FROM messages');
+  });
+
+  // The Snoozed view (#269) shows in the sidebar only while something is snoozed.
+  it('says how many messages are snoozed, live snoozes in enabled accounts only', async () => {
+    query
+      .mockResolvedValueOnce({ rows: [{ account_id: 'a', count: '1', server_counts_at: new Date(), server_count_revision: '1' }] })
+      .mockResolvedValueOnce({ rows: [{ n: 3 }] });
+    const body = await (await fetch(`${base}/api/mail/unread-counts`)).json();
+    expect(body.snoozed).toBe(3);
+    const [sql, params] = query.mock.calls[1];
+    expect(params).toEqual(['user-1']);
+    expect(sql).toContain('a.enabled');
+    expect(sql).toContain('m.folder = sm.snoozed_folder');
+  });
+
+  it('still answers the counts when the snoozed count fails', async () => {
+    query
+      .mockResolvedValueOnce({ rows: [{ account_id: 'a', count: '1', server_counts_at: new Date(), server_count_revision: '1' }] })
+      .mockRejectedValueOnce(new Error('db hiccup'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const res = await fetch(`${base}/api/mail/unread-counts`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ total: 1, snoozed: 0 });
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('uses only opted-in accounts for unified category counts', async () => {

@@ -12,16 +12,19 @@ import com.getcapacitor.Bridge;
 import com.getcapacitor.BridgeWebViewClient;
 
 public class MailFlowWebViewClient extends BridgeWebViewClient {
-    private static final String SETUP_URL = "file:///android_asset/public/index.html";
-    private static final String FALLBACK_URL = "file:///android_asset/public/host-unavailable.html";
+    // Served by Capacitor's local server, not from file://: its "Change host" button needs the
+    // Capacitor bridge, which a file:// page does not get.
+    private static final String FALLBACK_PATH = "/host-unavailable.html";
+    private final Bridge bridge;
     private final Context context;
-    private final String localUrl;
+    private final MainActivity activity;
     private boolean loadingFallback = false;
 
-    public MailFlowWebViewClient(Bridge bridge, Context context) {
+    public MailFlowWebViewClient(Bridge bridge, MainActivity activity) {
         super(bridge);
-        this.context = context.getApplicationContext();
-        this.localUrl = bridge.getLocalUrl();
+        this.bridge = bridge;
+        this.context = activity.getApplicationContext();
+        this.activity = activity;
     }
 
     @Override
@@ -30,7 +33,8 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
         if (request == null || uri == null) return super.shouldOverrideUrlLoading(view, request);
 
         String url = uri.toString();
-        if (shouldStayInWebView(view, url)) return false;
+        if (request.isForMainFrame() && openOidcLogin(view, url)) return true;
+        if (isConfiguredHost(url) || isAppPage(url)) return false;
         if (!request.isForMainFrame()) return isWebUrl(uri);
         if (openExternallyIfNeeded(url)) return true;
 
@@ -39,7 +43,8 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
 
     @Override
     public boolean shouldOverrideUrlLoading(WebView view, String url) {
-        if (shouldStayInWebView(view, url)) return false;
+        if (openOidcLogin(view, url)) return true;
+        if (isConfiguredHost(url) || isAppPage(url)) return false;
         if (openExternallyIfNeeded(url)) {
             return true;
         }
@@ -71,7 +76,7 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
     public void onPageFinished(WebView view, String url) {
         super.onPageFinished(view, url);
 
-        if (FALLBACK_URL.equals(url)) return;
+        if (isFallback(url)) return;
         loadingFallback = false;
 
         if (!isConfiguredHost(url)) return;
@@ -87,24 +92,26 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
         });
     }
 
+    private boolean openOidcLogin(WebView view, String url) {
+        String host = MailFlowNativePlugin.getSavedHost(context);
+        if (!MailFlowOidcLogin.isStartUrl(host, url)) return false;
+        MailFlowOidcLogin.open(activity, view, host, url);
+        return true;
+    }
+
     private boolean isConfiguredHost(String url) {
         String host = MailFlowNativePlugin.getSavedHost(context);
         return host != null && NativeSecurity.isSameOrigin(host, url);
     }
 
-    private boolean shouldStayInWebView(WebView view, String url) {
-        if (isConfiguredHost(url) || FALLBACK_URL.equals(url)) return true;
+    // The app's own pages (setup, host unavailable), on Capacitor's local server.
+    private boolean isAppPage(String url) {
+        String local = bridge.getLocalUrl();
+        return local != null && url != null && NativeSecurity.isSameOrigin(local, url);
+    }
 
-        String currentUrl = view == null ? null : view.getUrl();
-        if (!WebNavigationPolicy.isInitialHostNavigation(localUrl, SETUP_URL, currentUrl, url)) {
-            return false;
-        }
-
-        // Fallback for setup pages whose asynchronous Capacitor bridge did not
-        // finish saving before location.replace() started navigation. Never
-        // bypass the explicit warning required for unencrypted HTTP hosts.
-        if (!NativeSecurity.isHttpsUrl(url)) return false;
-        return MailFlowNativePlugin.saveHost(context, url) != null;
+    private boolean isFallback(String url) {
+        return isAppPage(url) && FALLBACK_PATH.equals(Uri.parse(url).getPath());
     }
 
     private boolean isWebUrl(Uri uri) {
@@ -113,7 +120,7 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
     }
 
     private boolean openExternallyIfNeeded(String url) {
-        if (url == null || url.trim().isEmpty() || isConfiguredHost(url) || FALLBACK_URL.equals(url)) {
+        if (url == null || url.trim().isEmpty() || isConfiguredHost(url) || isAppPage(url)) {
             return false;
         }
 
@@ -138,6 +145,6 @@ public class MailFlowWebViewClient extends BridgeWebViewClient {
     private void loadFallback(WebView view) {
         if (loadingFallback) return;
         loadingFallback = true;
-        view.post(() -> view.loadUrl(FALLBACK_URL));
+        view.post(() -> view.loadUrl(bridge.getLocalUrl() + FALLBACK_PATH));
     }
 }

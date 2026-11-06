@@ -12,6 +12,8 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/packages/release/
+frontend/packages/electron/metainfo/
+frontend/packages/electron/package-type/
 
 # TLS certs (generated locally or via Let's Encrypt)
 certs/

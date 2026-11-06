@@ -5,20 +5,17 @@ import { api } from '../utils/api.js';
 
 export default function LockScreen() {
   const { t } = useTranslation();
-  const { user, setUser, setLocked, loadPreferences } = useStore();
+  const { user, setLocked, loadPreferences, signOut } = useStore();
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [unlocking, setUnlocking] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
 
-  async function handleSignOut() {
+  // The same sign-out as the sidebar's: it clears this user's mailbox state and follows the
+  // SSO end-session URL when there is one, which this screen used to drop (#523).
+  function handleSignOut() {
     setSigningOut(true);
-    try {
-      await api.logout();
-    } catch { /* intentional */ }
-    localStorage.removeItem('mailflow_locked_message');
-    setLocked(false);
-    setUser(null);
+    signOut();
   }
 
   async function handleUnlock(e) {

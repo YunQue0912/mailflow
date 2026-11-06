@@ -18,6 +18,16 @@
  */
 export function extractImapError(err) {
   if (!err) return 'Unknown error';
+
+  // A connect that fails on every address the host resolves to (IPv6 and IPv4 under
+  // autoSelectFamily) rejects with an AggregateError whose message is empty; the reasons are
+  // on .errors, one per address. Unwrapped, it read only "AggregateError" in the log and the
+  // UI, with nothing to diagnose from (#510).
+  if (Array.isArray(err.errors) && err.errors.length && err.name === 'AggregateError') {
+    const reasons = [...new Set(err.errors.map(e => e?.message || e?.code).filter(Boolean))];
+    if (reasons.length) return reasons.join('; ');
+    if (err.code) return String(err.code);
+  }
   const code = err.serverResponseCode ? `[${err.serverResponseCode}] ` : '';
 
   // The parsed response carries the server's TEXT attributes; imapflow joins them into
@@ -27,6 +37,14 @@ export function extractImapError(err) {
     if (text) return `${code}${String(text).trim()}`;
   }
   if (err.responseText) return `${code}${String(err.responseText).trim()}`;
+  // imapflow reports some authentication failures with the server's sentence as a plain string
+  // in err.response: Outlook's "User is authenticated but not connected." (IMAP turned off for
+  // the mailbox, answered to NAMESPACE after a successful login) arrives as
+  // AuthenticationFailure('Authentication failed') with that text there. Keep both.
+  if (err.authenticationFailed && typeof err.response === 'string' && err.response.trim()) {
+    const text = err.response.trim();
+    return `${code}${err.message && !text.includes(err.message) ? `${err.message}: ` : ''}${text}`;
+  }
   if (err.response?.command) return `${code}${err.response.command}: ${err.message}`;
 
   return `${code}${err.serverResponse || err.message || String(err)}`;

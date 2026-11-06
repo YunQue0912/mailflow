@@ -28,6 +28,14 @@ registerHooks({
         'export default { useTranslation, initReactI18next };',
       ].join("\n") };
     }
+    // pdf.js needs a real browser; the viewer tests drive this stand-in through globalThis.__pdfStub.
+    if (url.endsWith('/src/utils/pdfDocument.js')) {
+      return { format: 'module', shortCircuit: true, source: [
+        'export const openPdf = (bytes, options) => globalThis.__pdfStub.openPdf(bytes, options);',
+        'export const renderPage = () => ({ done: Promise.resolve(), cancel() {} });',
+        'export const renderPagesForPrint = async () => [];',
+      ].join("\n") };
+    }
     if (url.endsWith('.json')) {
       return { format: 'module', shortCircuit: true, source: `export default ${readFileSync(new URL(url), 'utf8')}` };
     }
@@ -55,6 +63,7 @@ Object.assign(globalThis, {
   Node: dom.window.Node, Element: dom.window.Element, HTMLElement: dom.window.HTMLElement,
   getComputedStyle: dom.window.getComputedStyle, matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
   ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+  MutationObserver: dom.window.MutationObserver,
   IS_REACT_ACT_ENVIRONMENT: true,
 });
 // jsdom implements neither of these, and the component asks the window for both.
@@ -265,6 +274,354 @@ describe('Download all asks first when an attachment is risky', () => {
   });
 });
 
+// The attachment viewer. PDF bytes are never served here: pdf.js needs a real browser, so the PDF
+// tests only go as far as the viewer opening, and the byte check and rendering are exercised with
+// images, which jsdom can hold.
+describe('attachment viewer', () => {
+  const MSG_VIEW = { ...MSG_A, id: 'g7', uid: 7, subject: 'Boleto' };
+  const MSG_OTHER = { ...MSG_A, id: 'h8', uid: 8, subject: 'Other' };
+  const MSG_LOCKED = { ...MSG_A, id: 'i9', uid: 9, subject: 'Extrato' };
+  const MSG_LONG = { ...MSG_A, id: 'j10', uid: 10, subject: 'Catálogo' };
+  const FILES = {
+    g7: [
+      { filename: 'boleto.pdf', type: 'application/pdf', part: '2', size: 10 },
+      { filename: 'foto.jpg', type: 'image/jpeg', part: '3', size: 10 },
+      { filename: 'disguised.png', type: 'image/png', part: '4', size: 10 },
+      { filename: 'planilha.xlsx', type: 'application/vnd.ms-excel', part: '5', size: 10 },
+      { filename: 'setup.exe', type: 'application/octet-stream', part: '6', size: 10 },
+    ],
+    i9: [
+      { filename: 'extrato.pdf', type: 'application/pdf', part: '7', size: 10 },
+      { filename: 'recibo.jpg', type: 'image/jpeg', part: '8', size: 10 },
+    ],
+    j10: [
+      { filename: 'catalogo.pdf', type: 'application/pdf', part: '9', size: 10 },
+      { filename: 'enorme.pdf', type: 'application/pdf', part: '10', size: 80 * 1024 * 1024 },
+    ],
+  };
+  const BYTES = {
+    '3': new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10]),
+    '4': new TextEncoder().encode('<!DOCTYPE html><script>alert(1)</script>'),
+    '7': new TextEncoder().encode('%PDF-1.7\n% encrypted'),
+    '8': new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10]),
+    '9': new TextEncoder().encode('%PDF-1.7\n% six pages'),
+  };
+  // Stands in for pdf.js: the document opens only with the password "segredo".
+  const passwordsTried = [];
+  const lockedPdf = {
+    async openPdf(bytes, { password } = {}) {
+      passwordsTried.push(password ?? null);
+      if (password !== 'segredo') {
+        throw Object.assign(new Error('Password required'), { name: 'PasswordException', code: password ? 2 : 1 });
+      }
+      return {
+        doc: { numPages: 1, getPage: async () => ({ getViewport: () => ({ width: 595, height: 842 }) }) },
+        destroy() {},
+      };
+    },
+  };
+  const NEVER_ARRIVES = new Set(['2']);
+  const requests = [];
+  const saved = [];
+  let originalFetch, originalClick;
+
+  before(() => {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      requests.push(u);
+      const part = /\/attachments\/([^/?]+)$/.exec(u)?.[1];
+      if (part !== undefined) {
+        if (NEVER_ARRIVES.has(decodeURIComponent(part))) return new Promise(() => {});
+        const body = BYTES[decodeURIComponent(part)] ?? new Uint8Array();
+        return {
+          ok: true, status: 200,
+          arrayBuffer: async () => body.slice().buffer,
+          blob: async () => new Blob([body]),
+        };
+      }
+      const id = /\/messages\/([^/]+)\/body/.exec(u)?.[1];
+      const json = FILES[id] ? { html: '<p>hi</p>', text: 'hi', attachments: FILES[id] } : {};
+      return { ok: true, status: 200, json: async () => json, text: async () => '' };
+    };
+    originalClick = dom.window.HTMLAnchorElement.prototype.click;
+    dom.window.HTMLAnchorElement.prototype.click = function () {
+      saved.push({ href: this.getAttribute('href'), download: this.getAttribute('download') });
+    };
+    globalThis.__pdfStub = lockedPdf;
+    useStore.getState().setMessages?.([MSG_A, MSG_VIEW, MSG_OTHER, MSG_LOCKED, MSG_LONG]);
+  });
+  after(() => {
+    globalThis.fetch = originalFetch;
+    dom.window.HTMLAnchorElement.prototype.click = originalClick;
+  });
+
+  const settle = () => React.act(async () => {
+    for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 0));
+  });
+  async function open(id) {
+    // Through another message first, so a viewer left open by the previous test is closed.
+    await React.act(async () => {
+      useStore.getState().setSelectedMessage('h8');
+      root.render(React.createElement(MessagePane));
+    });
+    await React.act(async () => { useStore.getState().setSelectedMessage(id); });
+    await settle();
+    requests.length = 0;
+    saved.length = 0;
+  }
+  const chip = filename => [...document.querySelectorAll('button')].find(b => b.textContent.includes(filename));
+  async function clickChip(filename) {
+    await React.act(async () => {
+      chip(filename).dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+    });
+    await settle();
+  }
+  const dialog = () => document.querySelector('[role="dialog"]');
+  const attachmentRequests = () => requests.filter(u => u.includes('/attachments/'));
+  async function press(key, target = dialog() ?? document.body) {
+    await React.act(async () => {
+      target.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    });
+    await settle();
+  }
+
+  test('clicking a PDF opens the viewer instead of downloading it', async () => {
+    await open('g7');
+    assert.equal(dialog(), null);
+    await clickChip('boleto.pdf');
+    assert.ok(dialog(), 'the viewer is open');
+    assert.match(dialog().textContent, /boleto\.pdf/);
+    assert.deepEqual(attachmentRequests(), ['/api/mail/messages/g7/attachments/2'], 'the file is fetched once, for the viewer');
+    assert.deepEqual(saved, [], 'nothing is saved to disk');
+  });
+
+  test("the viewer's toolbar pads below a status bar drawn over the page", async () => {
+    // jsdom does no layout, so the content area measures 0 wide and the toolbar takes its
+    // wide padding; what matters is --sat in it: the viewer covers the whole screen, and in
+    // a standalone PWA the status bar is drawn over the page, so the old plain padding put
+    // the zoom row underneath it.
+    await open('g7');
+    await clickChip('boleto.pdf');
+    const close = dialog().querySelector('button[aria-label="message.preview.close"]');
+    assert.equal(close.parentElement.style.paddingTop, 'calc(var(--sat) + 10px)');
+    assert.equal(close.parentElement.style.paddingBottom, 'calc(10px - var(--sat-trim))');
+  });
+
+  test('an image is shown from its bytes, and Download saves those same bytes', async () => {
+    await open('g7');
+    await clickChip('foto.jpg');
+    const img = dialog().querySelector('img');
+    assert.ok(img, 'the image is rendered');
+    assert.match(img.getAttribute('src'), /^blob:/);
+    const download = dialog().querySelector('button[aria-label="message.preview.download"]');
+    await React.act(async () => { download.click(); });
+    assert.equal(saved.length, 1);
+    assert.match(saved[0].href, /^blob:/);
+    assert.equal(saved[0].download, 'foto.jpg');
+    assert.equal(attachmentRequests().length, 1, 'Download reuses the bytes instead of fetching again');
+  });
+
+  test('bytes that are not what the name claims are refused, with Download still offered', async () => {
+    await open('g7');
+    await clickChip('disguised.png');
+    assert.equal(dialog().querySelector('img'), null, 'an HTML file named .png is never rendered');
+    assert.match(dialog().textContent, /message\.preview\.unsupported/);
+    assert.ok([...dialog().querySelectorAll('button')].some(b => b.textContent === 'message.preview.download'));
+  });
+
+  test('other documents still download, and risky files still ask first', async () => {
+    await open('g7');
+    await clickChip('planilha.xlsx');
+    assert.equal(dialog(), null, 'a spreadsheet does not open the viewer');
+    assert.deepEqual(attachmentRequests(), ['/api/mail/messages/g7/attachments/5']);
+    await clickChip('setup.exe');
+    assert.equal(dialog(), null);
+    assert.match(chip('setup.exe').textContent, /message\.attachmentRisk\.armed\[/);
+  });
+
+  test('while open, keystrokes stay in the viewer and Escape closes only the viewer', async () => {
+    await open('g7');
+    const reached = [];
+    const listener = e => reached.push(e.key);
+    document.addEventListener('keydown', listener);
+    try {
+      await clickChip('boleto.pdf');
+      await press('e');
+      await press('#');
+      assert.deepEqual(reached, [], 'mail shortcuts must not act on the message behind the viewer');
+      await press('Escape');
+      assert.equal(dialog(), null, 'Escape closes the viewer');
+      assert.deepEqual(reached, [], 'and does not reach the pane either');
+      assert.equal(useStore.getState().selectedMessageId, 'g7', 'the message stays open');
+      await press('e', document.body);
+      assert.deepEqual(reached, ['e'], 'once closed, keys flow again');
+    } finally {
+      document.removeEventListener('keydown', listener);
+    }
+  });
+
+  test('arrow keys move between the previewable attachments only', async () => {
+    await open('g7');
+    await clickChip('boleto.pdf');
+    const title = () => dialog().querySelector('[title]').getAttribute('title');
+    assert.equal(title(), 'boleto.pdf');
+    await press('ArrowRight');
+    assert.equal(title(), 'foto.jpg');
+    await press('ArrowRight');
+    assert.equal(title(), 'disguised.png');
+    await press('ArrowRight');
+    assert.equal(title(), 'disguised.png', 'the spreadsheet and the installer are not in the viewer');
+    await press('ArrowLeft');
+    assert.equal(title(), 'foto.jpg');
+  });
+
+  const passwordField = () => dialog()?.querySelector('input[type="password"]') ?? null;
+  async function submitPassword(text) {
+    const input = passwordField();
+    const setValue = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set;
+    await React.act(async () => {
+      setValue.call(input, text);
+      input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    });
+    await React.act(async () => { dialog().querySelector('button[type="submit"]').click(); });
+    await settle();
+  }
+
+  test('a password-protected PDF asks for its password and opens with the right one', async () => {
+    await open('i9');
+    passwordsTried.length = 0;
+    await clickChip('extrato.pdf');
+    assert.ok(passwordField(), 'the viewer asks for the password instead of failing');
+    assert.match(dialog().textContent, /message\.preview\.password/);
+    assert.equal(document.activeElement, passwordField(), 'the field is focused, ready to type');
+
+    await submitPassword('errada');
+    assert.match(dialog().textContent, /message\.preview\.passwordIncorrect/);
+    assert.equal(passwordField().value, '', 'a wrong password is cleared for the next try');
+
+    await submitPassword('segredo');
+    assert.equal(passwordField(), null, 'the right password opens the document');
+    assert.deepEqual(passwordsTried, [null, 'errada', 'segredo']);
+    const print = dialog().querySelector('button[aria-label="message.preview.print"]');
+    assert.equal(print.disabled, false, 'an unlocked PDF can be printed');
+  });
+
+  test('arrows move the caret in the password field, and the password is forgotten on leaving', async () => {
+    await open('i9');
+    await clickChip('extrato.pdf');
+    const title = () => dialog().querySelector('[title]').getAttribute('title');
+    await press('ArrowRight', passwordField());
+    assert.equal(title(), 'extrato.pdf', 'typing in the field does not switch attachments');
+
+    await submitPassword('segredo');
+    await press('ArrowRight');
+    assert.equal(title(), 'recibo.jpg');
+    passwordsTried.length = 0;
+    await press('ArrowLeft');
+    assert.equal(title(), 'extrato.pdf');
+    assert.ok(passwordField(), 'coming back asks again');
+    assert.deepEqual(passwordsTried, [null], 'the earlier password was not kept');
+  });
+
+  test('while open, the app behind is inert, so Tab cannot reach it; closing gives it back', async () => {
+    await open('g7');
+    await clickChip('foto.jpg');
+    const app = document.getElementById('root');
+    assert.equal(app.hasAttribute('inert'), true, 'the app behind the viewer cannot take focus or clicks');
+    assert.equal(dialog().closest('[inert]'), null, 'the viewer itself stays usable');
+    const late = document.createElement('div');
+    await React.act(async () => { document.body.appendChild(late); });
+    await settle();
+    assert.equal(late.hasAttribute('inert'), true, 'something added to the page meanwhile is inert too');
+    await press('Escape');
+    assert.equal(app.hasAttribute('inert'), false);
+    assert.equal(late.hasAttribute('inert'), false);
+    late.remove();
+  });
+
+  test('an image the browser cannot decode shows the message, not a broken icon', async () => {
+    await open('g7');
+    await clickChip('foto.jpg');
+    await React.act(async () => { dialog().querySelector('img').dispatchEvent(new dom.window.Event('error')); });
+    assert.equal(dialog().querySelector('img'), null);
+    assert.match(dialog().textContent, /message\.preview\.unsupported/);
+    assert.ok([...dialog().querySelectorAll('button')].some(b => b.textContent === 'message.preview.download'));
+  });
+
+  test('Ctrl+P pressed again while printing does not stack a second print', async () => {
+    await open('g7');
+    await clickChip('foto.jpg');
+    const ctrlP = () => React.act(async () => {
+      dialog().dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'p', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+    await ctrlP();
+    await ctrlP();
+    await ctrlP();
+    const frames = [...dialog().querySelectorAll('iframe')];
+    assert.equal(frames.length, 1, 'one print frame');
+    await press('Escape');
+    assert.equal(frames[0].isConnected, false, 'closing the viewer removes it');
+  });
+
+  test('a file over the size limit downloads instead of opening the viewer', async () => {
+    await open('j10');
+    await clickChip('enorme.pdf');
+    assert.equal(dialog(), null);
+    assert.deepEqual(attachmentRequests(), ['/api/mail/messages/j10/attachments/10']);
+  });
+
+  test('a long PDF keeps drawings only for the pages near the viewport', async () => {
+    // A controllable IntersectionObserver: the test says which pages are in the window.
+    const observed = new Map();
+    globalThis.IntersectionObserver = class {
+      constructor(callback) { this.callback = callback; }
+      observe(el) { observed.set(el, this.callback); }
+      disconnect() {}
+    };
+    // jsdom lays nothing out; the viewer waits for a measured width before drawing pages.
+    Object.defineProperty(dom.window.HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => 800 });
+    globalThis.__pdfStub = {
+      async openPdf() {
+        return {
+          doc: { numPages: 6, getPage: async () => ({ getViewport: () => ({ width: 595, height: 842 }) }) },
+          destroy() {},
+        };
+      },
+    };
+    try {
+      await open('j10');
+      await clickChip('catalogo.pdf');
+      const pages = [...dialog().querySelectorAll('.mf-pdf-page')];
+      assert.equal(pages.length, 6);
+      const drawn = () => pages.map(p => p.querySelectorAll('canvas').length);
+      const scrollTo = async (visible) => {
+        await React.act(async () => {
+          pages.forEach((page, i) => observed.get(page)([{ isIntersecting: visible.includes(i + 1) }]));
+        });
+        await settle();
+      };
+      await scrollTo([1, 2]);
+      assert.deepEqual(drawn(), [1, 1, 0, 0, 0, 0], 'the first pages are drawn, the rest wait');
+      await scrollTo([4, 5, 6]);
+      assert.deepEqual(drawn(), [0, 0, 0, 1, 1, 1], 'pages scrolled past give their drawing back');
+    } finally {
+      delete globalThis.IntersectionObserver;
+      delete dom.window.HTMLElement.prototype.clientWidth;
+      globalThis.__pdfStub = lockedPdf;
+    }
+  });
+
+  test('selecting another message closes the viewer', async () => {
+    await open('g7');
+    await clickChip('foto.jpg');
+    assert.ok(dialog());
+    await React.act(async () => { useStore.getState().setSelectedMessage('h8'); });
+    await settle();
+    assert.equal(dialog(), null);
+  });
+});
+
 // Characterization tests for the body renderer, written before extracting it into its own
 // component. The iframe lifecycle effect had no coverage at all, and two of the fixes living
 // in it (a document that never finishes loading, #1287ada; resetting the frame between
@@ -328,6 +685,29 @@ describe('message body rendering', () => {
     assert.match(document.getElementById('root').innerHTML, /Plain text with/);
   });
 
+  test('a text-only body stays translatable under the translate="no" UI', async () => {
+    // index.html marks <body> translate="no" so browser translators cannot break React's DOM.
+    // Plain-text mail renders in the main document, so without this the browser could no
+    // longer translate a message written in another language.
+    await open('t1');
+    const card = [...document.querySelectorAll('.msg-card')].find(el => /Plain text with/.test(el.textContent));
+    assert.ok(card, 'the plain-text body is rendered');
+    assert.equal(card.closest('[translate]')?.getAttribute('translate'), 'yes');
+  });
+
+  test('an HTML body stays translatable under the translate="no" UI', async () => {
+    // Chrome's translator carries the page's translate="no" into the same-origin frame, so the
+    // email has to opt back in inside its own document. jsdom does not parse srcdoc (see above),
+    // so the test parses it.
+    await open('h1');
+    const srcdoc = document.querySelector('iframe')?.getAttribute('srcdoc') ?? '';
+    const text = new dom.window.DOMParser().parseFromString(srcdoc, 'text/html').getElementById('hello');
+    assert.ok(text, 'the HTML body reaches the frame');
+    assert.equal(text.closest('[translate]')?.getAttribute('translate'), 'yes');
+    // Not on the <iframe>, where Chrome would also translate the frame's localized title.
+    assert.equal(document.querySelector('iframe').getAttribute('translate'), null);
+  });
+
   test('switching messages resets the frame height', async () => {
     // The pane sets the frame back to 300px before paint, so a tall email does not leave the
     // next, shorter one padded out with its height.
@@ -368,5 +748,729 @@ describe('selected-message body shortcuts', () => {
     assert.deepEqual(unsubscribe.mock.calls.map(call => call.arguments[0]), [msg.id]);
     await React.act(async () => { shortcutBus.emit('unsubscribe'); useStore.getState().setSelectedMessage(null); shortcutBus.emit('unsubscribe'); });
     assert.equal(unsubscribe.mock.callCount(), 1);
+  });
+});
+
+// The move picker lists favorites under the name the user gave them in the sidebar, not the raw
+// folder name (#505).
+describe('move picker favorites', () => {
+  const FOLDERS = [
+    { path: 'INBOX', name: 'INBOX', delimiter: '/', special_use: '\\Inbox' },
+    { path: 'Projects/Receipts', name: 'Receipts', delimiter: '/' },
+    { path: 'Archive', name: 'Archive', delimiter: '/', special_use: '\\Archive' },
+  ];
+  let originalFetch;
+  before(() => {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => ({
+      ok: true, status: 200, text: async () => '',
+      json: async () => (String(url).includes('/accounts/acct/folders') ? FOLDERS : {}),
+    });
+    useStore.getState().setMessages?.([MSG_A]);
+  });
+  after(() => {
+    globalThis.fetch = originalFetch;
+    useStore.setState({ favoriteFolders: [] });
+  });
+
+  async function openPicker() {
+    // Start from a fresh mount: the picker is a toggle, and a picker left open by the previous
+    // test would be closed by this click.
+    await React.act(async () => { root.render(null); });
+    await React.act(async () => {
+      useStore.getState().setSelectedMessage('a1');
+      root.render(React.createElement(MessagePane));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    const moveBtn = document.querySelector('[title="contextMenu.moveToFolder"]');
+    assert.ok(moveBtn, 'the Move button is rendered');
+    await React.act(async () => { moveBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    return [...document.querySelectorAll('button')].map(b => b.textContent);
+  }
+
+  test('a renamed favorite shows its custom name', async () => {
+    useStore.setState({ favoriteFolders: [{ accountId: 'acct', path: 'Projects/Receipts', label: 'Tax 2026' }] });
+    const entries = await openPicker();
+    assert.ok(entries.includes('Tax 2026'), `favorites should show the custom name, got ${JSON.stringify(entries)}`);
+    assert.ok(entries.includes('Projects / Receipts'), 'the full folder list still shows the real folder');
+  });
+
+  test('a favorite without a custom name shows the folder as before', async () => {
+    useStore.setState({ favoriteFolders: [{ accountId: 'acct', path: 'Projects/Receipts' }] });
+    const entries = await openPicker();
+    assert.equal(entries.filter(e => e === 'Projects / Receipts').length, 2, 'once as a favorite, once in the full list');
+  });
+});
+
+describe('Reply with AI in the toolbar', () => {
+  const button = () => document.querySelector('[title="compose.toolbar.aiReply"]');
+  let realStatus;
+  async function show({ compose, summarize = true }) {
+    api.ai.status = async () => ({ enabled: true, features: { compose, summarize } });
+    // A fresh mount: the pane asks for the AI status when it mounts.
+    await React.act(async () => { root.render(null); });
+    await React.act(async () => {
+      useStore.getState().setSelectedMessage('a1');
+      root.render(React.createElement(MessagePane));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 0)); });
+  }
+  before(() => { realStatus = api.ai.status; });
+  after(() => {
+    api.ai.status = realStatus;
+    useStore.setState({ plaintextEmail: false });
+    useStore.getState().closeCompose();
+  });
+
+  test('opens the reply with the AI panel waiting for the instruction', async () => {
+    await show({ compose: true });
+    assert.ok(button(), 'offered when the AI can write replies');
+    await React.act(async () => { button().dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    const data = useStore.getState().composeData;
+    assert.equal(data?.isReply, true);
+    assert.equal(data.aiReply, true);
+    assert.equal(data.subject, 'Re: First');
+  });
+
+  // A phone's toolbar only just fits its buttons (#650), so there it is in More.
+  test('is in More on a phone', async () => {
+    // A phone's pane pages with SwipePager, which waits a frame, and jsdom has none.
+    globalThis.requestAnimationFrame ??= cb => setTimeout(() => cb(Date.now()), 0);
+    globalThis.cancelAnimationFrame ??= id => clearTimeout(id);
+    dom.window.requestAnimationFrame ??= globalThis.requestAnimationFrame;
+    dom.window.cancelAnimationFrame ??= globalThis.cancelAnimationFrame;
+    api.ai.status = async () => ({ enabled: true, features: { compose: true, summarize: true } });
+    await React.act(async () => { root.render(null); });
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    dom.window.innerWidth = 375;
+    const phone = createRoot(container);
+    const click = async el => {
+      await React.act(async () => { el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+      await React.act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    };
+    try {
+      await React.act(async () => {
+        useStore.getState().setSelectedMessage('a1');
+        phone.render(React.createElement(MessagePane));
+      });
+      await React.act(async () => { await new Promise(r => setTimeout(r, 0)); });
+      assert.ok(!container.querySelector('button[aria-label="compose.toolbar.aiReply"]'), 'not a toolbar button');
+      await click(container.querySelector('button[aria-label="message.more"]'));
+      const items = [...container.querySelectorAll('[role="menuitem"]')];
+      assert.equal(items[1]?.textContent, 'compose.toolbar.aiReply', 'after the read toggle');
+      await click(items[1]);
+      assert.equal(useStore.getState().composeData?.aiReply, true);
+      assert.equal(useStore.getState().composeData.subject, 'Re: First');
+    } finally {
+      await React.act(async () => { useStore.getState().closeCompose(); });
+      await React.act(async () => phone.unmount());
+      container.remove();
+      dom.window.innerWidth = 1024;
+    }
+  });
+
+  test('is not offered when the AI does not write emails, or the user writes in plain text', async () => {
+    await show({ compose: false });
+    assert.equal(button(), null);
+    await show({ compose: true, summarize: false });
+    assert.equal(button(), null, 'nor without summaries: the reply is written from received mail');
+    useStore.setState({ plaintextEmail: true });
+    await show({ compose: true });
+    assert.equal(button(), null);
+  });
+});
+
+// #572: the reading pane's own Delete and Archive open what takes the message's place, by the
+// afterRemove setting, instead of leaving "Select a message to read".
+describe('the next message opens after the pane removes the open one', () => {
+  const MSG_C = { ...MSG_A, id: 'c3', uid: 3, subject: 'Third' };
+  // The desktop titles carry the shortcut, e.g. "message.archive (E)".
+  const paneButton = title => [...document.querySelectorAll('button')].find(b => (b.getAttribute('title') || '').split(' (')[0] === title);
+  const show = async (id, afterRemove = 'next') => {
+    useStore.setState({ afterRemove, searchQuery: '' });
+    useStore.getState().setMessages([MSG_A, MSG_B, MSG_C].map(m => ({ ...m })));
+    await React.act(async () => { useStore.getState().setSelectedMessage(id); });
+    await React.act(async () => { root.render(React.createElement(MessagePane)); });
+  };
+  const click = el => React.act(async () => { el.dispatchEvent(new window.MouseEvent('click', { bubbles: true })); });
+
+  test('Delete opens the message below', async () => {
+    await show('b2');
+    await click(paneButton('message.delete'));
+    assert.equal(useStore.getState().selectedMessageId, 'c3');
+    assert.deepEqual(useStore.getState().messages.map(m => m.id), ['a1', 'c3']);
+  });
+
+  test('Archive with "previous" opens the message above', async () => {
+    await show('b2', 'previous');
+    await click(paneButton('message.archive'));
+    assert.equal(useStore.getState().selectedMessageId, 'a1');
+  });
+
+  // #630: the Undo put the message back into whatever list was showing by then.
+  test('Undo of Archive puts the message back into its list, not into one opened since', async () => {
+    const undoArchive = () => {
+      const toast = useStore.getState().notifications.findLast(n => n.title === 'message.archived.title');
+      toast.onUndo();
+      useStore.getState().removeNotification(toast.id);
+    };
+    useStore.setState({ selectedAccountId: 'acct', selectedFolder: 'INBOX' });
+    await show('b2');
+    await click(paneButton('message.archive'));
+    undoArchive();
+    assert.deepEqual(useStore.getState().messages.map(m => m.id).sort(), ['a1', 'b2', 'c3']);
+
+    await show('b2');
+    await click(paneButton('message.archive'));
+    useStore.setState({ selectedFolder: 'Sent' });
+    useStore.getState().setMessages([]);
+    undoArchive();
+    assert.deepEqual(useStore.getState().messages.map(m => m.id), []);
+    useStore.setState({ selectedFolder: 'INBOX' });
+  });
+
+  test('"back to the list" leaves the pane empty, as before', async () => {
+    await show('b2', 'list');
+    await click(paneButton('message.delete'));
+    assert.equal(useStore.getState().selectedMessageId, null);
+    useStore.setState({ afterRemove: 'next' });
+  });
+});
+
+// #701: the pane's Delete reaches the server only when its undo window closes, so a count the
+// server reports in the meantime still includes the message. It must not put it back on the badge.
+describe('the badge after the pane deletes the last unread message', () => {
+  const paneButton = title => [...document.querySelectorAll('button')].find(b => (b.getAttribute('title') || '').split(' (')[0] === title);
+  const counts = (n, revision) => ({ byAccount: { acct: n }, snapshots: { acct: { revision, known: true, stale: false, observedAt: new Date().toISOString() } } });
+
+  test('a count observed before the delete was sent does not bring the badge back to 1', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    t.after(() => {
+      // Cancel the delete still waiting out its undo window, and leave the toasts as they were.
+      const toast = useStore.getState().notifications.find(n => n.title === 'messageList.deleted.title');
+      toast?.onUndo();
+      if (toast) useStore.getState().removeNotification(toast.id);
+      useStore.setState({ afterRemove: 'next' });
+    });
+    const unread = { ...MSG_A, id: 'u701', uid: 701, subject: 'Last unread', is_read: false };
+    useStore.setState({ afterRemove: 'list', searchQuery: '' });
+    useStore.getState().setMessages([unread]);
+    useStore.getState().setUnreadCounts(counts(1, '7010'));
+    await React.act(async () => { useStore.getState().setSelectedMessage(unread.id); });
+    await React.act(async () => { root.render(React.createElement(MessagePane)); });
+    await React.act(async () => { paneButton('message.delete').dispatchEvent(new window.MouseEvent('click', { bubbles: true })); });
+    assert.equal(useStore.getState().unreadCounts.byAccount.acct, 0);
+    // Past the settle floor of a change sent at the click, before this one is even sent.
+    t.mock.timers.tick(8000);
+    useStore.getState().setUnreadCounts(counts(1, '7011'));
+    assert.equal(useStore.getState().unreadCounts.byAccount.acct, 0);
+  });
+});
+
+// #585: a message you sent shows its Bcc under To and Cc; mail without one shows none.
+describe('the Bcc line', () => {
+  const realFetch = globalThis.fetch;
+  after(() => { globalThis.fetch = realFetch; });
+  const open = async (id, bccAddresses) => {
+    globalThis.fetch = async (url) => (String(url).includes(`/messages/${id}/body`)
+      ? { ok: true, status: 200, json: async () => ({ html: '', text: 'hi', attachments: [], bccAddresses }) }
+      : realFetch(url));
+    const sent = { ...MSG_A, id, folder: 'Sent', cc_addresses: [{ name: 'Cee', email: 'cc@x.z' }] };
+    useStore.getState().setMessages([sent]);
+    await React.act(async () => { useStore.getState().setSelectedMessage(id); });
+    await React.act(async () => { root.render(React.createElement(MessagePane)); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 30)); });
+    return document.getElementById('root').textContent;
+  };
+
+  test('lists the Bcc of a message you sent', async () => {
+    const text = await open('sent-bcc', [{ name: 'Hidden', email: 'hidden@x.z' }]);
+    assert.match(text, /Bcc\s*Hidden/);
+    assert.match(text, /Cc\s*Cee/);
+  });
+
+  test('shows no Bcc line when there is none', async () => {
+    const text = await open('sent-nobcc', []);
+    assert.doesNotMatch(text, /Bcc/);
+  });
+});
+
+// In the grouped list a conversation row is labeled with its first sender and subject, but it opens
+// its newest message, which the pane shows, and allows images from, as that message's own.
+describe('a conversation row in the grouped list', () => {
+  const realFetch = globalThis.fetch;
+  after(() => { globalThis.fetch = realFetch; });
+
+  test('shows and acts on the opened message\'s own sender and subject', async () => {
+    const posts = [];
+    globalThis.fetch = async (url, opts = {}) => {
+      if (String(url).includes('/messages/row-latest/body')) {
+        return { ok: true, status: 200, json: async () => ({ html: '<p>Latest message body</p>', text: 'Latest message body', attachments: [], hasBlockedRemoteImages: true }) };
+      }
+      if (opts.method === 'POST') posts.push({ url: String(url), body: JSON.parse(opts.body || '{}') });
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
+    };
+    const row = { ...MSG_A, id: 'row-latest', thread_id: 't1', message_count: 2,
+      subject: 'Question', from_name: 'Opener', from_email: 'opener@x.z',
+      reply_subject: 'Re: Question', reply_from_name: 'Latest Person', reply_from_email: 'latest@x.z' };
+    useStore.getState().setMessages([row]);
+    await React.act(async () => { useStore.getState().setSelectedMessage('row-latest'); });
+    await React.act(async () => { root.render(React.createElement(MessagePane)); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 30)); });
+    const text = document.getElementById('root').textContent;
+    assert.match(text, /Latest Person/);
+    assert.match(text, /latest@x\.z/);
+    assert.match(text, /Re: Question/);
+    assert.doesNotMatch(text, /Opener|opener@x\.z/);
+
+    const allow = [...document.querySelectorAll('button')].find(b => b.textContent === 'message.allowSender');
+    assert.ok(allow, 'the remote images notice offers to allow the sender');
+    await React.act(async () => { allow.click(); await new Promise(r => setTimeout(r, 10)); });
+    const added = posts.find(p => p.url.includes('/auth/preferences/whitelist-add'));
+    assert.deepEqual(added?.body, { type: 'address', value: 'latest@x.z' });
+  });
+});
+
+// #228: a body that can be shown dark gets a toggle in a dark theme; the setting picks the default.
+describe('dark email bodies', () => {
+  const realFetch = globalThis.fetch;
+  after(() => { globalThis.fetch = realFetch; useStore.setState({ theme: 'dark', darkEmailBodies: false }); });
+  const open = async (id, bodyJson, { theme = 'dark', setting = false } = {}) => {
+    globalThis.fetch = async (url) => (String(url).includes(`/messages/${id}/body`)
+      ? { ok: true, status: 200, json: async () => ({ attachments: [], ...bodyJson }) }
+      : realFetch(url));
+    useStore.setState({ theme, darkEmailBodies: setting });
+    useStore.getState().setMessages([{ ...MSG_A, id }]);
+    await React.act(async () => { useStore.getState().setSelectedMessage(id); });
+    await React.act(async () => { root.render(React.createElement(MessagePane)); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 30)); });
+  };
+  const toggle = () => [...document.querySelectorAll('button')]
+    .find(b => ['message.showDark', 'message.showOriginal'].includes(b.getAttribute('aria-label')));
+  const textCard = () => [...document.querySelectorAll('.msg-card')].find(el => el.textContent.includes('plain words'));
+  const click = el => React.act(async () => { el.dispatchEvent(new window.MouseEvent('click', { bubbles: true })); });
+
+  test('a plain-text message follows a dark theme, and switches to the original and back', async () => {
+    await open('dark-text-1', { text: 'plain words' });
+    assert.equal(textCard().style.background, 'var(--bg-primary)');
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showOriginal');
+    assert.equal(toggle().getAttribute('aria-pressed'), 'true');
+    await click(toggle());
+    assert.equal(textCard().style.background, 'white');
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showDark');
+    await click(toggle());
+    assert.equal(textCard().style.background, 'var(--bg-primary)');
+  });
+
+  test("HTML with its own dark design follows the setting, and the toggle switches it", async () => {
+    const html = { html: '<p>styled</p>', darkCss: '@media (min-width: 0px){p{color:#eee}}', lightOnly: false, text: '' };
+    await open('dark-html-own', html);
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showDark');
+    await click(toggle());
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showOriginal');
+    await open('dark-html-own-2', html, { setting: true });
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showOriginal');
+  });
+
+  test('HTML without its own dark design can be shown dark too: MailFlow recolors it', async () => {
+    await open('dark-html-plain', { html: '<p>plain html</p>', text: '' });
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showDark');
+    await click(toggle());
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showOriginal');
+    await open('dark-html-plain-2', { html: '<p>plain html</p>', text: '' }, { setting: true });
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showOriginal');
+  });
+
+  test('no toggle in a light theme; HTML that asks to stay light has one', async () => {
+    await open('dark-text-3', { text: 'plain words' }, { theme: 'light', setting: true });
+    assert.equal(toggle(), undefined);
+    assert.equal(textCard().style.background, 'white');
+    await open('dark-html-1', { html: '<p>plain html</p>', text: '', lightOnly: true }, { setting: true });
+    assert.equal(toggle().getAttribute('aria-label'), 'message.showOriginal', 'a sender asking to stay light is shown dark too, and can be switched back');
+  });
+});
+
+describe('blocked trackers', () => {
+  const BODIES = {
+    t7: { html: '<p>hi</p>', text: 'hi', attachments: [], remoteImagesProxied: true, trackersBlocked: 2 },
+    u8: { html: '<p>hi</p>', text: 'hi', attachments: [], remoteImagesProxied: true, trackersBlocked: 0 },
+    v9: { html: '<p>hi</p>', text: 'hi', attachments: [], remoteImagesBlocked: true, hasBlockedRemoteImages: true, trackersBlocked: 0 },
+  };
+  let originalFetch;
+  before(() => {
+    globalThis.requestAnimationFrame ??= cb => setTimeout(() => cb(Date.now()), 0);
+    globalThis.cancelAnimationFrame ??= id => clearTimeout(id);
+    dom.window.requestAnimationFrame ??= globalThis.requestAnimationFrame;
+    dom.window.cancelAnimationFrame ??= globalThis.cancelAnimationFrame;
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const id = /\/messages\/([^/]+)\/body/.exec(String(url))?.[1];
+      return { ok: true, status: 200, json: async () => BODIES[id] ?? {}, text: async () => '' };
+    };
+    useStore.getState().setMessages?.(Object.keys(BODIES).map((id, i) => ({ ...MSG_A, id, uid: 70 + i, subject: id })));
+  });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  async function open(id) {
+    await React.act(async () => {
+      useStore.getState().setSelectedMessage(id);
+      root.render(React.createElement(MessagePane));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 0)); });
+  }
+  const text = () => document.getElementById('root').textContent;
+
+  test('says how many trackers were not loaded when images are allowed', async () => {
+    await open('t7');
+    assert.ok(text().includes('message.trackersBlocked'), 'the note is shown');
+    assert.ok(document.querySelector('[title="message.trackersBlockedHint"]'), 'it explains itself on hover');
+  });
+
+  test('says nothing with no trackers, or while images are blocked anyway', async () => {
+    await open('u8');
+    assert.ok(!text().includes('message.trackersBlocked'));
+    await open('v9');
+    assert.ok(!text().includes('message.trackersBlocked'));
+    assert.ok(text().includes('message.remoteImagesBlocked'), 'the blocked-images notice is shown instead');
+  });
+});
+
+// The server answers a star only once the mail server has the flag, which takes seconds on Gmail.
+describe('the star button', () => {
+  const MSG_S = { ...MSG_A, id: 's1', uid: 21, subject: 'Star me', is_starred: false };
+  let originalFetch;
+  let answer;
+  before(() => {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith('/star')) {
+        const ok = await new Promise(resolve => { answer = resolve; });
+        return ok
+          ? { ok: true, status: 200, json: async () => ({ ok: true }) }
+          : { ok: false, status: 500, json: async () => ({ error: 'IMAP store failed' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ html: '', text: 'Hi', attachments: [] }), text: async () => '' };
+    };
+    useStore.getState().setMessages?.([MSG_S]);
+  });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  const starred = () => useStore.getState().messages.find(m => m.id === 's1').is_starred;
+  const clickStar = async () => {
+    const btn = [...document.querySelectorAll('button')].find(b => b.getAttribute('title') === 'message.star');
+    assert.ok(btn, 'the reading pane has a star button');
+    await React.act(async () => { btn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+  };
+  const serverSays = async (ok) => {
+    await React.act(async () => { answer(ok); await new Promise(r => setTimeout(r, 20)); });
+  };
+
+  test('fills at once and stays when the server agrees', async () => {
+    await React.act(async () => {
+      useStore.getState().setSelectedMessage('s1');
+      root.render(React.createElement(MessagePane));
+    });
+    await clickStar();
+    assert.equal(starred(), true, 'starred before the server answered');
+    await serverSays(true);
+    assert.equal(starred(), true);
+  });
+
+  test('is put back, with a notice, when the server refuses', async () => {
+    const before = useStore.getState().notifications?.length ?? 0;
+    await clickStar();
+    assert.equal(starred(), false, 'unstarred before the server answered');
+    await serverSays(false);
+    assert.equal(starred(), true, 'starred again once the server refused');
+    assert.equal(useStore.getState().notifications?.length ?? 0, before + 1, 'and the failure is shown');
+  });
+});
+
+// On a desktop the next and previous messages are loaded once the open one has shown, so j/k
+// show a message at once (on a phone the swipe pager does this).
+describe('loading the neighbors ahead', () => {
+  const ROW = (id) => ({ ...MSG_A, id, uid: id.length, subject: `Row ${id}` });
+  let originalFetch;
+  let asked;
+  before(() => {
+    originalFetch = globalThis.fetch;
+    asked = [];
+    globalThis.fetch = async (url) => {
+      const id = /\/messages\/([^/]+)\/body/.exec(String(url))?.[1];
+      if (id) asked.push(id);
+      return { ok: true, status: 200, json: async () => (id ? { html: `<p>${id}</p>`, attachments: [] } : {}), text: async () => '' };
+    };
+    useStore.getState().setMessages?.([ROW('n1'), ROW('n2'), ROW('n3')]);
+  });
+  after(() => { globalThis.fetch = originalFetch; });
+
+  test('fetches the next and previous bodies after a short pause', async () => {
+    await React.act(async () => {
+      useStore.getState().setSelectedMessage('n2');
+      root.render(React.createElement(MessagePane));
+    });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 60)); });
+    assert.deepEqual(asked, ['n2'], 'only the open one at first');
+    await React.act(async () => { await new Promise(r => setTimeout(r, 500)); });
+    assert.deepEqual([...asked].sort(), ['n1', 'n2', 'n3']);
+  });
+
+  test('opening a neighbor then needs no request', async () => {
+    const before = asked.length;
+    await React.act(async () => { useStore.getState().setSelectedMessage('n3'); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 60)); });
+    assert.equal(asked.slice(before).filter(id => id === 'n3').length, 0);
+  });
+});
+
+// On a phone the pane's own arrows move to the next or previous row of the list, bypassing the
+// list's click. A notification parks the message it opens under __dl_<id>, and the entry outlives
+// that open; the arrows' pick ends it as the list's does (selectListedMessage).
+describe('the arrows on a phone', () => {
+  test('pick the next row as the list picks one', async () => {
+    // A root of its own: useMobile reads innerWidth once, so the shared one stays a desktop pane.
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    dom.window.innerWidth = 375;
+    const phone = createRoot(container);
+    try {
+      await React.act(async () => {
+        useStore.getState().setMessages([MSG_A, MSG_B]);
+        useStore.getState().setThreadMessages('__dl_b2', [MSG_B]);
+        useStore.getState().setSelectedMessage('a1');
+        phone.render(React.createElement(MessagePane));
+      });
+      const next = container.querySelector('button[title="message.nextMessage"]');
+      assert.ok(next, 'the pane offers the next message');
+      await React.act(async () => { next.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+      assert.equal(useStore.getState().selectedMessageId, 'b2');
+      assert.equal(useStore.getState().threadMessages.__dl_b2, undefined);
+    } finally {
+      await React.act(async () => phone.unmount());
+      container.remove();
+      dom.window.innerWidth = 1024;
+    }
+  });
+});
+
+// "Mark as unread" from the reading pane toolbar (#683): the toolbar button vanished once it had
+// worked, and the row's context menu, which reads unread_count, still offered "Mark as unread"
+// because the open had set unread_count to 0 and the pane changed only is_read.
+describe('the toolbar read toggle (#683)', () => {
+  const ContextMenuPromise = import('./ContextMenu.jsx');
+  const click = (el) => el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+
+  async function openRead(t, extra = {}) {
+    // As the list leaves a row it marked read on open: is_read true, unread_count 0.
+    const msg = { ...MSG_A, id: 'toggle-683', uid: 683, is_read: true, unread_count: 0, ...extra };
+    const bulkRead = t.mock.method(api, 'bulkRead', async () => ({}));
+    await React.act(async () => { root.render(null); });
+    await React.act(async () => {
+      useStore.getState().setMessages([msg]);
+      useStore.getState().setSelectedMessage(msg.id);
+      root.render(React.createElement(MessagePane));
+    });
+    return { msg, bulkRead };
+  }
+
+  const toolbarButton = (title) => [...document.querySelectorAll('button.btn-press')].find(b => b.title === title);
+
+  async function menuLabels(message) {
+    const ContextMenu = (await ContextMenuPromise).default;
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const menuRoot = createRoot(host);
+    await React.act(async () => {
+      menuRoot.render(React.createElement(ContextMenu, { x: 0, y: 0, message, onClose() {}, onAction() {} }));
+    });
+    const text = host.textContent;
+    await React.act(async () => menuRoot.unmount());
+    host.remove();
+    return text;
+  }
+
+  test('after Mark as unread the toolbar offers Mark as read instead of nothing', async (t) => {
+    const { msg, bulkRead } = await openRead(t);
+    const unreadBtn = toolbarButton('contextMenu.markUnread');
+    assert.ok(unreadBtn, 'a read message offers Mark as unread');
+    await React.act(async () => { click(unreadBtn); });
+    assert.deepEqual(bulkRead.mock.calls[0].arguments, [[msg.id], false]);
+    assert.equal(toolbarButton('contextMenu.markUnread'), undefined);
+    const readBtn = toolbarButton('contextMenu.markRead');
+    assert.ok(readBtn, 'the button stays, now offering Mark as read');
+    await React.act(async () => { click(readBtn); });
+    assert.deepEqual(bulkRead.mock.calls[1].arguments, [[msg.id], true]);
+    assert.equal(useStore.getState().messages[0].is_read, true);
+    assert.ok(toolbarButton('contextMenu.markUnread'), 'and back again');
+  });
+
+  test('toolbar Mark as read cancels a delayed read the list scheduled on open', async (t) => {
+    // The list registers its read-on-open delay by message id; without the cancel the delay
+    // ran out after the manual read and marked the message read a second time.
+    const { scheduleMarkReadTimer } = await import('../utils/markRead.js');
+    const { msg, bulkRead } = await openRead(t, { is_read: false, unread_count: 1 });
+    let delayedRan = 0;
+    scheduleMarkReadTimer(msg.id, () => { delayedRan += 1; }, 30);
+    await React.act(async () => { click(toolbarButton('contextMenu.markRead')); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 60)); });
+    assert.equal(delayedRan, 0, 'the pending delayed read was cancelled');
+    assert.deepEqual(bulkRead.mock.calls.map(c => c.arguments[1]), [true]);
+  });
+
+  test('the toolbar toggle keeps the GTD rail copy of the thread in step', async (t) => {
+    const { msg } = await openRead(t, { message_id: '<gtd-683@example.com>' });
+    const rail = { ...msg, id: 'rail-683', is_read: true };
+    await React.act(async () => { useStore.setState({ gtdSections: { reference: { threads: [rail] } } }); });
+    try {
+      await React.act(async () => { click(toolbarButton('contextMenu.markUnread')); });
+      assert.equal(useStore.getState().gtdSections.reference.threads[0].is_read, false);
+      await React.act(async () => { click(toolbarButton('contextMenu.markRead')); });
+      assert.equal(useStore.getState().gtdSections.reference.threads[0].is_read, true);
+    } finally {
+      await React.act(async () => { useStore.setState({ gtdSections: null }); });
+    }
+  });
+
+  test("the row's context menu offers Mark as read once the pane marked it unread", async (t) => {
+    await openRead(t);
+    await React.act(async () => { click(toolbarButton('contextMenu.markUnread')); });
+    const row = useStore.getState().messages[0];
+    assert.equal(row.is_read, false);
+    assert.equal(row.unread_count, 1, 'unread_count follows is_read');
+    const labels = await menuLabels(row);
+    assert.ok(labels.includes('contextMenu.markRead'), `menu offers Mark as read, got ${labels}`);
+    assert.ok(!labels.includes('contextMenu.markUnread'));
+  });
+});
+
+// A read still in flight when the reader marks the message unread (the open's read waits on the
+// IMAP STORE, so its reply can easily land after the click). Its reply used to record a grace
+// entry anyway, and the next list refresh within 10 seconds turned the message read again, so
+// the row's menu went back to offering "Mark as unread". The guard also marked a conversation
+// row read without bringing its unread_count down, so the menu offered "Mark as read" for a row
+// shown read.
+describe('a read in flight and the toolbar read toggle', () => {
+  const ContextMenuPromise = import('./ContextMenu.jsx');
+  const click = (el) => el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  const toolbarButton = (title) => [...document.querySelectorAll('button.btn-press')].find(b => b.title === title);
+
+  async function menuLabels(message) {
+    const ContextMenu = (await ContextMenuPromise).default;
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const menuRoot = createRoot(host);
+    await React.act(async () => {
+      menuRoot.render(React.createElement(ContextMenu, { x: 0, y: 0, message, onClose() {}, onAction() {} }));
+    });
+    const text = host.textContent;
+    await React.act(async () => menuRoot.unmount());
+    host.remove();
+    return text;
+  }
+
+  // An unread row in the pane, and a bulkRead whose reads wait until the test lets them answer.
+  async function openUnread(t, extra = {}) {
+    const msg = { ...MSG_A, id: 'race-read', uid: 684, is_read: false, unread_count: 1, ...extra };
+    const reads = [];
+    const bulkRead = t.mock.method(api, 'bulkRead', (ids, read) => (read
+      ? new Promise((resolve, reject) => reads.push({ resolve, reject }))
+      : Promise.resolve({})));
+    await React.act(async () => { root.render(null); });
+    await React.act(async () => {
+      useStore.getState().setMessages([msg]);
+      useStore.getState().setSelectedMessage(msg.id);
+      root.render(React.createElement(MessagePane));
+    });
+    return { msg, reads, bulkRead };
+  }
+  const settle = async (fn) => { await React.act(async () => { fn(); await new Promise(r => setTimeout(r, 0)); }); };
+  // The list's refresh: the server's rows through the list's read guard into the store.
+  const refreshWith = async (serverRow) => {
+    const { applyReadGuard } = await import('../utils/pendingReads.js');
+    await React.act(async () => { useStore.getState().setMessages(applyReadGuard([serverRow])); });
+    return useStore.getState().messages[0];
+  };
+
+  test('Mark as unread while the open\'s read is in flight: a refresh after its reply leaves it unread', async (t) => {
+    const { applyMarkRead } = await import('../utils/markRead.js');
+    const { msg, reads } = await openUnread(t);
+    await settle(() => applyMarkRead(msg));
+    await settle(() => click(toolbarButton('contextMenu.markUnread')));
+    await settle(() => reads[0].resolve({}));
+
+    const row = await refreshWith({ ...msg, is_read: false, unread_count: 1 });
+    assert.equal(row.is_read, false, 'the refresh does not turn it read again');
+    const labels = await menuLabels(row);
+    assert.ok(labels.includes('contextMenu.markRead'), `menu offers Mark as read, got ${labels}`);
+    assert.ok(toolbarButton('contextMenu.markRead'), 'and so does the toolbar');
+  });
+
+  test('the in-flight read failing after Mark as unread does not count the message unread twice', async (t) => {
+    const { applyMarkRead } = await import('../utils/markRead.js');
+    const { msg, reads } = await openUnread(t);
+    const adjust = t.mock.method(useStore.getState(), 'adjustUnread');
+    await settle(() => applyMarkRead(msg));
+    await settle(() => click(toolbarButton('contextMenu.markUnread')));
+    t.mock.method(console, 'error', () => {});
+    await settle(() => reads[0].reject(new Error('IMAP down')));
+    assert.deepEqual(adjust.mock.calls.map(c => c.arguments[1]), [-1, 1], 'read once, unread once, and no roll-back on top');
+    assert.equal(useStore.getState().messages[0].is_read, false);
+  });
+
+  test('Mark as read from the toolbar, then a stale refresh: the row is read in every view', async (t) => {
+    const { msg, reads } = await openUnread(t, { message_count: 2 });
+    await settle(() => click(toolbarButton('contextMenu.markRead')));
+    assert.equal(reads.length, 1);
+
+    const row = await refreshWith({ ...msg, is_read: false, unread_count: 1 });
+    assert.equal(row.is_read, true);
+    assert.equal(row.unread_count, 0, 'unread_count comes down with is_read');
+    const labels = await menuLabels(row);
+    assert.ok(labels.includes('contextMenu.markUnread'), `menu offers Mark as unread, got ${labels}`);
+    assert.ok(toolbarButton('contextMenu.markUnread'));
+    await settle(() => reads[0].resolve({}));
+  });
+});
+
+// #596: in List first the open message has a Back bar, as on a phone, and Back returns to the list.
+describe('List first back bar', () => {
+  const backButton = () => [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'common.back');
+  test('shown in List first, and Back goes back in history', async () => {
+    // The pane calls the global history, as the phone's Back does; this environment has none.
+    const realHistory = globalThis.history;
+    let backs = 0;
+    globalThis.history = { state: { mailflow: 'message' }, back: () => { backs += 1; } };
+    try {
+      await React.act(async () => { useStore.setState({ layout: 'list', messages: [MSG_A, MSG_B] }); useStore.getState().setSelectedMessage('a1'); });
+      await React.act(async () => { root.render(React.createElement(MessagePane)); });
+      assert.ok(backButton(), 'a Back button');
+      await React.act(async () => { backButton().click(); });
+      assert.equal(backs, 1);
+    } finally {
+      globalThis.history = realHistory;
+    }
+  });
+  test('without the opened message\'s history entry, Back closes it instead of leaving MailFlow', async () => {
+    // Opened before switching to List first, or restored after unlocking: no entry was pushed.
+    const realHistory = globalThis.history;
+    let backs = 0;
+    globalThis.history = { state: null, back: () => { backs += 1; } };
+    try {
+      await React.act(async () => { useStore.setState({ layout: 'list', messages: [MSG_A, MSG_B] }); useStore.getState().setSelectedMessage('a1'); });
+      await React.act(async () => { root.render(React.createElement(MessagePane)); });
+      await React.act(async () => { backButton().click(); });
+      assert.equal(backs, 0);
+      assert.equal(useStore.getState().selectedMessageId, null);
+    } finally {
+      globalThis.history = realHistory;
+    }
+  });
+  test('not in a layout with a reading pane', async () => {
+    await React.act(async () => { useStore.getState().setSelectedMessage('a1'); });
+    await React.act(async () => { useStore.setState({ layout: 'comfortable' }); });
+    assert.equal(backButton(), undefined);
   });
 });

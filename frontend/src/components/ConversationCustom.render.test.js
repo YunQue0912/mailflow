@@ -44,6 +44,7 @@ Object.assign(globalThis, {
   window: dom.window, document: dom.window.document,
   localStorage: dom.window.localStorage, CustomEvent: dom.window.CustomEvent,
   Node: dom.window.Node, Element: dom.window.Element, HTMLElement: dom.window.HTMLElement,
+  MutationObserver: dom.window.MutationObserver,
   getComputedStyle: dom.window.getComputedStyle,
   requestAnimationFrame: callback => { frames.set(++frameId, callback); return frameId; },
   cancelAnimationFrame: id => frames.delete(id),
@@ -65,6 +66,9 @@ const { BUILTIN_SUMMARIZE } = await import('../aiActions.js');
 const ConversationMessageCard = (await import('./ConversationMessageCard.jsx')).default;
 const ConversationPane = (await import('./ConversationPane.jsx')).default;
 const MessagePane = (await import('./MessagePane.jsx')).default;
+const AttachmentViewer = (await import('./AttachmentViewer.jsx')).default;
+const { scheduleMarkReadTimer, applyMarkRead } = await import('../utils/markRead.js');
+const { _resetReadOrder, _readIntentSize } = await import('../utils/readOrder.js');
 
 const container = document.getElementById('root');
 const ACCOUNT = { id: 'acct', email_address: 'me@example.invalid', enabled: true, include_in_unified_inbox: true };
@@ -76,6 +80,7 @@ const message = (id, extra = {}) => ({
 const initial = [message('first'), message('second')];
 let root;
 beforeEach(() => {
+  _resetReadOrder();
   window.innerWidth = 1024;
   localStorage.removeItem('mailflow_ai_results');
   useStore.setState({
@@ -108,6 +113,33 @@ const click = async element => {
   await React.act(async () => element.click());
 };
 const labelled = label => container.querySelector(`button[title="${label}"]`);
+const deferred = () => {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+};
+const settle = () => React.act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+function readServer(t, rows) {
+  const flags = new Map(rows.map(item => [item.id, item.is_read]));
+  const requests = [];
+  let held = null;
+  t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+    if (!String(url).endsWith('/mail/messages/bulk-read')) return new Response('{}');
+    const body = JSON.parse(options.body);
+    requests.push(body);
+    body.ids.forEach(id => flags.set(id, body.read));
+    const wait = held;
+    held = null;
+    if (wait) await wait.promise;
+    return new Response(JSON.stringify({ updated: body.ids }));
+  });
+  return { flags, requests, hold: wait => { held = wait; } };
+}
+async function openReadThread(rows) {
+  useStore.setState({ messages: rows, threadMessages: { thread: rows } });
+  api.getThread = async () => ({ messages: rows });
+  await render(ConversationPane, { threadId: 'thread', folder: 'INBOX', accountId: ACCOUNT.id, selectedMessageId: rows[0].id });
+}
 
 for (const Component of [ConversationMessageCard, MessagePane]) {
   for (const width of [480, 1024]) {
@@ -118,7 +150,7 @@ for (const Component of [ConversationMessageCard, MessagePane]) {
     window.mailflowNative = { platform: 'android', attachments: { download: async options => { downloads.push(options); return { started: true }; } } };
     useStore.setState({ messages: [item], selectedMessageId: item.id });
     await render(Component, { message: item, expanded: true, onToggle() {} });
-    if (Component === MessagePane && width >= 768) {
+    if (width >= 768) {
       await click(labelled('message.downloadEml'));
     } else {
       await click(labelled('message.more'));
@@ -159,8 +191,8 @@ async function startCardAi(id) {
     signal = options.signal;
     return new Promise(resolve => { finish = resolve; });
   };
-  await render(ConversationMessageCard, { message: item, expanded: true, onToggle() {}, onReply() {}, onForward() {} });
-  await click(labelled('message.more'));
+  await render(ConversationMessageCard, { message: item, expanded: true, onToggle() {}, aiEnabled: true });
+  await click(labelled('message.aiActions'));
   await click([...container.querySelectorAll('button')].find(el => el.textContent === 'message.summarize'));
   assert.equal(aiRuns.size, 1);
   return { item, get signal() { return signal; }, finish: text => finish(text) };
@@ -172,7 +204,7 @@ test('conversation AI finishes after navigation and restores the saved result on
   assert.equal(run.signal.aborted, false);
   await React.act(async () => run.finish('Saved summary'));
   assert.equal(getResults(run.item.id)[BUILTIN_SUMMARIZE.id].text, 'Saved summary');
-  await render(ConversationMessageCard, { message: run.item, expanded: true, onToggle() {}, onReply() {}, onForward() {} });
+  await render(ConversationMessageCard, { message: run.item, expanded: true, onToggle() {}, aiEnabled: true });
   assert.ok(container.textContent.includes('Saved summary'));
 });
 
@@ -202,6 +234,143 @@ test('thread mark-read stops if refreshing the membership fails', async (t) => {
   await click(labelled('contextMenu.markRead'));
   assert.equal(bulkRead.mock.callCount(), 0);
   assert.ok(useStore.getState().notifications.some(item => item.type === 'error'));
+});
+
+test('a later card unread wins while the whole-thread membership lookup is delayed', async t => {
+  const rows = [message('first', { is_read: true }), message('second')];
+  const server = readServer(t, rows);
+  await openReadThread(rows);
+  const lookup = deferred();
+  api.getThread = () => lookup.promise;
+  await click(labelled('contextMenu.markRead'));
+  await click(container.querySelector('[data-message-id="first"] button[title="contextMenu.markUnread"]'));
+  await React.act(async () => lookup.resolve({ messages: rows }));
+  await settle();
+  assert.deepEqual(server.requests, [{ ids: ['first'], read: false }, { ids: ['second'], read: true }]);
+  assert.equal(server.flags.get('first'), false);
+  assert.equal(useStore.getState().threadMessages.thread.find(item => item.id === 'first').is_read, false);
+  assert.equal(_readIntentSize(), 0);
+});
+
+test('a later card unread survives an older whole-thread read response', async t => {
+  const rows = [message('first', { is_read: true }), message('second')];
+  const server = readServer(t, rows);
+  await openReadThread(rows);
+  const response = deferred();
+  server.hold(response);
+  await click(labelled('contextMenu.markRead'));
+  await settle();
+  await click(container.querySelector('[data-message-id="first"] button[title="contextMenu.markUnread"]'));
+  await React.act(async () => response.resolve());
+  await settle();
+  assert.equal(server.flags.get('first'), false);
+  assert.equal(server.flags.get('second'), true);
+  assert.equal(useStore.getState().threadMessages.thread.find(item => item.id === 'first').is_read, false);
+  assert.equal(_readIntentSize(), 0);
+});
+
+test('whole-thread unread cancels a pending automatic timer even when the lookup already says unread', async t => {
+  const rows = initial.map(item => ({ ...item, is_read: true }));
+  const server = readServer(t, rows);
+  await openReadThread(rows);
+  api.getThread = async () => ({ messages: initial });
+  scheduleMarkReadTimer('first', () => api.bulkRead(['first'], true), 20);
+  await click(labelled('contextMenu.markUnread'));
+  await React.act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+  assert.deepEqual(server.requests, [{ ids: ['first', 'second'], read: false }]);
+  assert.equal(server.flags.get('first'), false);
+});
+
+test('whole-thread unread supersedes an in-flight automatic read even when the lookup says unread', async t => {
+  const rows = [message('first'), message('second', { is_read: true })];
+  const server = readServer(t, rows);
+  await openReadThread(rows);
+  const response = deferred();
+  server.hold(response);
+  await React.act(async () => applyMarkRead(rows[0]));
+  await click(labelled('contextMenu.markUnread'));
+  await React.act(async () => response.resolve());
+  await settle();
+  assert.deepEqual(server.requests, [{ ids: ['first'], read: true }, { ids: ['first', 'second'], read: false }]);
+  assert.equal(server.flags.get('first'), false);
+  assert.equal(useStore.getState().threadMessages.thread.find(item => item.id === 'first').is_read, false);
+});
+
+test('a whole-thread read response does not adjust a different account view\'s category counts', async t => {
+  const rows = initial.map(item => ({ ...item, category: 'primary' }));
+  const server = readServer(t, rows);
+  await openReadThread(rows);
+  const response = deferred();
+  server.hold(response);
+  await click(labelled('contextMenu.markRead'));
+  await settle();
+  const other = message('other-message', { account_id: 'other-account', category: 'primary' });
+  api.getThread = async () => ({ messages: [other] });
+  await React.act(async () => useStore.setState({ selectedAccountId: 'other-account', categoryCounts: { primary: 8 } }));
+  await render(ConversationPane, { threadId: 'thread', folder: 'INBOX', accountId: 'other-account' });
+  await React.act(async () => response.resolve());
+  await settle();
+  assert.equal(server.flags.get('first'), true, 'the requested read still completed for its account');
+  assert.equal(useStore.getState().categoryCounts.primary, 8, 'the new account owns the category counts');
+  assert.deepEqual(useStore.getState().threadMessages.thread.map(item => item.id), ['other-message']);
+});
+
+for (const phase of ['lookup', 'response']) for (const transition of ['lock/unlock', 'sign-out/sign-in']) {
+  test(`whole-thread read drops a ${phase} completion after ${transition} in the same user`, async t => {
+    const server = readServer(t, initial);
+    await openReadThread(initial);
+    const waiting = deferred();
+    if (phase === 'lookup') api.getThread = () => waiting.promise;
+    else server.hold(waiting);
+    await click(labelled('contextMenu.markRead'));
+    await settle();
+    await React.act(async () => {
+      const store = useStore.getState();
+      if (transition === 'lock/unlock') { store.setLocked(true); store.setLocked(false); }
+      else { store.setUser(null); store.setUser({ id: 'user' }); }
+    });
+    await React.act(async () => waiting.resolve({ messages: initial }));
+    await settle();
+    assert.deepEqual(useStore.getState().threadMessages, {});
+    assert.deepEqual(useStore.getState().notifications, []);
+    assert.equal(server.requests.length, phase === 'lookup' ? 0 : 1);
+    assert.equal(_readIntentSize(), 0);
+  });
+}
+
+test('thread mark-read in an account view leaves another account untouched', async (t) => {
+  const copy = message('other-copy', { account_id: 'other-account', message_id: initial[0].message_id });
+  api.getThread = async () => ({ messages: [...initial, copy] });
+  const calls = [];
+  t.mock.method(api, 'bulkRead', async (ids, read) => { calls.push({ ids, read }); });
+  await render(ConversationPane, { threadId: 'thread', folder: 'INBOX', accountId: ACCOUNT.id });
+  await click(labelled('contextMenu.markRead'));
+  assert.deepEqual(calls, [{ ids: ['first', 'second'], read: true }]);
+  assert.equal(useStore.getState().threadMessages.thread.find(item => item.id === copy.id).is_read, false);
+});
+
+test('a new conversation member refreshes the cards while retaining an opened message', async () => {
+  const props = { threadId: 'thread', folder: 'INBOX', accountId: ACCOUNT.id };
+  await render(ConversationPane, { ...props, refreshKey: 'thread:2' });
+  await click(container.querySelector('[data-message-id="first"] > button[aria-expanded]'));
+  const arrived = message('arrived', { date: '2026-09-18T00:00:00Z' });
+  api.getThread = async () => ({ messages: [...initial, arrived] });
+  await render(ConversationPane, { ...props, refreshKey: 'thread:3' });
+  for (const id of ['first', 'arrived']) {
+    assert.equal(container.querySelector(`[data-message-id="${id}"] > button[aria-expanded]`)?.getAttribute('aria-expanded'), 'true');
+  }
+});
+
+test('Android preview downloads use the native endpoint after the image bytes have loaded', async (t) => {
+  const attachment = { filename: 'photo.png', type: 'image/png', part: '2', size: 8 };
+  const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, arrayBuffer: async () => bytes.buffer }));
+  const received = [];
+  window.mailflowNative = { platform: 'android' };
+  await render(AttachmentViewer, { messageId: 'preview', attachments: [attachment], onClose() {}, onDownloadFallback: item => received.push(item) });
+  assert.ok(document.querySelector('img'), 'the viewer has the downloaded image');
+  await click(document.querySelector('button[title="message.preview.download"]'));
+  assert.deepEqual(received, [attachment]);
 });
 
 test('GTD opening retains its own mark-read policy', async (t) => {

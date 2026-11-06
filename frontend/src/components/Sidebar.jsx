@@ -1,26 +1,40 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import AccountMark from './AccountMark.jsx';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
-import { unreadBadge } from '../utils/unreadBadge.js';
+import { totalBadge, unreadBadge } from '../utils/unreadBadge.js';
 import { api } from '../utils/api.js';
 import { isNativeAppEnvironment } from '../utils/nativeUpdatePolicy.js';
 import { resolveThreadMessages } from '../utils/threadActions.js';
-import { folderDisplayName } from '../utils/folderDisplay.js';
+import { keepDraftsApart } from '../utils/conversationActions.js';
+import { folderDisplayName, folderDisplayNameForPath, folderRole } from '../utils/folderDisplay.js';
 import {
   activateOnKey,
   buildFolderTree,
+  subtreeUnread,
   collapsedTooltip,
   FOLDER_ORDER_DRAG_TYPE,
   folderDropPosition,
   hasRenderedInbox,
+  existingHiddenPaths,
+  moveHiddenPaths,
   resolveFolderOrderDrop,
 } from '../utils/sidebar.js';
 import { useMobile } from '../hooks/useMobile.js';
 import LogoMark from './LogoMark.jsx';
 import ProfileModal from './ProfileModal.jsx';
 import { useUiScale, descale } from '../hooks/useUiScale.js';
+import { SNOOZED_FOLDER } from '../utils/snoozeActions.js';
+import { SCHEDULED_VIEW } from '../utils/scheduledCompose.js';
+import { SendLaterIcon } from './SendLater.jsx';
+import { describeAccountError, needsSignIn } from '../utils/accountErrors.js';
 
 const ICONS = {
+  snoozed: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+      <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+    </svg>
+  ),
   inbox: (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
       <polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/>
@@ -250,13 +264,31 @@ function CtxMenuItem({ icon, label, onClick, danger, disabled }) {
 }
 
 // ─── Main Sidebar ─────────────────────────────────────────────────────────────
+// A folder row's badge: its unread count, or for Drafts how many drafts it holds (#643), outlined
+// rather than filled so it doesn't read as unread mail.
+function folderBadge(folder, folderMappings, t) {
+  if (!folder) return null;
+  const counts = { known: folder.counts_known !== false, stale: folder.counts_stale };
+  if (folderRole(folder, folderMappings) === 'drafts') {
+    const b = totalBadge({ count: folder.total_count, ...counts });
+    return b && { ...b, title: t('sidebar.draftsTotal', { n: folder.total_count }) };
+  }
+  return unreadBadge({ count: folder.unread_count, ...counts, observedAt: folder.server_counts_at });
+}
+
+function badgeStyle(badge) {
+  return badge.total
+    ? { fontSize: 10, color: 'var(--text-tertiary)', border: '1px solid var(--border)', padding: '0 4px', borderRadius: 8 }
+    : { fontSize: 10, color: 'var(--text-tertiary)', background: 'var(--bg-elevated)', padding: '1px 5px', borderRadius: 8 };
+}
+
 export default function Sidebar() {
   const { t } = useTranslation();
   const uiScale = useUiScale();
   const {
     accounts, unreadCounts, selectedAccountId, selectedFolder,
-    setSelectedAccount, setShowAdmin, setAdminTab, openCompose,
-    folders, setFolders, setAccounts, user, setUser, lockScreen, sidebarCollapsed: sidebarCollapsedPref, toggleSidebar,
+    setSelectedAccount, setShowAdmin, setAdminTab, setAccountsIntent, openCompose,
+    folders, setFolders, setAccounts, user, signOut, lockScreen, sidebarCollapsed: sidebarCollapsedPref, toggleSidebar,
     blockRemoteImages, setBlockRemoteImages, setMobileSidebarOpen, addNotification,
     searchAllFolders, setSearchAllFolders,
     hiddenFolders, setHiddenFolders,
@@ -336,7 +368,7 @@ export default function Sidebar() {
       // Sent copies), so scope the move to the dragged row's account exactly as the context-menu
       // move does — the server silently skips messages whose account lacks the destination.
       movedIds = [...new Set(
-        threadMsgs.filter(m => m?.account_id === row.account_id).map(m => m.id).filter(Boolean)
+        keepDraftsApart(threadMsgs, row.id).filter(m => m?.account_id === row.account_id).map(m => m.id).filter(Boolean)
       )];
       if (!movedIds.length) movedIds = [row.id];
       msgs = [row];
@@ -350,7 +382,7 @@ export default function Sidebar() {
     if (!msgs.length) return;
     msgs.forEach(msg => {
       state.removeMessage(msg.id);
-      if (!msg.is_read) state.decrementUnread(msg.account_id);
+      if (!msg.is_read) state.decrementUnread(msg.account_id, 1, { undoable: true });
     });
     let undone = false;
     const timer = setTimeout(async () => {
@@ -468,6 +500,18 @@ export default function Sidebar() {
     setHiddenFolders(updated);
   }, [hiddenFolders, setHiddenFolders]);
 
+  // Keep a hidden folder hidden under the name MailFlow renamed it to, and forget one MailFlow
+  // deleted, so a new folder made later with the same name is not born hidden (#694).
+  const moveHiddenFolder = useCallback((accountId, oldPath, newPath) => {
+    const all = useStore.getState().hiddenFolders;
+    const current = all[accountId] || [];
+    const next = moveHiddenPaths(current, oldPath, newPath, folders[accountId]);
+    if (next.length === current.length && next.every((p, i) => p === current[i])) return;
+    const updated = { ...all };
+    if (next.length === 0) delete updated[accountId]; else updated[accountId] = next;
+    setHiddenFolders(updated);
+  }, [folders, setHiddenFolders]);
+
   // Loading state for folder ops
   const [folderOpLoading, setFolderOpLoading] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState(null); // { message, onConfirm }
@@ -507,29 +551,11 @@ export default function Sidebar() {
     return () => { cancelled = true; };
   }, []);
 
-  const handleLogout = async () => {
-    // The logout response may carry an OIDC end-session URL when the account signed in
-    // through a provider with RP-initiated logout enabled; navigating there also clears
-    // the upstream SSO session. Falls back to /login otherwise. (#310)
-    const res = await api.logout().catch(() => ({}));
-    // Appearance/localization prefs (theme, font, layout, language) are deliberately
-    // NOT cleared: keeping them means the login screen and the next visit retain the
-    // last-used look instead of snapping back to the default dark theme (issue #208).
-    // They are re-synced from the account's server-side preferences after login.
-    // The keys below are mailbox/session state that can reference the previous user's
-    // accounts or folders, so they are cleared on sign-out.
-    [
-      'mailflow_notification_sound', 'mailflow_custom_sound', 'mailflow_custom_sound_name',
-      'mailflow_page_size', 'mailflow_scroll_mode', 'mailflow_sync_interval',
-      'mailflow_threaded_view', 'mailflow_plaintext_email',
-      'mailflow_hover_quick_actions', 'mailflow_swipe_actions',
-      'mailflow_expanded_accounts', 'mailflow_collapsed_folders',
-    ].forEach(k => localStorage.removeItem(k));
-    setUser(null);
-    window.location.href = res?.endSessionUrl || '/login';
-  };
-
   const isUnified = selectedAccountId === null;
+  const snoozedCount = useStore(s => s.snoozedCount);
+  const scheduledCount = useStore(s => s.scheduledCount);
+  const scheduledAttention = useStore(s => s.scheduledAttention);
+  const isScheduledView = isUnified && selectedFolder === SCHEDULED_VIEW;
 
   // Focus rename/create inputs when they appear
   useEffect(() => {
@@ -589,6 +615,7 @@ export default function Sidebar() {
     setFolderOpLoading(true);
     try {
       const { newPath } = await api.renameFolder(renamingFolder.accountId, renamingFolder.path, renamingFolder.value.trim());
+      if (newPath) moveHiddenFolder(renamingFolder.accountId, renamingFolder.path, newPath);
       const updated = await api.getFolders(renamingFolder.accountId);
       setFolders(renamingFolder.accountId, updated);
       // If we were viewing the renamed folder, navigate to it
@@ -605,9 +632,7 @@ export default function Sidebar() {
 
   const handleDeleteFolder = (accountId, folderPath) => {
     const account = accounts.find(a => a.id === accountId);
-    const accountFolders = folders[accountId] || [];
-    const delimiter = accountFolders.find(f => f.delimiter)?.delimiter || '/';
-    const name = folderPath.split(delimiter).pop();
+    const name = folderDisplayNameForPath(folderPath, t, account?.folder_mappings, folders[accountId]);
     const accountLabel = account?.name || account?.email_address || '';
     setConfirmDialog({
       message: t('sidebar.confirmDelete', { name }),
@@ -615,6 +640,7 @@ export default function Sidebar() {
       onConfirm: async () => {
         try {
           await api.deleteFolder(accountId, folderPath);
+          moveHiddenFolder(accountId, folderPath, null);
           const updated = await api.getFolders(accountId);
           setFolders(accountId, updated);
           if (selectedAccountId === accountId && selectedFolder === folderPath) {
@@ -629,9 +655,9 @@ export default function Sidebar() {
 
   const handleEmptyFolder = (accountId, folderPath) => {
     const account = accounts.find(a => a.id === accountId);
-    const accountFolders = folders[accountId] || [];
-    const delimiter = accountFolders.find(f => f.delimiter)?.delimiter || '/';
-    const name = folderPath.split(delimiter).pop();
+    // The name the folder has in the sidebar, so emptying the "Deleted Items" it labels Trash
+    // asks about and reports Trash (#623).
+    const name = folderDisplayNameForPath(folderPath, t, account?.folder_mappings, folders[accountId]);
     const accountLabel = account?.name || account?.email_address || '';
     setConfirmDialog({
       message: t('sidebar.confirmEmpty', { name }),
@@ -683,16 +709,14 @@ export default function Sidebar() {
     if (idx === -1) return;
     const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
     if (targetIdx < 0 || targetIdx >= accounts.length) return;
-    const targetAccount = accounts[targetIdx];
     const newOrder = [...accounts];
     newOrder[idx] = accounts[targetIdx];
     newOrder[targetIdx] = accounts[idx];
     setAccounts(newOrder);
     try {
-      await Promise.all([
-        api.updateAccount(account.id, { sort_order: targetIdx }),
-        api.updateAccount(targetAccount.id, { sort_order: idx }),
-      ]);
+      // The whole order, not the two swapped: accounts can share a position, and then the others
+      // reshuffled on the next load (#695).
+      await api.reorderAccounts(newOrder.map(a => a.id));
     } catch (err) {
       setAccounts(accounts);
       addNotification({ title: t('sidebar.accountMenu.moveFailed'), body: err.message });
@@ -777,6 +801,15 @@ export default function Sidebar() {
     ];
   };
 
+  // Settings > Accounts at this account's row, where its error is explained, optionally
+  // starting "Sign in again" there.
+  const openAccountRow = (account, action = 'focus') => {
+    setAccountsIntent({ accountId: account.id, action });
+    setAdminTab('accounts');
+    setShowAdmin(true);
+    setMobileSidebarOpen(false);
+  };
+
   // ── Account context menu items ─────────────────────────────────────────────
   const buildAccountMenuItems = (account) => {
     const idx = accounts.findIndex(a => a.id === account.id);
@@ -828,8 +861,13 @@ export default function Sidebar() {
         icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>,
         action: () => { setAdminTab('accounts'); setShowAdmin(true); },
       },
-      {
-        label: t('sidebar.accountMenu.reconnect'),
+      // An account whose sign-in stopped working is fixed by signing in, not by retrying.
+      needsSignIn(account) ? {
+        label: t('sidebar.accountMenu.signInAgain'),
+        icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>,
+        action: () => openAccountRow(account, 'signIn'),
+      } : {
+        label: t('sidebar.accountMenu.tryAgain'),
         icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>,
         action: () => api.reconnectAccount(account.id).catch(console.error),
       },
@@ -852,7 +890,7 @@ export default function Sidebar() {
       {/* Header */}
       <div style={{
         paddingTop: 'calc(var(--sat) + 16px)',
-        paddingBottom: 16, paddingLeft: 12, paddingRight: 12,
+        paddingBottom: 'calc(16px - var(--sat-trim))', paddingLeft: 12, paddingRight: 12,
         display: 'flex', alignItems: 'center',
         justifyContent: 'space-between', borderBottom: '1px solid var(--border-subtle)',
         minHeight: 56, flexShrink: 0,
@@ -908,7 +946,7 @@ export default function Sidebar() {
       {/* Compose button */}
       <div style={{ padding: '12px 10px' }}>
         <button
-          onClick={() => openCompose({ accountId: selectedAccountId || undefined })}
+          onClick={() => openCompose({})}
           className="btn-press"
           style={{
             width: '100%', padding: sidebarCollapsed ? '10px' : '10px 14px',
@@ -934,11 +972,42 @@ export default function Sidebar() {
             mailboxRow
             icon={ICONS.inbox}
             label={t('sidebar.allInboxes')}
-            active={isUnified && !showContacts}
+            active={isUnified && selectedFolder !== SNOOZED_FOLDER && !isScheduledView && !showContacts}
             collapsed={sidebarCollapsed}
             badge={unreadCounts.total}
             badgeStale={!unreadCounts.complete}
             onClick={() => setSelectedAccount(null, 'INBOX')}
+          />
+        )}
+
+        {/* Snoozed (#269): every account's snoozed mail in one place, soonest back first. Shown
+            while something is snoozed, and while it is open, so unsnoozing the last message does
+            not pull it away from under the reader. */}
+        {(snoozedCount > 0 || (isUnified && selectedFolder === SNOOZED_FOLDER)) && (
+          <NavItem
+            mailboxRow
+            icon={ICONS.snoozed}
+            label={t('sidebar.snoozed')}
+            active={isUnified && selectedFolder === SNOOZED_FOLDER && !showContacts}
+            collapsed={sidebarCollapsed}
+            onClick={() => setSelectedAccount(null, SNOOZED_FOLDER)}
+          />
+        )}
+
+        {/* Scheduled (#543, design 5.2): every account's scheduled messages. Shown, like Snoozed,
+            while there is any (pending or needing attention) and while it is open. The badge is the
+            pending count; a red dot and the tooltip say how many need attention. */}
+        {(scheduledCount > 0 || scheduledAttention > 0 || isScheduledView) && (
+          <NavItem
+            mailboxRow
+            icon={<SendLaterIcon size={16} />}
+            label={t('sidebar.scheduled')}
+            active={isScheduledView && !showContacts}
+            collapsed={sidebarCollapsed}
+            badge={scheduledCount}
+            badgeTitle={t('sidebar.scheduledPending', { n: scheduledCount })}
+            alert={scheduledAttention > 0 ? t('sidebar.scheduledAttention', { n: scheduledAttention }) : null}
+            onClick={() => setSelectedAccount(null, SCHEDULED_VIEW)}
           />
         )}
 
@@ -958,8 +1027,7 @@ export default function Sidebar() {
                 const accountFolders = folders[accountId] || [];
                 const folderObj = accountFolders.find(f => f.path === path);
                 const isActive = selectedAccountId === accountId && selectedFolder === path;
-                const favBadge = unreadBadge({ count: folderObj?.unread_count, known: folderObj?.counts_known !== false,
-                  stale: folderObj?.counts_stale, observedAt: folderObj?.server_counts_at });
+                const favBadge = folderBadge(folderObj, account.folder_mappings, t);
                 const isRenamingThis = renamingFav?.accountId === accountId && renamingFav?.path === path;
                 const isDragging = favDragIdx === idx;
                 const isDropTarget = favDropIdx === idx && favDragIdx !== null && favDragIdx !== idx;
@@ -1112,16 +1180,16 @@ export default function Sidebar() {
                       />
                     ) : (
                       <span style={{ fontSize: 13, fontWeight: isActive ? 500 : 400, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {label || (folderObj ? folderDisplayName(folderObj, t, account.folder_mappings) : (path.split('/').pop() || path))}
+                        {label || (folderObj ? folderDisplayName(folderObj, t, account.folder_mappings, accountFolders) : (path.split('/').pop() || path))}
                       </span>
                     )}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
                       {favBadge && (
-                        <span title={favBadge.title} style={{ fontSize: 10, color: 'var(--text-tertiary)', background: 'var(--bg-elevated)', padding: '1px 5px', borderRadius: 8 }}>
+                        <span title={favBadge.title} style={badgeStyle(favBadge)}>
                           {favBadge.text}
                         </span>
                       )}
-                      <div style={{ width: 6, height: 6, borderRadius: '50%', background: account.color, flexShrink: 0 }} />
+                      <AccountMark accountId={account.id} color={account.color} size={6} />
                     </div>
                   </div>
                 );
@@ -1161,7 +1229,8 @@ export default function Sidebar() {
           const expanded = expandedAccounts[account.id];
           const isSelected = selectedAccountId === account.id;
           const accountFolders = folders[account.id] || [];
-          const accountHiddenPaths = hiddenFolders[account.id] || [];
+          // Only hidden folders that still exist: a deleted one must not keep the toggle (#694).
+          const accountHiddenPaths = existingHiddenPaths(hiddenFolders[account.id], accountFolders);
           const showingHidden = showHiddenFor.has(account.id);
 
           const selectInbox = () => setSelectedAccount(account.id, 'INBOX');
@@ -1220,9 +1289,7 @@ export default function Sidebar() {
                     {(account.name || account.email_address || '?').charAt(0).toUpperCase()}
                   </div>
                 ) : (
-                  <div style={{
-                    width: 8, height: 8, borderRadius: '50%',
-                    background: account.color, flexShrink: 0,
+                  <AccountMark accountId={account.id} color={account.color} size={8} style={{
                     boxShadow: account.sync_error ? '0 0 0 2px rgba(248,113,113,0.4)' : 'none',
                   }} />
                 )}
@@ -1246,9 +1313,18 @@ export default function Sidebar() {
                         </div>
                       )}
                       {account.sync_error && (
-                        <div style={{ fontSize: 11, color: 'var(--red)' }}>
-                          {t('sidebar.connectionError')}
-                        </div>
+                        <button
+                          type="button"
+                          onClick={e => { e.stopPropagation(); openAccountRow(account); }}
+                          title={t('accountErrors.label.openRow')}
+                          style={{
+                            display: 'block', padding: 0, border: 'none', background: 'none', cursor: 'pointer',
+                            fontSize: 11, color: 'var(--red)', textAlign: 'left', textDecoration: 'underline',
+                            textDecorationStyle: 'dotted', textUnderlineOffset: 2,
+                          }}
+                        >
+                          {t(describeAccountError(account).labelKey)}
+                        </button>
                       )}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
@@ -1508,7 +1584,7 @@ export default function Sidebar() {
                             fontSize: 12, color: 'var(--text-secondary)',
                             flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                           }}>
-                            {folderDisplayName(folder, t, account.folder_mappings)}
+                            {folderDisplayName(folder, t, account.folder_mappings, accountFolders)}
                           </span>
                         )}
 
@@ -1520,11 +1596,15 @@ export default function Sidebar() {
                             <button onClick={() => setRenamingFolder(null)} style={{ background: 'var(--bg-tertiary)', border: 'none', borderRadius: 4, color: 'var(--text-secondary)', padding: '2px 6px', cursor: 'pointer', fontSize: 11 }}>✕</button>
                           </div>
                         ) : (
-                          !folder.no_select && (() => {
-                            const b = unreadBadge({ count: folder.unread_count, known: folder.counts_known !== false,
-                              stale: folder.counts_stale, observedAt: folder.server_counts_at });
+                          (() => {
+                            // Collapsed with subfolders: the total including them (#536).
+                            const rolledUp = hasChildren && !isExpanded;
+                            if (folder.no_select && !rolledUp) return null;
+                            const b = rolledUp
+                              ? unreadBadge(subtreeUnread(node, path => accountHiddenPaths.includes(path)))
+                              : folderBadge(folder, account.folder_mappings, t);
                             return b && (
-                              <span title={b.title} style={{ fontSize: 10, color: 'var(--text-tertiary)', background: 'var(--bg-elevated)', padding: '1px 5px', borderRadius: 8, flexShrink: 0 }}>
+                              <span title={rolledUp ? `${b.title}, including subfolders` : b.title} style={{ ...badgeStyle(b), flexShrink: 0 }}>
                                 {b.text}
                               </span>
                             );
@@ -1805,7 +1885,7 @@ export default function Sidebar() {
 
           {/* Sign out */}
           <div
-            onClick={handleLogout}
+            onClick={() => signOut()}
             style={{
               display: 'flex', alignItems: 'center', gap: 10,
               paddingTop: 8, paddingLeft: 14, paddingRight: 14,
@@ -2007,7 +2087,7 @@ export default function Sidebar() {
             />
           )}
           <CtxMenuItem icon={ICONS.logout} label={t('sidebar.signOut')} danger
-            onClick={() => { setUserMenuOpen(false); handleLogout(); }} />
+            onClick={() => { setUserMenuOpen(false); signOut(); }} />
         </div>
       )}
 
@@ -2073,8 +2153,13 @@ export default function Sidebar() {
   );
 }
 
-function NavItem({ icon, label, active, collapsed, badge, badgeStale = false, onClick, mailboxRow = false }) {
+// `alert` (the Scheduled entry's "2 need attention") adds a red dot and is said with the label.
+function NavItem({ icon, label, active, collapsed, badge, badgeStale = false, badgeTitle, alert = null, onClick, mailboxRow = false }) {
   const navBadge = unreadBadge({ count: badge, stale: badgeStale, max: 999 });
+  // The name says what the badge and the dot show: "Scheduled, Waiting to be sent: 1, Need
+  // attention: 3". Only an entry with its own badge title (Scheduled) names its count.
+  const parts = [label, badgeTitle && navBadge ? badgeTitle : null, alert].filter(Boolean);
+  const name = parts.length > 1 ? parts.join(', ') : null;
   return (
     <div
       data-mailbox-row={mailboxRow ? '' : undefined}
@@ -2083,8 +2168,8 @@ function NavItem({ icon, label, active, collapsed, badge, badgeStale = false, on
       onKeyDown={activateOnKey(onClick)}
       role="button"
       tabIndex={0}
-      title={collapsedTooltip(label, collapsed)}
-      aria-label={collapsedTooltip(label, collapsed)}
+      title={name || collapsedTooltip(label, collapsed)}
+      aria-label={name || collapsedTooltip(label, collapsed)}
       style={{
         display: 'flex', alignItems: 'center',
         gap: 8, padding: collapsed ? '9px' : '8px 10px',
@@ -2106,8 +2191,11 @@ function NavItem({ icon, label, active, collapsed, badge, badgeStale = false, on
       {!collapsed && (
         <>
           <span style={{ fontSize: 13, fontWeight: active ? 500 : 400, flex: 1 }}>{label}</span>
+          {alert && (
+            <span data-nav-alert="" aria-hidden="true" style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--red)', flexShrink: 0 }} />
+          )}
           {navBadge && (
-            <span title={navBadge.title} style={{
+            <span title={badgeTitle || navBadge.title} style={{
               fontSize: 11, fontWeight: 600, color: 'var(--accent-text)',
               background: 'var(--accent)', padding: '1px 7px',
               borderRadius: 10, minWidth: 20, textAlign: 'center',
@@ -2117,11 +2205,11 @@ function NavItem({ icon, label, active, collapsed, badge, badgeStale = false, on
           )}
         </>
       )}
-      {collapsed && navBadge && (
+      {collapsed && (navBadge || alert) && (
         <div style={{
           position: 'absolute', top: 6, right: 6,
           width: 7, height: 7, borderRadius: '50%',
-          background: 'var(--accent)',
+          background: alert ? 'var(--red)' : 'var(--accent)',
         }} />
       )}
     </div>

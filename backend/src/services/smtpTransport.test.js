@@ -1,3 +1,4 @@
+import { createServer } from 'net';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('nodemailer', () => ({ default: { createTransport: vi.fn() } }));
@@ -116,6 +117,91 @@ describe('createSmtpTransport', () => {
     expect(isPreDeliveryConnectionError({ command: 'CONN' })).toBe(true);
     expect(isPreDeliveryConnectionError({ command: 'AUTH' })).toBe(false);
     expect(isPreDeliveryConnectionError(new Error('timeout'))).toBe(false);
+  });
+});
+
+// Its EHLO reply offers AUTH but not STARTTLS, as a relay without TLS does, or as any EHLO
+// does after someone on the path has stripped STARTTLS from it.
+async function startSmtpServerWithoutStarttls() {
+  const commands = [];
+  const sockets = new Set();
+  const server = createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    let buffered = '';
+    let inData = false;
+    socket.write('220 smtp.example.com ESMTP\r\n');
+    socket.on('data', chunk => {
+      buffered += chunk.toString('latin1');
+      let end;
+      while ((end = buffered.indexOf('\r\n')) >= 0) {
+        const line = buffered.slice(0, end);
+        buffered = buffered.slice(end + 2);
+        if (inData) {
+          if (line === '.') {
+            inData = false;
+            socket.write('250 2.0.0 Queued\r\n');
+          }
+          continue;
+        }
+        const verb = line.split(' ')[0].toUpperCase();
+        commands.push(verb);
+        if (verb === 'EHLO') socket.write('250-smtp.example.com\r\n250 AUTH PLAIN\r\n');
+        else if (verb === 'AUTH') socket.write('235 2.7.0 Authentication successful\r\n');
+        else if (verb === 'MAIL' || verb === 'RCPT') socket.write('250 2.1.0 OK\r\n');
+        else if (verb === 'DATA') {
+          inData = true;
+          socket.write('354 Go ahead\r\n');
+        } else if (verb === 'QUIT') socket.end('221 2.0.0 Bye\r\n');
+        else socket.write('502 5.5.1 Unrecognized command\r\n');
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    commands,
+    close: () => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise(resolve => server.close(resolve));
+    },
+  };
+}
+
+describe('createSmtpTransport with real SMTP sessions', () => {
+  async function sendThroughPorts(ports) {
+    const { default: realNodemailer } = await vi.importActual('nodemailer');
+    const createTransport = vi.fn(options => realNodemailer.createTransport({
+      ...options,
+      host: '127.0.0.1',
+      port: ports[options.host],
+    }));
+    const transport = createSmtpTransport(resolved, { secure: false, ignoreTLS: true }, createTransport);
+    const outcome = await transport
+      .sendMail({ from: 'sender@example.com', to: 'user@example.com', text: 'Hello' })
+      .catch(err => err);
+    return { createTransport, outcome };
+  }
+
+  it('still moves on to the next address when the first refuses the connection', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const closed = createServer();
+    await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
+    const closedPort = closed.address().port;
+    await new Promise(resolve => closed.close(resolve));
+    const healthy = await startSmtpServerWithoutStarttls();
+    try {
+      const { createTransport, outcome } = await sendThroughPorts({
+        '203.0.113.10': closedPort,
+        '203.0.113.11': healthy.port,
+      });
+
+      expect(outcome.accepted).toEqual(['user@example.com']);
+      expect(healthy.commands).toContain('DATA');
+      expect(createTransport).toHaveBeenCalledTimes(2);
+    } finally {
+      await healthy.close();
+    }
   });
 });
 
@@ -269,6 +355,16 @@ describe('createAccountSmtpTransport', () => {
     expect(result.account.oauth_access_token).toBe('valid-token');
   });
 
+  it('marks a host the connection policy refuses, so a scheduled send does not retry it', async () => {
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: false, allowInsecureTls: false });
+    resolveForConnection.mockRejectedValue(new Error('Host resolves to a private or reserved IP address'));
+    const err = await createAccountSmtpTransport({
+      smtp_host: 'mail.internal', smtp_port: 465, smtp_tls: 'SSL', auth_user: 'u', auth_pass: 'p',
+    }).catch(e => e);
+    expect(err.message).toBe('Host resolves to a private or reserved IP address');
+    expect(err.hostRefused).toBe(true);
+  });
+
   it('returns a policy error instead of creating a plain-text transport', async () => {
     const result = await createAccountSmtpTransport({
       smtp_host: 'smtp.example.com',
@@ -283,6 +379,46 @@ describe('createAccountSmtpTransport', () => {
       error: 'Plain-text SMTP is not allowed: admin must enable "Allow insecure TLS"',
     });
     expect(nodemailer.createTransport).not.toHaveBeenCalled();
+  });
+
+  async function sendToServerWithoutStarttls() {
+    const server = await startSmtpServerWithoutStarttls();
+    try {
+      const { default: realNodemailer } = await vi.importActual('nodemailer');
+      nodemailer.createTransport.mockImplementation(realNodemailer.createTransport);
+      resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'] });
+
+      const result = await createAccountSmtpTransport({
+        smtp_host: 'smtp.example.com',
+        smtp_port: server.port,
+        smtp_tls: 'STARTTLS',
+        auth_user: 'sender@example.com',
+        auth_pass: 'test-password',
+      });
+      const outcome = await result.transport
+        .sendMail({ from: 'sender@example.com', to: 'user@example.com', text: 'Hello' })
+        .catch(err => err);
+      return { commands: server.commands, outcome };
+    } finally {
+      await server.close();
+    }
+  }
+
+  it('fails instead of authenticating in cleartext when EHLO does not offer STARTTLS', async () => {
+    const { commands, outcome } = await sendToServerWithoutStarttls();
+
+    expect(commands).toEqual(['EHLO', 'STARTTLS']);
+    expect(outcome).toMatchObject({ code: 'ETLS', command: 'STARTTLS' });
+  });
+
+  it('still sends to a server without STARTTLS when the admin allows insecure TLS', async () => {
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: false, allowInsecureTls: true });
+
+    const { commands, outcome } = await sendToServerWithoutStarttls();
+
+    expect(outcome.accepted).toEqual(['user@example.com']);
+    expect(commands).toContain('AUTH');
+    expect(commands).not.toContain('STARTTLS');
   });
 });
 

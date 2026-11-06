@@ -27,6 +27,20 @@ jobs:
   validate:
     name: Validate source and version
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mailflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     outputs:
       version: ${{ steps.release.outputs.version }}
       version-name: ${{ steps.release.outputs.version-name }}
@@ -100,12 +114,20 @@ jobs:
             backend/package-lock.json
             frontend/package-lock.json
 
+      - name: Test server updater
+        run: |
+          bash -n scripts/mailflow-update.sh
+          python3 scripts/mailflow-update.test.py
+
       - name: Test and lint backend
         working-directory: backend
+        env:
+          MAILFLOW_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/mailflow_test
         run: |
           npm ci
           npm test
           npm run lint
+          npm run lint:plugins
 
       - name: Test, lint, and build frontend
         working-directory: frontend

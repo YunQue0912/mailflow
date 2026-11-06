@@ -17,8 +17,10 @@ setInterval(() => {
   }
 }, 60_000);
 
+// A user's API tokens share one bucket of their own, so a tool cannot spend the searches the
+// person is typing in the browser, and many tokens do not add up to many budgets.
 function searchLimiter(req, res, next) {
-  const key = req.session.userId;
+  const key = req.apiToken ? `tokens:${req.session.userId}` : req.session.userId;
   const now = Date.now();
   const b = searchBuckets.get(key);
   if (!b || now > b.resetAt) {
@@ -120,7 +122,10 @@ export function freeTextTermCondition(likeIdx, ftsIdx) {
         OR m.from_email ILIKE $${likeIdx}
         OR m.subject ILIKE $${likeIdx}
         OR m.search_vector @@ plainto_tsquery('english', $${ftsIdx})
-        OR to_tsvector('english', LEFT(coalesce(m.body_text,''), ${FTS_BODY_CHAR_CAP})) @@ plainto_tsquery('english', $${ftsIdx})
+        OR CASE WHEN numnode(plainto_tsquery('english', $${ftsIdx})) > 0
+          THEN to_tsvector('english', LEFT(coalesce(m.body_text,''), ${FTS_BODY_CHAR_CAP})) @@ plainto_tsquery('english', $${ftsIdx})
+          ELSE to_tsvector('simple', LEFT(coalesce(m.body_text,''), ${FTS_BODY_CHAR_CAP})) @@ plainto_tsquery('simple', $${ftsIdx})
+        END
       )`;
 }
 
@@ -241,7 +246,9 @@ router.get('/', searchLimiter, async (req, res) => {
   try {
     const result = await query(`
       SELECT
-        m.id, m.uid, m.folder, m.subject, m.from_name, m.from_email,
+        m.id, m.uid, m.folder, m.message_id, m.subject, m.from_name, m.from_email,
+        m.to_addresses, m.cc_addresses, m.reply_to, m.delivery_addresses, m.thread_id,
+        m.in_reply_to, m.thread_references,
         m.date, m.snippet, m.is_read, m.is_starred, m.has_attachments, m.account_id,
         a.name as account_name, a.email_address as account_email, a.color as account_color
       FROM messages m

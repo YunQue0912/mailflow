@@ -16,6 +16,7 @@ import { loadAiConfig } from './aiProvider.js';
 import { getActivatedPlugins } from '../plugins/activation.js';
 import { getWarningsRaw, getConnectionStats, getSyncSignalsRaw } from './diagnosticsRing.js';
 import { getPerformanceSnapshot } from './performanceMetrics.js';
+import { scheduledSendReport } from './scheduledSendStatus.js';
 
 const packageMeta = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8'));
 const BACKEND_VERSION = (process.env.APP_VERSION || packageMeta.version || '0.0.0').replace(/^v[.]?/, '');
@@ -79,7 +80,7 @@ const PII_PATTERNS = [
   /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,       // IPv4
   /\beyJ[\w-]+\.[\w-]+\.[\w-]+/,                  // JWT
   /\b[A-Fa-f0-9]{32,}\b/,                         // long hex (keys/tokens)
-  /(ghp_|gho_|sk-|xoxb-|Bearer\s+\S)/i,           // token prefixes
+  /(ghp_|gho_|sk-|xoxb-|mfat_|Bearer\s+\S)/i,     // token prefixes (mfat_: MailFlow API tokens)
 ];
 
 export function scrubReport(obj) {
@@ -213,6 +214,10 @@ export async function buildServerReport(userId, salt) {
       lastSeenAgeSeconds: Math.round((Date.now() - s.lastT) / 1000),
     }));
 
+  // Counts by status only (design 3.3). Absent when it cannot be read, as other optional parts are.
+  let scheduledSend = null;
+  try { scheduledSend = await scheduledSendReport(userId); } catch { /* leave null */ }
+
   return {
     versions: { backend: BACKEND_VERSION, gitSha: process.env.BUILD_SHA || 'dev' },
     server: { uptimeSeconds: Math.round(process.uptime()), dbOk, redisOk },
@@ -224,5 +229,6 @@ export async function buildServerReport(userId, salt) {
     connection: getConnectionStats(),
     performance: getPerformanceSnapshot(),
     config: { aiEnabled, aiProvider, plugins },
+    scheduledSend,
   };
 }

@@ -3,17 +3,45 @@ import { request as httpsRequest } from 'https';
 import { request as httpRequest } from 'http';
 import { Router } from 'express';
 import { createRemoteJWKSet, jwtVerify, customFetch } from 'jose';
-import { query, pool } from '../services/db.js';
+import { query, pool, withTransaction } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { decrypt, isEncrypted } from '../services/encryption.js';
 import { imapManager } from '../index.js';
 import { validateHost } from '../services/hostValidation.js';
 import { getConnectionPolicy } from '../services/connectionPolicy.js';
 import { logAuthEvent } from '../services/authEvents.js';
+import { aiEnabledForNewUser } from '../services/aiNewUsers.js';
+import { unlinkUserIdentity } from '../services/userIdentities.js';
+import { isUuid } from '../utils/uuid.js';
+import { recordOidcConfirmation } from '../services/oidcConfirmation.js';
+import { revokedTokensNote } from '../services/apiTokens.js';
+import { confirmReauth, oidcConfirmationState, reauthFor, userForReauth } from '../services/apiTokenReauth.js';
 
 // In-memory OIDC discovery cache keyed by issuerUrl
 const discoveryCache = new Map();
 const DISCOVERY_TTL_MS = 5 * 60 * 1000;
+// How far before a reauth flow began its id_token's auth_time may lie: clock skew, nothing more.
+const REAUTH_CLOCK_SKEW_MS = 60 * 1000;
+
+// Linking an identity takes the confirmation creating an API token does (#714): the password, the
+// two-factor code or a fresh sign-in through a provider already linked, checked by
+// POST /api/auth/oidc/link-confirm with the rule in services/apiTokenReauth.js. A session on its
+// own cannot add one, since an identity signs in as the account past a password reset and without
+// its two-factor code. The confirmation counts for five minutes, for one link: the link start
+// spends it.
+const LINK_CONFIRMATION_MS = 5 * 60 * 1000;
+
+function recordLinkConfirmation(session, userId, now = Date.now()) {
+  session.linkConfirmation = { at: now, userId };
+  return new Date(now + LINK_CONFIRMATION_MS);
+}
+
+// Whether the session's user confirmed in the last five minutes.
+function linkConfirmed(session, now = Date.now()) {
+  const record = session?.linkConfirmation;
+  if (!record || typeof record.userId !== 'string' || record.userId !== session.userId) return false;
+  return Number.isFinite(record.at) && record.at <= now && now - record.at <= LINK_CONFIRMATION_MS;
+}
 
 // Fetch that skips TLS certificate verification — only used when allow_insecure is set.
 function makeInsecureFetch(signal) {
@@ -161,7 +189,8 @@ async function maybeBackfillDisplayName(client, userId, payload) {
 // Record how the user signed in so logout can offer RP-initiated (end-session) logout.
 // The raw id_token is kept for use as id_token_hint; the provider id lets logout look up
 // its issuer and the rp_initiated_logout toggle. Both are cleared when the session is
-// destroyed at logout.
+// destroyed at logout. A sign-in does not confirm the user for creating an API token: only the
+// reauth action below does, which makes the provider ask for credentials again.
 function rememberOidcSession(req, providerId, idToken) {
   req.session.oidcProviderId = providerId;
   if (idToken) req.session.oidcIdToken = idToken;
@@ -214,9 +243,13 @@ oidcApiRouter.get('/providers', async (req, res) => {
   }
 });
 
-// List identities linked to the current user
+// List identities linked to the current user, and what linking another has to be confirmed with
+// (#714), as the API token form is told: with 'oidc', the providers a sign-in can confirm with and
+// until when the last one counts.
 oidcApiRouter.get('/identities', requireAuth, async (req, res) => {
   try {
+    const user = await userForReauth(req.session.userId);
+    if (!user) return res.status(401).json({ error: 'Not authenticated' });
     const result = await query(
       `SELECT ui.id, ui.issuer, ui.email, ui.created_at, ui.last_used_at,
               op.name AS provider_name, op.slug AS provider_slug
@@ -226,31 +259,50 @@ oidcApiRouter.get('/identities', requireAuth, async (req, res) => {
        ORDER BY ui.created_at ASC`,
       [req.session.userId]
     );
-    res.json({ identities: result.rows });
+    const reauth = await reauthFor(user);
+    res.json({
+      identities: result.rows,
+      reauth,
+      ...(reauth === 'oidc' ? { oidc: await oidcConfirmationState(req, user) } : {}),
+    });
   } catch {
     res.status(500).json({ error: 'Failed to load identities' });
   }
 });
 
-// Unlink an identity from the current user
-oidcApiRouter.delete('/identities/:id', requireAuth, async (req, res) => {
+// Confirms the user before a link (#714), as creating an API token is confirmed and with its
+// refusals, limits and log entries (never 401: the web client signs out on one). A fresh sign-in
+// through single sign-on is spent here, as a token spends it. The link start takes what this
+// records, once, within five minutes.
+oidcApiRouter.post('/link-confirm', requireAuth, async (req, res) => {
   try {
-    // Prevent removing the last login method when no password is set
-    const userResult = await query('SELECT password_hash FROM users WHERE id = $1', [req.session.userId]);
-    const hasPassword = !!userResult.rows[0]?.password_hash;
-    if (!hasPassword) {
-      const countResult = await query(
-        'SELECT COUNT(*) AS count FROM user_identities WHERE user_id = $1',
-        [req.session.userId]
-      );
-      if (parseInt(countResult.rows[0].count) <= 1) {
-        return res.status(400).json({ error: 'Cannot unlink your only login method. Set a password first.' });
-      }
+    const user = await userForReauth(req.session.userId);
+    if (!user) return res.status(401).json({ error: 'Not authenticated' });
+    const { refusal } = await confirmReauth(req, user, await reauthFor(user));
+    if (refusal) return res.status(refusal.status).set(refusal.headers ?? {}).json(refusal.body);
+    const until = recordLinkConfirmation(req.session, user.id);
+    res.json({ ok: true, until: until.toISOString() });
+  } catch (err) {
+    console.error('OIDC link confirmation error:', err.message);
+    res.status(500).json({ error: 'Failed to confirm' });
+  }
+});
+
+// Unlink an identity from the current user, unless it is their last way to sign in: with no
+// identity left they need a password, and password sign-in turned on (#714). The API tokens
+// confirmed through its provider go with the user's last identity there (#617).
+oidcApiRouter.delete('/identities/:id', requireAuth, async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Identity not found' });
+  try {
+    const result = await withTransaction(client => unlinkUserIdentity(client, req.session.userId, req.params.id));
+    if (result.notFound) return res.status(404).json({ error: 'Identity not found' });
+    if (result.lastSignIn) {
+      return res.status(400).json({ error: 'Cannot unlink your only login method. Set a password first.' });
     }
-    await query(
-      'DELETE FROM user_identities WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.session.userId]
-    );
+    logAuthEvent('identity_unlinked', { userId: req.session.userId, username: req.session.username, ip: req.ip, success: true });
+    if (result.revokedTokens) {
+      console.log(`[oidc] user ${req.session.userId} unlinked their last identity at ${result.identity.provider_slug}${revokedTokensNote(result.revokedTokens)}`);
+    }
     res.json({ ok: true });
   } catch {
     res.status(500).json({ error: 'Failed to unlink identity' });
@@ -265,20 +317,36 @@ export default oidcApiRouter;
 export const oidcBrowserRouter = Router();
 
 // Error redirect: login-flow errors go to /login?oidc_error= (shown on LoginPage);
-// link-flow errors go to /?oidc_error= (shown as a toast inside MailApp).
+// link- and reauth-flow errors go to /?oidc_error= (shown as a toast inside MailApp).
 function oidcError(res, action, message) {
-  const base = action === 'link' ? '/' : '/login';
+  const base = action === 'link' || action === 'reauth' ? '/' : '/login';
   return res.redirect(`${base}?oidc_error=${encodeURIComponent(message)}`);
 }
 
-// Step 1: redirect the browser to the OIDC provider's authorization endpoint
+// Step 1: redirect the browser to the OIDC provider's authorization endpoint.
+// action=link adds an identity to the signed-in account, once its user has confirmed (#714);
+// action=reauth has the provider vouch again for the signed-in user, which creating an API token
+// needs when the account cannot sign in with a password (#617).
 oidcBrowserRouter.get('/:slug/start', async (req, res) => {
   const { slug } = req.params;
-  const isLink = req.query.action === 'link';
-  const action = isLink ? 'link' : 'login';
+  const action = ['link', 'reauth'].includes(req.query.action) ? req.query.action : 'login';
+  const isLink = action === 'link';
 
-  if (isLink && !req.session?.userId) {
+  if (action !== 'login' && !req.session?.userId) {
     return oidcError(res, action, 'Not authenticated');
+  }
+  // The screen-lock gate in index.js (#235) covers only /api, not this router. A locked session
+  // must not link another identity to the account, or sign in again to get an unlocked session.
+  if (req.session?.locked) {
+    return oidcError(res, action, 'Screen was locked — please try again');
+  }
+  // A link takes a confirmation just given (POST /api/auth/oidc/link-confirm), and spends it: the
+  // next link needs one of its own. Refused before the provider is looked up.
+  if (isLink) {
+    if (!linkConfirmed(req.session)) {
+      return oidcError(res, action, 'Confirm it is you first — link from Settings → Security');
+    }
+    delete req.session.linkConfirmation;
   }
 
   try {
@@ -303,6 +371,9 @@ oidcBrowserRouter.get('/:slug/start', async (req, res) => {
       providerId: provider.id,
       action,
       linkUserId: isLink ? req.session.userId : undefined,
+      reauthUserId: action === 'reauth' ? req.session.userId : undefined,
+      // The callback checks the id_token's auth_time against this.
+      startedAt: action === 'reauth' ? Date.now() : undefined,
       expiresAt: Date.now() + 10 * 60 * 1000,
     };
 
@@ -316,6 +387,13 @@ oidcBrowserRouter.get('/:slug/start', async (req, res) => {
       code_challenge: challenge,
       code_challenge_method: 'S256',
     });
+    // A reauth has to be a sign-in just made, not a session the provider still holds: prompt=login
+    // and max_age=0 make it ask for credentials again, and max_age also makes auth_time required
+    // in the id_token, which the callback checks, since not every provider honours either.
+    if (action === 'reauth') {
+      params.set('prompt', 'login');
+      params.set('max_age', '0');
+    }
 
     // Save session before redirecting so the PKCE verifier and state nonce are
     // committed to the store before the provider redirects back with the code.
@@ -333,6 +411,12 @@ oidcBrowserRouter.get('/:slug/callback', async (req, res) => {
 
   const pending = req.session.oidcPending;
   const pendingAction = pending?.action || 'login';
+
+  // Also covers a flow that started before the lock, e.g. auto-lock in another tab.
+  if (req.session.locked) {
+    delete req.session.oidcPending;
+    return oidcError(res, pendingAction, 'Screen was locked — please try again');
+  }
 
   if (error) {
     console.error('OIDC provider error:', error, error_description);
@@ -438,7 +522,8 @@ oidcBrowserRouter.get('/:slug/callback', async (req, res) => {
 
     // ── Link action: add this identity to an already-authenticated account ────
     if (pending.action === 'link') {
-      if (!pending.linkUserId) {
+      // Only for the user who started it, still signed in on this session, as reauth requires too.
+      if (!pending.linkUserId || req.session.userId !== pending.linkUserId) {
         return oidcError(res, 'link', 'Link session invalid');
       }
       try {
@@ -453,7 +538,37 @@ oidcBrowserRouter.get('/:slug/callback', async (req, res) => {
         }
         throw err;
       }
+      // Logged so a link shows in the admin's security log (#714).
+      logAuthEvent('identity_linked', { userId: pending.linkUserId, username: req.session.username, ip: req.ip, success: true });
       return res.redirect('/?oidc_success=linked');
+    }
+
+    // ── Reauth action: the provider vouches again for the signed-in user ───────
+    // Only for the identity linked to the user who started it, still signed in on this session.
+    // Nothing else about the session changes.
+    if (pending.action === 'reauth') {
+      const { rows: [identity] } = await client.query(
+        'SELECT user_id FROM user_identities WHERE issuer = $1 AND subject = $2',
+        [issuer, subject]
+      );
+      if (!pending.reauthUserId || identity?.user_id !== pending.reauthUserId
+          || req.session.userId !== pending.reauthUserId) {
+        return oidcError(res, 'reauth', 'That sign-in is not linked to your account');
+      }
+      // The provider must have asked for credentials again: auth_time has to be there (max_age was
+      // requested) and from after this flow began. A session the provider kept would carry an
+      // older one, or none.
+      const authTime = Number.isFinite(payload.auth_time) ? payload.auth_time * 1000 : null;
+      if (!Number.isFinite(pending.startedAt) || authTime === null || authTime < pending.startedAt - REAUTH_CLOCK_SKEW_MS) {
+        return oidcError(res, 'reauth', 'Sign in again at your provider to confirm');
+      }
+      await client.query(
+        'UPDATE user_identities SET last_used_at = NOW() WHERE issuer = $1 AND subject = $2',
+        [issuer, subject]
+      );
+      recordOidcConfirmation(req.session, pending.reauthUserId, provider);
+      await new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()));
+      return res.redirect('/?oidc_success=reauth');
     }
 
     // ── Login action: find or provision a MailFlow user ───────────────────────
@@ -533,12 +648,16 @@ oidcBrowserRouter.get('/:slug/callback', async (req, res) => {
         user.is_admin = adminFromClaim;
       }
 
-      await client.query(
+      const { rows: [linkedRow] } = await client.query(
         `INSERT INTO user_identities (user_id, provider_id, issuer, subject, email, email_verified, last_used_at)
          VALUES ($1, $2, $3, $4, $5, $6, NOW())
-         ON CONFLICT (issuer, subject) DO UPDATE SET last_used_at = NOW()`,
+         ON CONFLICT (issuer, subject) DO UPDATE SET last_used_at = NOW()
+         RETURNING (xmax = 0) AS linked`,
         [user.id, provider.id, issuer, subject, email, emailVerified]
       );
+      if (linkedRow?.linked) {
+        logAuthEvent('identity_linked', { userId: user.id, username: user.username, ip: req.ip, success: true });
+      }
       await maybeBackfillDisplayName(client, user.id, payload);
       await new Promise((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
       req.session.userId = user.id;
@@ -585,8 +704,8 @@ oidcBrowserRouter.get('/:slug/callback', async (req, res) => {
           // be created through local registration.
           const isAdmin = adminFromClaim === true;
           const newUser = await client.query(
-            'INSERT INTO users (username, password_hash, is_admin) VALUES ($1, NULL, $2) RETURNING id, username, is_admin',
-            [email.toLowerCase(), isAdmin]
+            'INSERT INTO users (username, password_hash, is_admin, ai_enabled) VALUES ($1, NULL, $2, $3) RETURNING id, username, is_admin',
+            [email.toLowerCase(), isAdmin, await aiEnabledForNewUser(client)]
           );
           user = newUser.rows[0];
           if (isFirstUser) {
@@ -596,14 +715,18 @@ oidcBrowserRouter.get('/:slug/callback', async (req, res) => {
             );
           }
         }
-        await client.query(
+        const { rows: [linkedRow] } = await client.query(
           `INSERT INTO user_identities (user_id, provider_id, issuer, subject, email, email_verified, last_used_at)
            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-           ON CONFLICT (issuer, subject) DO UPDATE SET last_used_at = NOW()`,
+           ON CONFLICT (issuer, subject) DO UPDATE SET last_used_at = NOW()
+           RETURNING (xmax = 0) AS linked`,
           [user.id, provider.id, issuer, subject, email, emailVerified]
         );
         await maybeBackfillDisplayName(client, user.id, payload);
         await client.query('COMMIT');
+        if (linkedRow?.linked) {
+          logAuthEvent('identity_linked', { userId: user.id, username: user.username, ip: req.ip, success: true });
+        }
         await new Promise((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
         req.session.userId = user.id;
         req.session.username = user.username;

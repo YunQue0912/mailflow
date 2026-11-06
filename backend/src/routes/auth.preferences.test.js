@@ -55,10 +55,10 @@ describe('PATCH /auth/preferences folderOrder', () => {
     const [sql, params] = query.mock.calls[0];
     expect(sql).toContain('SET preferences = preferences');
     expect(sql).toContain(
-      "jsonb_build_object('folderOrder', $40::jsonb)",
+      "jsonb_build_object('folderOrder', $39::jsonb)",
     );
     expect(params[0]).toBe('user-1');
-    expect(params[39]).toBe(JSON.stringify(folderOrder));
+    expect(params[38]).toBe(JSON.stringify(folderOrder));
     expect(res.json).toHaveBeenCalledWith({ ok: true });
   });
 });
@@ -75,10 +75,10 @@ describe('PATCH /auth/preferences senderFavicons', () => {
 
     const [sql, params] = query.mock.calls[0];
     expect(sql).toContain(
-      "jsonb_build_object('senderFavicons', $41::boolean)",
+      "jsonb_build_object('senderFavicons', $40::boolean)",
     );
     expect(params[0]).toBe('user-1');
-    expect(params[40]).toBe(true);
+    expect(params[39]).toBe(true);
     expect(res.json).toHaveBeenCalledWith({ ok: true });
   });
 
@@ -110,38 +110,26 @@ describe('PATCH /auth/preferences defaultSender (#417)', () => {
   it('persists an account default', async () => {
     const res = await run({ defaultSender: `account:${A}` });
     const [sql, params] = query.mock.calls[0];
-    expect(sql).toContain("jsonb_build_object('defaultSender', $43::text)");
-    expect(params[42]).toBe(`account:${A}`);
-    expect(res.json).toHaveBeenCalledWith({ ok: true });
-  });
-
-  it('saves the custom conversation mode alongside default sender without shifting other preferences', async () => {
-    const res = await run({ conversationMode: 'pane', defaultSender: `account:${A}`, showMessagePreviews: false });
-    const [sql, params] = query.mock.calls[0];
-    expect(sql).toContain("jsonb_build_object('conversationMode', $39::text)");
-    expect(sql).toContain("jsonb_build_object('showMessagePreviews', $42::boolean)");
-    expect(sql).toContain("jsonb_build_object('defaultSender', $43::text)");
-    expect(params[38]).toBe('pane');
-    expect(params[41]).toBe(false);
-    expect(params[42]).toBe(`account:${A}`);
+    expect(sql).toContain("jsonb_build_object('defaultSender', $42::text)");
+    expect(params[41]).toBe(`account:${A}`);
     expect(res.json).toHaveBeenCalledWith({ ok: true });
   });
 
   it('persists an alias default, so an identity can be the default and not just an account', async () => {
     await run({ defaultSender: `alias:${A}:${B}` });
-    expect(query.mock.calls[0][1][42]).toBe(`alias:${A}:${B}`);
+    expect(query.mock.calls[0][1][41]).toBe(`alias:${A}:${B}`);
   });
 
   it('persists an empty string, which is how the preference is cleared', async () => {
     // '' is meaningful: it means "no preference, fall back to last used". It must be
     // written rather than treated as an absent key, or clearing would silently no-op.
     await run({ defaultSender: '' });
-    expect(query.mock.calls[0][1][42]).toBe('');
+    expect(query.mock.calls[0][1][41]).toBe('');
   });
 
   it('leaves the stored value untouched when the key is absent', async () => {
     await run({ theme: 'dark' });
-    expect(query.mock.calls[0][1][42]).toBe(null);
+    expect(query.mock.calls[0][1][41]).toBe(null);
   });
 
   it('rejects malformed values instead of storing something unusable', async () => {
@@ -181,4 +169,91 @@ describe('PATCH /auth/preferences hoverActionSet (#440)', () => {
     await call({ hoverActionSet: 'markRead' }); // not an array — ignored, not stored
     expect(query.mock.calls[0][1][43]).toBeNull();
   });
+});
+
+
+describe('PATCH /auth/preferences autoOpenReplyDrafts', () => {
+  for (const value of [true, false]) it(`persists explicit ${value}`, async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { autoOpenReplyDrafts: value } }, res);
+    expect(query.mock.calls[0][0]).toContain("jsonb_build_object('autoOpenReplyDrafts', $45::boolean)");
+    expect(query.mock.calls[0][1][44]).toBe(value);
+  });
+  it('rejects a nonboolean without a write', async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { autoOpenReplyDrafts: 'true' } }, res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /auth/preferences afterRemove (#572)', () => {
+  it.each(['next', 'previous', 'list'])('stores %s', async (value) => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { afterRemove: value } }, res);
+    expect(query.mock.calls[0][0]).toContain("jsonb_build_object('afterRemove', $46::text)");
+    expect(query.mock.calls[0][1][45]).toBe(value);
+  });
+
+  it.each(['open', '', 3, null])('ignores %p', async (value) => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { afterRemove: value } }, res);
+    expect(query.mock.calls[0][1][45]).toBeNull();
+  });
+});
+
+describe('PATCH /auth/preferences darkEmailBodies (#228)', () => {
+  for (const value of [true, false]) it(`persists explicit ${value}`, async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { darkEmailBodies: value } }, res);
+    expect(query.mock.calls[0][0]).toContain("jsonb_build_object('darkEmailBodies', $47::boolean)");
+    expect(query.mock.calls[0][1][46]).toBe(value);
+  });
+  it('rejects a nonboolean without a write', async () => {
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { darkEmailBodies: 'yes' } }, res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /auth/preferences listSort', () => {
+  const res = () => ({ status: vi.fn().mockReturnThis(), json: vi.fn() });
+  const account = '22222222-2222-4222-8222-222222222222';
+
+  it('stores each folder\'s order and leaves out folders at the default', async () => {
+    const listSort = {
+      [`${account}:Archive`]: { sort: 'from', dir: 'asc', starredFirst: false },
+      'all:INBOX': { sort: 'date', dir: 'desc', starredFirst: true },
+      [`${account}:INBOX`]: { sort: 'date', dir: 'desc', starredFirst: false },
+    };
+    await patchPreferences({ session: { userId: 'user-1' }, body: { listSort } }, res());
+
+    const [sql, params] = query.mock.calls[0];
+    expect(sql).toContain("jsonb_build_object('listSort', $48::jsonb)");
+    expect(JSON.parse(params[47])).toEqual({
+      [`${account}:Archive`]: { sort: 'from', dir: 'asc', starredFirst: false },
+      'all:INBOX': { sort: 'date', dir: 'desc', starredFirst: true },
+    });
+  });
+
+  it('leaves listSort alone when it is not sent', async () => {
+    await patchPreferences({ session: { userId: 'user-1' }, body: { pageSize: '50' } }, res());
+    expect(query.mock.calls[0][1][47]).toBeNull();
+  });
+
+  for (const [name, listSort] of [
+    ['an array', []],
+    ['an unknown order', { 'all:INBOX': { sort: 'size' } }],
+    ['an unknown direction', { 'all:INBOX': { sort: 'from', dir: 'up' } }],
+    ['a key without an account', { INBOX: { sort: 'from' } }],
+    ['a non-boolean starredFirst', { 'all:INBOX': { starredFirst: 'yes' } }],
+  ]) {
+    it(`refuses ${name}`, async () => {
+      const r = res();
+      await patchPreferences({ session: { userId: 'user-1' }, body: { listSort } }, r);
+      expect(r.status).toHaveBeenCalledWith(400);
+      expect(query).not.toHaveBeenCalled();
+    });
+  }
 });

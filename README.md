@@ -9,18 +9,21 @@
 <p align="center">
   <a href="#installation">Quick Start</a> ·
   <a href="#email-provider-setup">Setup Guide</a> ·
-  <a href="https://mailflow.sh/#supporters">Contributing</a> ·
+  <a href="#supporters">Support MailFlow</a> ·
   <a href="https://mailflow.sh/#roadmap">Roadmap</a>
 </p>
 
 ## Licensing
 
-MailFlow is dual-licensed:
+Licensing and paid options:
 
-- **[AGPL-3.0](LICENSE)** — free for personal use, self-hosting, and open-source projects. If you modify and distribute or host MailFlow, you must publish your changes under the same license.
-- **[Commercial License](LICENSE-COMMERCIAL)** — $500 per installation, one-time. For businesses or deployments where AGPL obligations cannot be met. [Purchase here](https://mailflow.sh/#pricing).
+- **[AGPL-3.0](LICENSE)**: free for everyone, individuals and businesses, to self-host. If you modify MailFlow and let others use it over a network, you must publish your changes under the same license.
+- **Business License**: $100 per instance per year, plus tax. MailFlow is free for everyone under the AGPL, including businesses. If you use it in a business, we ask you to buy a yearly license to support development. It isn't legally required or enforced. [Buy one here](https://mailflow.sh/#pricing), or sponsor at $40/month on [GitHub Sponsors](https://github.com/sponsors/maathimself), which includes one.
+- **[Private modifications license](LICENSE-COMMERCIAL)** (commercial license): $500 per installation, one-time, plus tax. Only for a business that wants to modify MailFlow and run it without publishing its changes; most businesses don't need it. [Purchase here](https://mailflow.sh/#pricing).
+- **Hosting providers and MSPs**: partner plans for offering MailFlow to your customers: a revenue share for hosting platforms, or MSP plans: Starter at $500 per year for 5 client instances, and Partner at $1,200 per year for 20 (plus tax). Partners are listed on mailflow.sh and get an email before each security release with its date and severity; the fix itself is public to everyone at the same time. [Details](https://mailflow.sh/#pricing), or get in touch at contact@mailflow.sh.
+- **Business support**: from $600 per year, plus tax, for teams that rely on MailFlow, with help setting up, priority answers and a say in the roadmap. Includes a business license. Get in touch at contact@mailflow.sh.
 
-**Personal self-hosting is free and always will be.** This licensing model exists to protect the project from commercial exploitation while keeping MailFlow freely available to individuals and families.
+**Personal self-hosting is free and always will be.**
 
 If you contribute code, please read the [Contributor License Agreement](CLA.md). By submitting a pull request you agree to its terms.
 
@@ -35,12 +38,12 @@ If you contribute code, please read the [Contributor License Agreement](CLA.md).
 - **Attachments** — send and receive file attachments across all accounts
 - **Multiple layouts** — classic, compact, wide reader, vertical split, and more
 - **Multiple themes** — dark, light, and several color schemes; custom CSS field for per-user style overrides
-- **Multi-language UI** — English, French, Spanish, Italian, German, Russian, Simplified Chinese, Polish, Czech, and Brazilian Portuguese
+- **Multi-language UI** — English, French, Spanish, Italian, German, Russian, Simplified Chinese, Polish, Czech, Brazilian Portuguese, and Korean
 - **Full-text search** — across all connected accounts simultaneously
 - **Real-time notifications** — WebSocket-powered new-mail toasts and web push notifications
 - **PWA** — installable as a desktop or mobile app with push notification support
 - **Command palette** — Cmd+K / Ctrl+K quick-access for actions and navigation
-- **Keyboard shortcuts** — full shortcut set, fully customisable per user
+- **Keyboard shortcuts** — full shortcut set, fully customizable per user
 - **Smart contact autocomplete** — learns from sent mail to rank suggestions
 - **Reply / Forward / Compose** — correct per-account SMTP routing; font family groups, email priority
 - **Folder navigation** — expand any account to browse folders
@@ -51,7 +54,7 @@ If you contribute code, please read the [Contributor License Agreement](CLA.md).
 - **Block list** — automatically move mail from blocked senders to trash before inbox rules run
 - **Spam reporting** — mark messages as spam or not spam from the context menu, toolbar, or bulk actions; feedback will feed into automated filtering in a future release
 - **Snooze** — snooze messages until a chosen time; they reappear at the top of the inbox
-- **AI assistant** — use an OpenAI-compatible API provider or a ChatGPT Codex subscription; summarise threads, draft replies, ask questions about a message
+- **AI assistant** — use an OpenAI-compatible API provider or a ChatGPT Codex subscription; summarize threads, draft replies, ask questions about a message; admins choose which users may use it
 - **Password recovery** — recover your account via a recovery email address configured in profile settings
 - **User management** — admin panel, invite-only registration, invite emails
 - **Two-factor authentication** — TOTP (any authenticator app), email OTP fallback, persistent device trust; admin-configurable enforcement policy
@@ -76,9 +79,12 @@ itself:
 - **Reference** — kept until you remove the label or mark the thread done.
 
 Label the selected thread from the keyboard — **t** for Todo, **w** for Watch,
-**d** for Delegated (all remappable in the keyboard-shortcut settings) — or from the
-context menu, which also covers Someday and Reference. Each state's folder name is
-configurable per account, and accounts with GTD off behave exactly as before.
+**d** for Delegated, **v** for Reference, **b** for Someday, and **Shift+E** for Done
+(all remappable in the keyboard-shortcut settings) — or from the context menu. Each state's folder name is
+configurable per account. Applying a GTD state preserves every member in the target before removing the
+thread's old GTD copies. Inbox and ordinary labels remain intact. A state switch
+ends pending Undo windows; an initial classification still offers Undo when supported. Accounts
+with GTD off behave exactly as before.
 
 ---
 
@@ -156,10 +162,11 @@ MailFlow will be available on port 443 (HTTPS, self-signed certificate) and port
 
 **Ports are configurable in `.env`:**
 
-| Variable        | Default | Description |
-| --------------- | ------- | ----------- |
-| `APP_PORT`      | `443`   | HTTPS port  |
-| `APP_HTTP_PORT` | `80`    | HTTP port   |
+| Variable | Default | Description |
+|---|---|---|
+| `APP_PORT` | `443` | HTTPS port |
+| `APP_HTTP_PORT` | `80` | HTTP port |
+| `NGINX_TLS` | `on` | `off` stops serving HTTPS on `APP_PORT` (see below) |
 
 **Optional — automatic HTTPS via Let's Encrypt:** set `DOMAIN` and `ACME_EMAIL` in `.env`, download the HTTPS overlay, then restart:
 
@@ -170,7 +177,9 @@ docker compose -f docker-compose.yml -f docker-compose.https.yml --profile https
 
 This adds a Caddy reverse proxy that handles certificate issuance and renewal automatically. Requires Docker Compose 2.21+, a public domain with DNS pointing at the server, and ports 80/443 open.
 
-**Optional — behind your own reverse proxy:** point your proxy at port 80. Set `APP_HTTP_PORT` in `.env` if you need a different host port. Your proxy should forward `X-Forwarded-Proto: https` so that session cookies are marked Secure correctly.
+**Optional — behind your own reverse proxy:** point your proxy at port 80. Set `APP_HTTP_PORT` in `.env` if you need a different host port. Your proxy should forward `X-Forwarded-Proto: https` so that session cookies are marked Secure correctly. To stop MailFlow's nginx serving HTTPS on port 443 and generating a certificate, set `NGINX_TLS=off` in `.env`. This needs a writable `/etc/nginx/conf.d`, so on a read-only filesystem mount a certificate in `/etc/nginx/ssl` instead. The `--profile https` setup always keeps HTTPS on, because Caddy connects to it.
+
+If clients can reach MailFlow only through your proxy, also set `TRUST_PROXY_HOPS=2` in `.env`, so the login rate limit sees each client's address rather than the proxy's. Docker publishes `APP_PORT` and `APP_HTTP_PORT` on every interface, and firewalls such as ufw do not filter them, so first bind both to an address only your proxy can reach, for example `APP_HTTP_PORT=127.0.0.1:8080` and `APP_PORT=127.0.0.1:8443` for a proxy on the same host. Without that, leave `TRUST_PROXY_HOPS` unset: a client that connects directly could choose the address it is rate-limited and logged under. If your `docker-compose.yml` has no `TRUST_PROXY_HOPS` line, download it again with the first command in step 1, or the setting never reaches the backend.
 
 ### 4. Create your admin account
 
@@ -190,7 +199,7 @@ docker compose pull
 docker compose up -d
 ```
 
-To pin to a specific version instead of `latest`, add `MAILFLOW_VERSION=2.7.0` to your `.env`.
+To pin to a specific version instead of `latest`, add `MAILFLOW_VERSION=4.0.4` to your `.env`.
 
 ---
 
@@ -236,7 +245,9 @@ First build takes 2–3 minutes. MailFlow will be available on port 443 (HTTPS, 
 docker compose -f docker-compose.yml -f docker-compose.https.yml --profile https up -d --build
 ```
 
-**Optional — behind your own reverse proxy:** point your proxy at port 80. Your proxy should forward `X-Forwarded-Proto: https` so that session cookies are marked Secure correctly.
+**Optional — behind your own reverse proxy:** point your proxy at port 80. Your proxy should forward `X-Forwarded-Proto: https` so that session cookies are marked Secure correctly. To stop MailFlow's nginx serving HTTPS on port 443 and generating a certificate, set `NGINX_TLS=off` in `.env`. This needs a writable `/etc/nginx/conf.d`, so on a read-only filesystem mount a certificate in `/etc/nginx/ssl` instead. The `--profile https` setup always keeps HTTPS on, because Caddy connects to it.
+
+If clients can reach MailFlow only through your proxy, also set `TRUST_PROXY_HOPS=2` in `.env`, so the login rate limit sees each client's address rather than the proxy's. Docker publishes `APP_PORT` and `APP_HTTP_PORT` on every interface, and firewalls such as ufw do not filter them, so first bind both to an address only your proxy can reach, for example `APP_HTTP_PORT=127.0.0.1:8080` and `APP_PORT=127.0.0.1:8443` for a proxy on the same host. Without that, leave `TRUST_PROXY_HOPS` unset: a client that connects directly could choose the address it is rate-limited and logged under.
 
 ### 4. Create your admin account
 
@@ -346,7 +357,7 @@ sudo cp /opt/mailflow/contrib/nginx.conf /etc/nginx/sites-available/mailflow
 
 Open `/etc/nginx/sites-available/mailflow` and replace `/path/to/mailflow/frontend/dist` with `/opt/mailflow/frontend/dist`.
 
-The provided config listens on port 80 for use behind a TLS-terminating reverse proxy (Nginx/Caddy/Traefik). If you want nginx to terminate TLS directly, uncomment the HTTPS server block in the file and set your certificate paths. A quick self-signed cert:
+The provided config listens on port 80 for use behind a TLS-terminating reverse proxy (Nginx/Caddy/Traefik). If clients can reach nginx only through that proxy, set `TRUST_PROXY_HOPS=2` in `.env`, so the login rate limit sees each client's address rather than the proxy's. With the proxy on the same host, you can ensure that by changing `listen 80;` to `listen 127.0.0.1:8080;` and pointing the proxy there. Without that, leave `TRUST_PROXY_HOPS` unset: a client that connects to nginx directly could choose the address it is rate-limited and logged under. If you want nginx to terminate TLS directly, uncomment the HTTPS server block in the file and set your certificate paths. A quick self-signed cert:
 
 ```bash
 sudo mkdir -p /etc/ssl/mailflow
@@ -448,16 +459,47 @@ Gmail requires an **App Password** (not your normal password):
 ### Microsoft 365 / Outlook (OAuth2)
 
 Microsoft has disabled basic (password) auth for Outlook.com, Hotmail, and most
-Microsoft 365 accounts, so they connect via OAuth2 under **Settings → Integrations →
-Microsoft 365** (not the normal Add Account form). This is a one-time setup: you
-create a free [Microsoft Entra app registration](https://portal.azure.com) once, and
-the same app then serves every account and user on your instance.
+Microsoft 365 accounts, so they connect with **Sign in with Microsoft**: in **Settings →
+Accounts → Add account**, type the address or pick **Outlook.com, Hotmail, Live, MSN** or
+**Microsoft 365 (work or school)**. Administrators configure how this works under
+**Settings → Email providers**.
+
+**Personal accounts (Outlook.com, Hotmail, Live, MSN) need no setup.** MailFlow shows a
+code; open [microsoft.com/devicelogin](https://microsoft.com/devicelogin) on any device
+and enter it. In Outlook.com, IMAP must be allowed first: **Settings → Mail → Forwarding
+and IMAP → Let devices and apps use IMAP**. When your instance has no Microsoft app of
+its own that accepts personal accounts, this sign-in uses MailFlow's registered public
+app, which accepts personal Microsoft accounts only. The app only identifies MailFlow to Microsoft: you
+sign in on Microsoft's own page in your browser, Microsoft sends the tokens straight
+to your server, and MailFlow's maintainers never see your mail or tokens. Microsoft
+may label the app **"unverified"** on the consent screen; that refers to the
+publisher verification status of the app registration and does not change what the
+app can access.
+
+To stop offering the shared app, turn off **Let people sign in with MailFlow's shared
+app** in Settings → Email providers, or set `MS_BUILTIN_APP=false` in `.env`.
+Once the switch has been used, its setting takes precedence over `MS_BUILTIN_APP`.
+Turning it off stops new sign-ins through the shared app; accounts already connected
+through it keep refreshing through it. Personal accounts then need your own app
+registration, as below.
+
+**Your own app registration** is needed for work / school accounts, and is an
+option for admins who prefer not to use the shared app. Once its Client ID is saved,
+work and school sign-ins use it, and so do personal ones if its tenant admits them
+(`common` or `consumers`); with a tenant limited to organizations, personal accounts keep
+using the shared app while it is on. Personal accounts already connected
+through MailFlow's shared app keep working through it when you add your own app,
+because each account remembers the app it was connected with. It is a one-time
+setup: you create a free [Microsoft Entra app registration](https://portal.azure.com)
+once, and the same app then serves every account and user on your instance. If you
+later replace the app with a different one, reconnect the accounts that were connected
+through the old one.
 
 **1. Register the app.** In the Azure portal, go to **Microsoft Entra ID → App
 registrations → New registration**. Under **Supported account types**, choose
 **"Accounts in any organizational directory and personal Microsoft accounts"** so it
 covers both Outlook.com/Hotmail and work/school accounts. After creating it, copy the
-**Application (Client) ID**.
+**Application (client) ID**.
 
 **2. Grant the mail permissions.** Open the app's **API permissions** page and add
 both of these, then follow the consent note:
@@ -476,25 +518,27 @@ both of these, then follow the consent note:
 
 Then follow the steps for your account type:
 
-**Personal accounts (Outlook.com / Hotmail)** (public client, device code):
+**Personal accounts with your own app** (public client, device code):
 
 1. In the Azure app, open **Authentication** and set **"Allow public client flows"**
    to **Yes**. No client secret or redirect URI is needed.
-2. In Integrations → Microsoft 365, enter the **Client ID** and **Tenant ID**
-   (`common`), leave Client Secret and Redirect URI blank, then save.
-3. Start the device-code flow shown there. MailFlow displays a short code; visit
-   [microsoft.com/devicelogin](https://microsoft.com/devicelogin) and enter it to
-   authorise.
+2. In Settings → Email providers → **Set up your own Microsoft Entra app**, enter the
+   **Application (client) ID** and **Directory (tenant) ID** (`common`), leave Client
+   secret and Redirect URI blank, then save.
+3. People then add their accounts under Accounts → Add account, which shows the code to
+   enter at [microsoft.com/devicelogin](https://microsoft.com/devicelogin).
 
 **Work / school accounts (Microsoft 365)** (confidential client):
 
 1. In the Azure app, open **Authentication → Add a platform → Web**, and set the
    redirect URI to `https://<your-mailflow-host>/oauth/microsoft/callback` (the exact
-   value is shown on the Integrations screen).
+   value is shown under Settings → Email providers).
 2. Under **Certificates & secrets → New client secret**, create a secret and copy its
    **Value** (not the Secret ID).
-3. In Integrations → Microsoft 365, enter the Client ID, Tenant ID, Client Secret,
-   and Redirect URI, then save and click **Connect Microsoft account**.
+3. In Settings → Email providers, enter the Application (client) ID, Directory (tenant) ID,
+   Client secret and Redirect URI, then save. People then add their accounts under
+   Accounts → Add account → **Microsoft 365 (work or school)**, which signs in on
+   Microsoft's page.
 
 ### Custom IMAP
 
@@ -536,6 +580,18 @@ git pull && \
 ```
 
 ## Backup and Restore
+
+Settings → Backup (admin only) downloads a backup of the installation's data: users, email accounts, rules, contacts, settings, plugin data and antispam training. Cached mail is downloaded again from the mail servers after a restore, unless **Include cached mail** is on, which adds the local copy of every synced message to the file. Without it, the newest unread messages in each inbox arrive as new mail after a restore, so inbox rules, forwarding included, run on them again.
+
+The file does not hold what is set in `.env`. A new server needs the same `ENCRYPTION_KEY`, and the same VAPID keys and OAuth client settings if they are set there; with new VAPID keys, push notifications stop until each browser subscribes again.
+
+The file holds password hashes, pending invite links and the accounts' credentials. The credentials are encrypted with `ENCRYPTION_KEY`; the rest is readable, and so is every message when cached mail is included, so keep the file safe.
+
+Restoring replaces everything on the server with the file's contents, then MailFlow restarts. Docker, pm2 and the systemd unit in `contrib/` start it again; a MailFlow started by hand has to be started again the same way. Anyone whose account is not in the backup is signed out, and the passwords are the ones in the backup. A backup restores only on a MailFlow version with the same database schema as the one that made it; releases with no migration between them share one. To move to a version with a newer schema, restore the backup on the version that made it, then update, so the update converts its data as usual.
+
+If your own reverse proxy sits in front of MailFlow, let `/api/admin/backup` through without a request size limit, without buffering and with long timeouts, as `frontend/nginx.conf` does. A native install set up before this version needs that location copied from `contrib/nginx.conf` into its nginx config.
+
+The database can also be copied as-is with a dump:
 
 ```bash
 # Backup database
@@ -618,7 +674,7 @@ npm run android:dist    # Android package (.apk / .aab)
 
 ## Supporters
 
-MailFlow is free and open source. If it's useful to you, consider supporting development:
+MailFlow is free and open source, and built and maintained by one person. Sponsorships pay for the time that goes into fixes, reviews and releases. Sponsors appear below; businesses that sponsor get their logo here and on mailflow.sh.
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Support_MailFlow-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge)](https://ko-fi.com/mailflow)
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-Sponsor-ea4aaa?logo=github-sponsors&logoColor=white&style=for-the-badge)](https://github.com/sponsors/maathimself)
@@ -626,8 +682,14 @@ MailFlow is free and open source. If it's useful to you, consider supporting dev
 ### GitHub Sponsors
 
 <!-- SPONSORS-START -->
-<a href="https://github.com/lindstrm" title="lindstrm"><img src="https://avatars.githubusercontent.com/u/321951?s=64&u=76e44fd34335455397911bf1e14e0d35a1053ec2&v=4" width="48" height="48" alt="lindstrm" style="border-radius:50%;margin:4px"></a>
-<a href="https://github.com/shamoon" title="shamoon"><img src="https://avatars.githubusercontent.com/u/4887959?s=64&v=4" width="48" height="48" alt="shamoon" style="border-radius:50%;margin:4px"></a>
+#### Sponsors
+
+<a href="https://github.com/phillip9933" title="phillip9933"><img src="https://avatars.githubusercontent.com/u/19641186?s=192&amp;u=f5eed97c62db0fed8c5274adcf7fd750e42bcd93&amp;v=4" width="48" height="48" alt="phillip9933" style="border-radius:50%;margin:4px"></a>
+<a href="https://github.com/Samuarcher" title="Samuarcher"><img src="https://avatars.githubusercontent.com/u/3508826?s=192&amp;u=b51d075a84fc497706806bb220253de08683bf1c&amp;v=4" width="48" height="48" alt="Samuarcher" style="border-radius:50%;margin:4px"></a>
+
+#### Past supporters
+
+<sub><a href="https://github.com/Rainson12">Rene Steen</a>, <a href="https://github.com/rahhing">rahh</a>, <a href="https://github.com/MikeScanlan5">Mike Scanlan</a>, <a href="https://github.com/lindstrm">Joachim Lindström</a>, <a href="https://github.com/shamoon">shamoon</a>, <a href="https://github.com/chip-well">Christopher Hipwell</a></sub>
 <!-- SPONSORS-END -->
 
 ---
@@ -639,6 +701,8 @@ MailFlow is free and open source. If it's useful to you, consider supporting dev
 ---
 
 ## Upgrading
+
+From v3 on, each release's notes on [GitHub Releases](https://github.com/maathimself/mailflow/releases) list its upgrade steps. The notes below cover older versions.
 
 ### GTD
 
@@ -679,6 +743,8 @@ If any accounts were configured with **Skip TLS verification** (e.g. for a self-
 ---
 
 ## Security notes
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md). Please don't open a public issue.
 
 - The first registered user becomes the admin automatically
 - Close open registration in Settings → Users once you've set up your accounts

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 MAILFLOW_DIR="${MAILFLOW_DIR:-/opt/mailflow}"
 MAILFLOW_HEALTH_URL="${MAILFLOW_HEALTH_URL:-https://mail.genoric.com/api/health}"
+MAILFLOW_UPDATE_WAIT_SECONDS="${MAILFLOW_UPDATE_WAIT_SECONDS:-900}"
 BACKEND_IMAGE='ghcr.io/yunque0912/mailflow-backend'
 FRONTEND_IMAGE='ghcr.io/yunque0912/mailflow-frontend'
 
@@ -14,6 +15,7 @@ Usage: mailflow-update <X.Y.Z-custom.N>
 Environment overrides:
   MAILFLOW_DIR         Compose directory (default: /opt/mailflow)
   MAILFLOW_HEALTH_URL  Public health URL (default: https://mail.genoric.com/api/health)
+  MAILFLOW_UPDATE_WAIT_SECONDS  Startup deadline per phase, including migrations (30-86400; default: 900)
 EOF
 }
 
@@ -38,6 +40,10 @@ version="${1#v}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-custom\.[0-9]+$ ]] || {
   die "Version must match X.Y.Z-custom.N (without a mutable tag such as latest)."
 }
+[[ "$MAILFLOW_UPDATE_WAIT_SECONDS" =~ ^[1-9][0-9]{1,4}$ ]] &&
+  (( MAILFLOW_UPDATE_WAIT_SECONDS >= 30 && MAILFLOW_UPDATE_WAIT_SECONDS <= 86400 )) || {
+  die 'MAILFLOW_UPDATE_WAIT_SECONDS must be a whole number from 30 to 86400.'
+}
 
 for command in awk curl docker python3 sha256sum; do
   command -v "$command" >/dev/null 2>&1 || die "Required command is missing: $command"
@@ -53,9 +59,15 @@ compose_config="$(docker compose config --format json)" || {
 }
 printf '%s' "$compose_config" | python3 -c '
 import json
+import re
 import sys
 
 config = json.load(sys.stdin)
+duration = str(config["services"]["backend"].get("stop_grace_period", ""))
+parts = re.findall(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|ms|s|m|h)", duration)
+scales = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600}
+if not parts or "".join(number + unit for number, unit in parts) != duration or sum(float(number) * scales[unit] for number, unit in parts) < 30:
+    raise SystemExit("backend must set stop_grace_period to at least 30s so sends can finish")
 frontend_networks = config["services"]["frontend"]["networks"]
 if set(frontend_networks) != {"mailflow", "edge_mailflow"}:
     raise SystemExit("frontend must connect only to mailflow and edge_mailflow")
@@ -64,7 +76,7 @@ if "mailflow-ingress" not in frontend_networks["edge_mailflow"].get("aliases", [
 edge_network = config["networks"]["edge_mailflow"]
 if edge_network.get("name") != "edge_mailflow" or not edge_network.get("external"):
     raise SystemExit("edge_mailflow must be the external edge_mailflow network")
-' || die 'Production Compose does not satisfy the stable Edge network contract.'
+' || die 'Production Compose does not satisfy the shutdown and stable Edge network requirements.'
 
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$MAILFLOW_DIR/.mailflow-update.lock"
@@ -142,24 +154,36 @@ echo 'Resolved application images:'
 grep -E '^ghcr\.io/yunque0912/mailflow-(backend|frontend):' <<< "$images"
 
 docker compose pull backend frontend
-docker compose up -d backend frontend
 
-echo 'Waiting for frontend and backend health checks...'
-for ((attempt = 1; attempt <= 60; attempt++)); do
-  backend_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' mailflow-backend 2>/dev/null || true)"
-  frontend_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' mailflow-frontend 2>/dev/null || true)"
-  if [[ "$backend_health" == 'healthy' && "$frontend_health" == 'healthy' ]]; then
-    break
-  fi
-  if [[ "$backend_health" == 'unhealthy' || "$frontend_health" == 'unhealthy' ]]; then
-    die "A container became unhealthy (backend=$backend_health, frontend=$frontend_health). Config backup: $config_backup"
-  fi
-  sleep 5
-done
-
-[[ "${backend_health:-}" == 'healthy' && "${frontend_health:-}" == 'healthy' ]] || {
-  die "Timed out waiting for healthy containers. Config backup: $config_backup"
+wait_for_health() {
+  local deadline=$((SECONDS + MAILFLOW_UPDATE_WAIT_SECONDS))
+  local container status ready previous=''
+  while (( SECONDS < deadline )); do
+    ready=true
+    local summary=''
+    for container in "$@"; do
+      status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)"
+      [[ "$status" == 'healthy' ]] || ready=false
+      summary+="$container=${status:-missing} "
+    done
+    [[ "$ready" == true ]] && return 0
+    if [[ "$summary" != "$previous" ]]; then
+      echo "Waiting for startup/migrations: $summary"
+      previous="$summary"
+    fi
+    # A migration runs before the HTTP listener exists and can outlast Docker health retries.
+    # An initial unhealthy result is therefore not a failed migration; wait for the deadline.
+    sleep 5
+  done
+  die "Startup deadline (${MAILFLOW_UPDATE_WAIT_SECONDS}s) exceeded: $summary Config backup: $config_backup. Inspect backend logs; do not roll back images automatically after migrations."
 }
+
+# Start the backend separately so frontend depends_on cannot abort a legitimate long migration.
+# PostgreSQL/Redis are already running and healthy; leave them and their data volumes alone.
+docker compose up -d --no-deps backend
+wait_for_health mailflow-backend
+docker compose up -d --no-deps frontend
+wait_for_health mailflow-backend mailflow-frontend
 
 backend_running_image="$(docker inspect -f '{{.Config.Image}}' mailflow-backend)"
 frontend_running_image="$(docker inspect -f '{{.Config.Image}}' mailflow-frontend)"

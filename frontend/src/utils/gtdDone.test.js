@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { doneGtdRow } from './gtdDone.js';
+import { getGtdMetadataRefreshGeneration } from '../plugins/gtd/metadataStore.js';
 import {
   clearGtdRemovalGuard,
   completedGtdRemovalMap,
@@ -86,6 +87,25 @@ describe('doneGtdRow', () => {
     }
   });
 
+  it('says why when the server refuses because it would delete the only copy', async () => {
+    const calls = [];
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      await doneGtdRow(thread, states, deps({
+        gtdDone: async () => { throw Object.assign(new Error('only copy'), { status: 409 }); },
+        restoreGtdThread: () => calls.push(['restore']),
+        addNotification: notification => calls.push(['notify', notification]),
+      }));
+      assert.deepEqual(calls, [
+        ['restore'],
+        ['notify', { title: 'gtd.doneFailed', body: 'gtd.onlyCopy' }],
+      ]);
+    } finally {
+      console.error = originalError;
+    }
+  });
+
   it('keeps the row removed but reports a partial archive failure', async () => {
     const calls = [];
     await doneGtdRow(thread, states, deps({
@@ -99,4 +119,45 @@ describe('doneGtdRow', () => {
     ]);
     assert.equal(completedGtdRemovalMap.size, 1);
   });
+
+  it('says so when the server could not clear the whole thread from its section', async () => {
+    const calls = [];
+    await doneGtdRow(thread, states, deps({
+      gtdDone: async () => ({ ok: true, threadRemains: true }),
+      addNotification: notification => calls.push(['notify', notification]),
+    }));
+
+    assert.deepEqual(calls, [
+      ['notify', { title: 'gtd.doneThreadRemains', body: 'A subject' }],
+    ]);
+  });
+
+  it('drops the removal guard when the thread stays in its section, so the next refetch shows it', async () => {
+    await doneGtdRow(thread, states, deps({
+      gtdDone: async () => ({ ok: true, threadRemains: true }),
+    }));
+    assert.equal(pendingGtdRemovalMap.size, 0);
+    assert.equal(completedGtdRemovalMap.size, 0);
+  });
+});
+
+
+it('refreshes indicators after sidebar Done and uncertain failure', async () => {
+  const before = getGtdMetadataRefreshGeneration();
+  await doneGtdRow(thread, states, deps());
+  assert.equal(getGtdMetadataRefreshGeneration(), before + 1);
+  await doneGtdRow(thread, states, deps({ gtdDone: async () => { throw new Error('lost response'); } }));
+  assert.equal(getGtdMetadataRefreshGeneration(), before + 2);
+});
+
+it('refreshes indicators when the thread stays in its section or the archive partly fails', async () => {
+  const notes = [];
+  const before = getGtdMetadataRefreshGeneration();
+  await doneGtdRow(thread, ['watch', 'delegated'], deps({
+    gtdDone: async () => ({ ok: true, threadRemains: true, archiveFailed: true }),
+    addNotification: note => notes.push(note.title),
+  }));
+  assert.equal(getGtdMetadataRefreshGeneration(), before + 1);
+  assert.deepEqual(notes, ['gtd.doneArchiveFailed', 'gtd.doneThreadRemains']);
+  clearGtdRemovalGuard('x', ['watch', 'delegated']);
 });

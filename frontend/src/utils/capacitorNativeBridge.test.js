@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { registerHooks } from 'node:module';
 import {
   callAndroidJavascriptInterface,
   callAndroidMessageBridge,
@@ -186,5 +187,42 @@ test('Android JavaScript interface can mount post-login action listeners without
     });
   } finally {
     globalThis.window = originalWindow;
+  }
+});
+
+test('missing optional logout support leaves other native methods available', async () => {
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === '@capacitor/core') {
+        return { url: 'data:text/javascript,' + encodeURIComponent(`
+          export const Capacitor = { isNativePlatform: () => true };
+          export const calls = [];
+          export function registerPlugin() {
+            return {
+              openOidcLogout: async () => { throw new Error('not implemented'); },
+              setUnreadCount: async ({ count }) => { calls.push(count); },
+            };
+          }
+        `), shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  const previousWindow = globalThis.window;
+  try {
+    const { Capacitor, calls } = await import('@capacitor/core');
+    globalThis.window = { Capacitor };
+    // A fresh module instance keeps this optional-plugin regression independent
+    // from the Android message-interface installation above.
+    const { installCapacitorNativeBridge: install } = await import('./capacitorNativeBridge.js?optional-logout');
+    await install();
+    const bridge = globalThis.window.mailflowNative;
+    await bridge.badges.setUnreadCount(1);
+    assert.deepEqual(await bridge.openOidcLogout('https://id.example.com/end'), { handled: false });
+    await bridge.badges.setUnreadCount(2);
+    assert.deepEqual(calls, [1, 2]);
+  } finally {
+    globalThis.window = previousWindow;
+    hooks.deregister();
   }
 });

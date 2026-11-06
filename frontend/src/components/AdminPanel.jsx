@@ -9,6 +9,7 @@ import { api } from '../utils/api.js';
 import { spamApi } from '../utils/spamApi.js';
 import { copyToClipboard } from '../utils/clipboard.js';
 import { isValidFromValue } from '../utils/defaultSender.js';
+import { autoRecipientFields } from '../utils/autoRecipients.js';
 import {
   AI_ACCOUNT_PROVIDER_OPTIONS,
   AI_CONNECTION_METHOD_ACCOUNT,
@@ -30,12 +31,26 @@ import { NOTIFICATION_SOUNDS, playNotificationSound, playCustomSound, warmUpAudi
 import { usePushNotifications } from '../hooks/usePushNotifications.js';
 import SignatureEditor from './SignatureEditor.jsx';
 import DiagnosticsReportModal from './DiagnosticsReportModal.jsx';
-import { getEffectiveShortcuts, getGroupedActions, shortcutActionText, SPECIAL_KEY_LABELS, parseModKey, modLabel } from '../utils/defaultShortcuts.js';
+import { getEffectiveShortcuts, getGroupedActions, getShortcutConflicts, shortcutActionText, shortcutBindingFromEvent, SPECIAL_KEY_LABELS, parseModKey, modLabel } from '../utils/defaultShortcuts.js';
 import { isValidForwardAddress } from '../utils/ruleActions.js';
 import { folderParentLabel } from '../utils/folderDisplay.js';
+import AdminUserEditor from './AdminUserEditor.jsx';
+import AccountErrorCallout from './AccountErrorCallout.jsx';
+import SignInAgainDialog from './SignInAgainDialog.jsx';
+import AddAccountChooser from './AddAccountChooser.jsx';
+import MicrosoftSignIn from './MicrosoftSignIn.jsx';
+import GoogleSignIn from './GoogleSignIn.jsx';
+import { describeAccountError } from '../utils/accountErrors.js';
+import { detectProvider } from '../utils/providerDetect.js';
+import { formatRelativeTime, daysSince } from '../utils/relativeTime.js';
+import { formatDateTime, formatDay, formatTime } from '../utils/formatDate.js';
+import { htmlLang } from '../utils/browserLanguage.js';
 import SpamSettings from './SpamSettings.jsx';
 import NativeUpdatePanel from './NativeUpdatePanel.jsx';
 import { CUSTOM_PROJECT_URL, getDeploymentWebsiteUrl, isPackagedMailFlow, selectAboutVersion } from '../utils/aboutInfo.js';
+import BackupSettings from './BackupSettings.jsx';
+import PasswordInput from './PasswordInput.jsx';
+import ApiTokensSection from './ApiTokensSection.jsx';
 
 // ─── Shared field component ───────────────────────────────────────────────────
 function Field({ label, required, children }) {
@@ -59,6 +74,8 @@ const inputStyle = {
 const TOGGLE_OFF_BACKGROUND = 'var(--border)';
 
 // ─── Color picker ─────────────────────────────────────────────────────────────
+// Common mailbox icons (#376); any other emoji can be typed.
+const ACCOUNT_ICON_CHOICES = ['🏠', '💼', '🏢', '🎓', '🛒', '💰', '👨‍👩‍👧', '❤️', '🎮', '✈️', '📦', '🔒'];
 const COLORS = [
   '#6366f1','#8b5cf6','#ec4899','#ef4444',
   '#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#14b8a6',
@@ -73,23 +90,35 @@ const PRESETS = {
 };
 
 // ─── Account Form (Add or Edit) ───────────────────────────────────────────────
+const OAUTH_PROVIDERS = new Set(['microsoft', 'google']);
+// Google's page for creating an app password (needs 2-Step Verification on the account).
+const GOOGLE_APP_PASSWORDS_URL = 'https://myaccount.google.com/apppasswords';
+// What a sign-in owns on the account; saving other settings never sends these for it.
+// The mailbox to open (auth_user) stays editable: it is how a shared or delegated mailbox is
+// reached with one's own sign-in.
+const OAUTH_OWNED_FIELDS = ['imap_host', 'imap_port', 'imap_tls', 'imap_skip_tls_verify', 'smtp_host', 'smtp_port', 'smtp_tls', 'auth_pass', 'smtp_auth_user', 'smtp_auth_pass'];
 function isMicrosoftImapHost(host) {
   const h = (host || '').toLowerCase();
   return h.includes('.outlook.com') || h.includes('office365.com') || h.includes('.hotmail.com') || h.includes('.live.com');
 }
 
-function AccountForm({ initial, onSave, onCancel }) {
+// prefill (add only): { email, preset } from the Add account chooser.
+// onMicrosoftSignIn (add only): switch to "Sign in with Microsoft" when an Outlook.com host is typed.
+// onSignInAgain (edit only): "Sign in again" for an account connected through a sign-in.
+function AccountForm({ initial, onSave, onCancel, prefill, onMicrosoftSignIn, onGoogleSignIn, onSignInAgain }) {
   const { t } = useTranslation();
   const { categorizationEnabled } = useStore();
 
   const isEdit = !!initial?.id;
-  const [form, setForm] = useState(initial || {
-    name: '', email_address: '', color: '#6366f1', protocol: 'imap',
+  const signedInWith = isEdit && OAUTH_PROVIDERS.has(initial?.oauth_provider) ? initial.oauth_provider : null;
+  const [form, setForm] = useState(() => initial || {
+    name: '', email_address: prefill?.email || '', color: '#6366f1', protocol: 'imap',
     imap_host: '', imap_port: 993, imap_skip_tls_verify: false,
     smtp_host: '', smtp_port: 587, smtp_tls: 'STARTTLS',
     smtp_auth_user: '', smtp_auth_pass: '',
-    auth_user: '', auth_pass: '', categorization_enabled: false, antispam_enabled: false,
+    auth_user: prefill?.email || '', auth_pass: '', categorization_enabled: false, antispam_enabled: false,
     trusted_authserv_id: '',
+    ...(prefill?.preset && PRESETS[prefill.preset]?.imap_host ? { ...PRESETS[prefill.preset], label: undefined } : {}),
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -99,8 +128,36 @@ function AccountForm({ initial, onSave, onCancel }) {
   const [detectedAuthservIds, setDetectedAuthservIds] = useState(null);
   const [showPass, setShowPass] = useState(false);
   const [showSmtpPass, setShowSmtpPass] = useState(false);
-  const [selectedPreset, setSelectedPreset] = useState(null);
+  const [selectedPreset, setSelectedPreset] = useState(prefill?.preset || null);
   const [mailPolicy, setMailPolicy] = useState({ allowPrivateHosts: false, allowInsecureTls: false, allowNonstandardPorts: false });
+  // Whether an Outlook.com address can be connected right away through Integrations, with the
+  // instance's own app or MailFlow's built-in one (#674). Asked only once one is typed, and
+  // only in a build that ships the built-in app; otherwise the note stays as it was.
+  const [msPersonalReady, setMsPersonalReady] = useState(false);
+  const [msWorkReady, setMsWorkReady] = useState(false);
+  const microsoftHost = isMicrosoftImapHost(form.imap_host);
+  // Which sign-in the Outlook host note offers: work or school for an address that is not a
+  // personal Microsoft one when work sign-in is set up, else personal.
+  const msSignInKind = detectProvider(form.email_address) !== 'microsoftPersonal' && msWorkReady ? 'work' : 'personal';
+  const msSignInOffered = msSignInKind === 'work' || msPersonalReady;
+  // Gmail and Google Workspace (imap.gmail.com, any address): sign in with Google when the
+  // instance's Google client is set up, else an app password, with where to make one.
+  const gmailHost = !isEdit && /^imap\.gmail\.com$/i.test((form.imap_host || '').trim());
+  const [googleSignInReady, setGoogleSignInReady] = useState(false);
+
+  useEffect(() => {
+    if (!microsoftHost && !gmailHost) return undefined;
+    let cancelled = false;
+    api.getIntegrationsStatus()
+      .then(d => {
+        if (cancelled) return;
+        setMsPersonalReady(!!d.microsoft?.builtinAppShipped && !!d.microsoft?.personalAccounts);
+        setMsWorkReady(!!d.microsoft?.workAccounts);
+        setGoogleSignInReady(!!d.google?.signIn);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [microsoftHost, gmailHost]);
 
   useEffect(() => {
     api.admin.getSettings()
@@ -128,6 +185,13 @@ function AccountForm({ initial, onSave, onCancel }) {
   }, [isEdit, form.antispam_enabled, initial?.id]);
 
   const set = (key, val) => setForm(f => ({ ...f, [key]: val }));
+  // The login follows the address (which is what it usually is) until the user edits the
+  // login itself, so correcting a prefilled address does not leave the old one as the login.
+  const [authUserEdited, setAuthUserEdited] = useState(false);
+  const setEmail = (value) => setForm(f => ({
+    ...f, email_address: value,
+    ...(!isEdit && !authUserEdited && (!f.auth_user || f.auth_user === f.email_address) ? { auth_user: value } : {}),
+  }));
 
   const handlePreset = (key) => {
     const p = PRESETS[key];
@@ -136,7 +200,8 @@ function AccountForm({ initial, onSave, onCancel }) {
   };
 
   const handleSubmit = async () => {
-    if (!form.email_address || !form.auth_user || !form.imap_host) {
+    // The login and server of a signed-in account are hidden and not editable: not required.
+    if (!form.email_address || (!signedInWith && (!form.auth_user || !form.imap_host))) {
       setError(t('admin.accounts.errorRequired'));
       return;
     }
@@ -191,6 +256,37 @@ function AccountForm({ initial, onSave, onCancel }) {
         </div>
       </Field>
 
+      {/* Icon (#376): an emoji shown in place of the color dot, or none. */}
+      <Field label={t('admin.accounts.icon')}>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          {[null, ...ACCOUNT_ICON_CHOICES].map(choice => {
+            const active = (form.icon || null) === choice;
+            return (
+              <button key={choice ?? 'none'} type="button" onClick={() => set('icon', choice)}
+                aria-pressed={active} title={choice ? undefined : t('admin.accounts.iconNone')}
+                aria-label={choice ? undefined : t('admin.accounts.iconNone')}
+                style={{
+                  width: 30, height: 30, borderRadius: 7, padding: 0, fontSize: 16, lineHeight: 1,
+                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+                  border: `1px solid ${active ? 'var(--accent)' : 'var(--border)'}`,
+                  background: active ? 'var(--accent-dim)' : 'transparent',
+                }}>
+                {choice ?? <span style={{ width: 10, height: 10, borderRadius: '50%', background: form.color, display: 'inline-block' }} />}
+              </button>
+            );
+          })}
+          <input
+            aria-label={t('admin.accounts.iconCustom')}
+            placeholder={t('admin.accounts.iconCustom')}
+            value={form.icon && !ACCOUNT_ICON_CHOICES.includes(form.icon) ? form.icon : ''}
+            onChange={e => set('icon', e.target.value.trim() || null)}
+            maxLength={16}
+            style={{ ...inputStyle, width: 150, padding: '6px 10px' }}
+          />
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>{t('admin.accounts.iconHint')}</div>
+      </Field>
+
       <Field label={t('admin.accounts.displayName')} required>
         <input value={form.name || ''} onChange={e => set('name', e.target.value)}
           placeholder={t('admin.accounts.displayNamePh')} style={inputStyle}
@@ -207,13 +303,47 @@ function AccountForm({ initial, onSave, onCancel }) {
 
       {!isEdit && (
         <Field label={t('admin.accounts.email')} required>
-          <input value={form.email_address || ''} onChange={e => set('email_address', e.target.value)}
+          <input value={form.email_address || ''} onChange={e => setEmail(e.target.value)}
             placeholder={t('admin.accounts.emailPh')} style={inputStyle}
             onFocus={e => e.target.style.borderColor = 'var(--accent)'}
             onBlur={e => e.target.style.borderColor = 'var(--border)'} />
         </Field>
       )}
 
+      {/* A Microsoft or Google sign-in owns the server: shown, not editable (#674). */}
+      {signedInWith ? (
+        <div data-signed-in-with={signedInWith} style={{
+          margin: '16px 0 0', padding: '12px 14px', borderRadius: 8, background: 'var(--bg-tertiary)',
+          border: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+        }}>
+          <div style={{ flex: '1 1 220px', minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', overflowWrap: 'anywhere' }}>
+              {t(signedInWith === 'google' ? 'accountForm.signedInGoogle' : 'accountForm.signedInMicrosoft', { email: initial.email_address })}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2, lineHeight: 1.5 }}>{t('accountForm.signedInNote')}</div>
+          </div>
+          {onSignInAgain && (
+            <button type="button" onClick={onSignInAgain} style={{
+              padding: '7px 14px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 7,
+              color: 'var(--text-primary)', fontSize: 13, fontWeight: 500, cursor: 'pointer',
+            }}>{t('accountErrors.action.signIn')}</button>
+          )}
+        </div>
+      ) : null}
+      {/* Microsoft only: a shared or delegated Microsoft 365 mailbox opens with one's own sign-in
+          as its address; Gmail has no such way. */}
+      {signedInWith === 'microsoft' && (
+        <div style={{ marginTop: 14 }}>
+          <Field label={t('accountForm.mailboxLabel')}>
+            <input value={form.auth_user || ''} onChange={e => set('auth_user', e.target.value)}
+              placeholder={initial.email_address} style={inputStyle}
+              onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+              onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5, lineHeight: 1.5 }}>{t('accountForm.mailboxHelp')}</div>
+          </Field>
+        </div>
+      )}
+      {signedInWith ? null : (<>
       <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
       <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
         {t('admin.accounts.imapSection')}
@@ -238,7 +368,7 @@ function AccountForm({ initial, onSave, onCancel }) {
       </div>
 
       <Field label={t('admin.accounts.authUser')} required>
-        <input value={form.auth_user || ''} onChange={e => set('auth_user', e.target.value)}
+        <input value={form.auth_user || ''} onChange={e => { setAuthUserEdited(true); set('auth_user', e.target.value); }}
           placeholder={t('admin.accounts.authUserPh')} style={inputStyle}
           onFocus={e => e.target.style.borderColor = 'var(--accent)'}
           onBlur={e => e.target.style.borderColor = 'var(--border)'} />
@@ -303,12 +433,45 @@ function AccountForm({ initial, onSave, onCancel }) {
           </svg>
           <div>
             <div style={{ fontWeight: 600, marginBottom: 3 }}>{t('admin.accounts.microsoftImapUnsupported')}</div>
-            <div style={{ color: 'var(--text-secondary)', lineHeight: 1.5 }}>{t('admin.accounts.microsoftImapNote')}</div>
+            <div style={{ color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+              {!isEdit && msSignInOffered && onMicrosoftSignIn ? t('admin.accounts.microsoftImapNoteSignIn')
+                : msPersonalReady ? t('admin.accounts.microsoftImapNoteReady') : t('admin.accounts.microsoftImapNote')}
+            </div>
+            {!isEdit && msSignInOffered && onMicrosoftSignIn && (
+              <button type="button" onClick={() => onMicrosoftSignIn(msSignInKind)} style={{
+                marginTop: 10, padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 7,
+                color: 'var(--accent-text)', fontSize: 13, fontWeight: 500, cursor: 'pointer',
+              }}>{t('msSignIn.titlePersonal')}</button>
+            )}
           </div>
         </div>
       )}
 
-      <div style={{ height: 1, background: 'var(--border-subtle)', margin: '4px 0 16px', marginTop: isMicrosoftImapHost(form.imap_host) ? 16 : '4px' }} />
+      {gmailHost && (
+        <div data-gmail-note style={{
+          padding: '10px 14px', marginTop: 10, borderRadius: 8, fontSize: 13, lineHeight: 1.5,
+          background: 'var(--bg-tertiary)', border: '1px solid var(--border-subtle)', color: 'var(--text-secondary)',
+        }}>
+          {googleSignInReady && onGoogleSignIn ? (
+            <>
+              <div>{t('googleSignIn.formNote')}</div>
+              <button type="button" onClick={onGoogleSignIn} style={{
+                marginTop: 10, padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 7,
+                color: 'var(--accent-text)', fontSize: 13, fontWeight: 500, cursor: 'pointer',
+              }}>{t('googleSignIn.title')}</button>
+            </>
+          ) : (
+            <>
+              <div>{t('googleSignIn.appPasswordNote')}</div>
+              <a href={GOOGLE_APP_PASSWORDS_URL} target="_blank" rel="noreferrer" style={{ display: 'inline-block', marginTop: 6, color: 'var(--accent)', fontWeight: 500 }}>
+                {t('googleSignIn.createAppPassword')}
+              </a>
+            </>
+          )}
+        </div>
+      )}
+
+      <div style={{ height: 1, background: 'var(--border-subtle)', margin: '4px 0 16px', marginTop: isMicrosoftImapHost(form.imap_host) || gmailHost ? 16 : '4px' }} />
       <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
         {t('admin.accounts.smtpSection')}
       </div>
@@ -362,6 +525,7 @@ function AccountForm({ initial, onSave, onCancel }) {
           </button>
         </div>
       </Field>
+      </>)}
 
       <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
       <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
@@ -371,9 +535,37 @@ function AccountForm({ initial, onSave, onCancel }) {
         value={form.signature || ''}
         onChange={val => set('signature', val)}
       />
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, fontSize: 13, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+        <input type="checkbox" checked={form.signature_enabled !== false}
+          onChange={e => set('signature_enabled', e.target.checked)}
+          style={{ accentColor: 'var(--accent)' }} />
+        {t('admin.accounts.signatureEnabledDefault')}
+      </label>
 
       {isEdit && (
         <>
+          <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+            {t('admin.accounts.autoRecipientsSection')}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 12, lineHeight: 1.5 }}>
+            {t('admin.accounts.autoRecipientsDesc')}
+          </div>
+          <Field label={t('compose.cc')}>
+            <input value={form.auto_cc_text ?? (form.auto_cc_addresses || []).join(', ')}
+              onChange={e => set('auto_cc_text', e.target.value)}
+              placeholder={t('compose.ccPh')} style={inputStyle}
+              onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+              onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+          </Field>
+          <Field label={t('compose.bcc')}>
+            <input value={form.auto_bcc_text ?? (form.auto_bcc_addresses || []).join(', ')}
+              onChange={e => set('auto_bcc_text', e.target.value)}
+              placeholder={t('compose.bccPh')} style={inputStyle}
+              onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+              onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+          </Field>
+
           <div style={{ height: 1, background: 'var(--border-subtle)', margin: '16px 0' }} />
           <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
             {t('admin.accounts.unifiedInboxSection')}
@@ -556,8 +748,60 @@ function AccountForm({ initial, onSave, onCancel }) {
 // ─── Accounts Tab ─────────────────────────────────────────────────────────────
 function AccountsTab() {
   const { t } = useTranslation();
-  const { accounts, setAccounts, updateAccount, setUnreadCounts, addNotification, backfillProgress } = useStore();
+  const { accounts, setAccounts, updateAccount, setUnreadCounts, addNotification, backfillProgress, user, setAdminTab, accountsIntent, setAccountsIntent } = useStore();
+  const isAdmin = !!user?.isAdmin;
   const [subview, setSubview] = useState('list'); // 'list' | 'add' | 'edit' | 'folders' | 'aliases'
+  const [signInTarget, setSignInTarget] = useState(null); // account being signed in again
+  const [focusedId, setFocusedId] = useState(null); // account row opened from the sidebar
+  const rowRefs = useRef({});
+  // Add account: the chooser, then the IMAP form or "Sign in with Microsoft" (#674).
+  const [addStep, setAddStep] = useState({ step: 'choose' }); // { step: 'choose' } | { step: 'form', preset, email } | { step: 'microsoft', mode }
+  const [msStatus, setMsStatus] = useState(null); // GET /api/integrations/status's microsoft entry
+  const [googleStatus, setGoogleStatus] = useState(null); // ...and its google entry
+  const startAdd = () => { setAddStep({ step: 'choose' }); setSubview('add'); };
+
+  useEffect(() => {
+    if (subview !== 'add') return undefined;
+    let cancelled = false;
+    setMsStatus(null);
+    api.getIntegrationsStatus()
+      .then(d => { if (!cancelled) { setMsStatus(d?.microsoft || {}); setGoogleStatus(d?.google || {}); } })
+      .catch(() => { if (!cancelled) { setMsStatus({}); setGoogleStatus({}); } });
+    return () => { cancelled = true; };
+  }, [subview]);
+
+  const chooseProvider = (choice, email) => {
+    if (choice === 'microsoftPersonal') setAddStep({ step: 'microsoft', mode: 'personal' });
+    else if (choice === 'microsoftWork') setAddStep({ step: 'microsoft', mode: 'work' });
+    // Gmail signs in on Google's page when the instance's Google client is set up; otherwise
+    // it is the app-password form.
+    else if (choice === 'gmail' && googleStatus?.signIn) setAddStep({ step: 'google' });
+    else setAddStep({ step: 'form', preset: choice === 'other' ? null : choice, email });
+  };
+  const reloadAccounts = () => api.getAccounts().then(setAccounts).catch(console.error);
+
+  // Opened from elsewhere: the empty inbox's Add account, or one account's row from the
+  // sidebar (and "Sign in again" if asked).
+  useEffect(() => {
+    if (!accountsIntent) return;
+    if (accountsIntent.action === 'add') {
+      setAccountsIntent(null);
+      startAdd();
+      return;
+    }
+    const target = accounts.find(a => a.id === accountsIntent.accountId);
+    setAccountsIntent(null);
+    if (!target) return;
+    setSubview('list');
+    setFocusedId(target.id);
+    if (accountsIntent.action === 'signIn') setSignInTarget(target);
+  }, [accountsIntent]); // eslint-disable-line react-hooks/exhaustive-deps -- acts once per intent
+  useEffect(() => {
+    if (!focusedId) return undefined;
+    rowRefs.current[focusedId]?.scrollIntoView?.({ block: 'nearest' });
+    const timer = setTimeout(() => setFocusedId(null), 2400);
+    return () => clearTimeout(timer);
+  }, [focusedId]);
   const [editTarget, setEditTarget] = useState(null);
   const [folderMappings, setFolderMappings] = useState({});
   const [availableFolders, setAvailableFolders] = useState([]);
@@ -579,9 +823,15 @@ function AccountsTab() {
   };
 
   const handleEdit = async (form) => {
-    const updates = { name: form.name, sender_name: form.sender_name || null, color: form.color, imap_host: form.imap_host, imap_port: form.imap_port, imap_skip_tls_verify: !!form.imap_skip_tls_verify, smtp_host: form.smtp_host, smtp_port: form.smtp_port, smtp_tls: form.smtp_tls, signature: form.signature || null, categorization_enabled: !!form.categorization_enabled, antispam_enabled: !!form.antispam_enabled, trusted_authserv_id: (form.trusted_authserv_id || '').trim() || null, include_in_unified_inbox: form.include_in_unified_inbox !== false };
+    const updates = { name: form.name, sender_name: form.sender_name || null, color: form.color, icon: form.icon || null, imap_host: form.imap_host, imap_port: form.imap_port, imap_skip_tls_verify: !!form.imap_skip_tls_verify, smtp_host: form.smtp_host, smtp_port: form.smtp_port, smtp_tls: form.smtp_tls, signature: form.signature || null, categorization_enabled: !!form.categorization_enabled, antispam_enabled: !!form.antispam_enabled, trusted_authserv_id: (form.trusted_authserv_id || '').trim() || null, include_in_unified_inbox: form.include_in_unified_inbox !== false };
+    Object.assign(updates, autoRecipientFields(form), { signature_enabled: form.signature_enabled !== false });
     if (form.auth_pass) updates.auth_pass = form.auth_pass;
-    if (form.auth_user) updates.auth_user = form.auth_user;
+    if (OAUTH_PROVIDERS.has(editTarget.oauth_provider)) {
+      // Sent only when it changed: a new login reconnects the account, and a cosmetic save
+      // (color, signature) must not. Left empty, it means the account's own address.
+      const mailbox = (form.auth_user || '').trim() || editTarget.email_address;
+      if (mailbox !== (editTarget.auth_user || editTarget.email_address)) updates.auth_user = mailbox;
+    } else if (form.auth_user) updates.auth_user = form.auth_user;
     // Separate SMTP credentials (optional). A username sends both (a blank password on
     // edit keeps the stored one); a blank username clears both back to the IMAP login.
     if (form.smtp_auth_user) {
@@ -591,6 +841,7 @@ function AccountsTab() {
       updates.smtp_auth_user = null;
       updates.smtp_auth_pass = null;
     }
+    if (OAUTH_PROVIDERS.has(editTarget.oauth_provider)) for (const field of OAUTH_OWNED_FIELDS) delete updates[field];
     const updated = await api.updateAccount(editTarget.id, updates);
     updateAccount(editTarget.id, updated);
     api.getUnreadCounts().then(setUnreadCounts).catch(console.error);
@@ -599,20 +850,30 @@ function AccountsTab() {
   };
 
   const handleDelete = (id) => {
+    // Its scheduled messages go with it (#543, design 1.1): the dialog opens at once, and says how
+    // many when the count arrives; without it (the request failed) it says the rest.
+    const body = t('admin.accounts.deleteBody');
     setConfirmDialog({
-      title: 'Remove account?',
-      message: 'All synced messages for this account will be deleted. This cannot be undone.',
-      confirmLabel: 'Remove',
+      accountId: id,
+      title: t('admin.accounts.deleteTitle'),
+      message: body,
+      confirmLabel: t('admin.accounts.deleteConfirm'),
       onConfirm: async () => {
         await api.deleteAccount(id);
         setAccounts(accounts.filter(a => a.id !== id));
       },
     });
+    api.scheduled.count(id).then((r) => {
+      const scheduled = Number(r?.count) || 0;
+      if (scheduled <= 0) return;
+      setConfirmDialog(d => (d?.accountId === id
+        ? { ...d, message: `${body} ${t('admin.accounts.deleteScheduled', { n: scheduled })}` } : d));
+    }, () => {});
   };
 
   const handleReconnect = async (id) => {
     await api.reconnectAccount(id);
-    updateAccount(id, { sync_error: null });
+    updateAccount(id, { sync_error: null, sync_error_code: null });
   };
 
   const handleReindex = async (id) => {
@@ -735,9 +996,11 @@ function AccountsTab() {
   };
 
   if (subview === 'add') {
+    const toChooser = () => setAddStep({ step: 'choose' });
+    const toList = () => setSubview('list');
     return (
       <div>
-        <button onClick={() => setSubview('list')} style={{
+        <button onClick={addStep.step === 'choose' ? toList : toChooser} style={{
           display: 'flex', alignItems: 'center', gap: 6,
           background: 'none', border: 'none', color: 'var(--text-secondary)',
           cursor: 'pointer', fontSize: 13, padding: '0 0 16px 0',
@@ -745,12 +1008,31 @@ function AccountsTab() {
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <polyline points="15 18 9 12 15 6"/>
           </svg>
-          {t('sidebar.backToAccounts')}
+          {addStep.step === 'choose' ? t('sidebar.backToAccounts') : t('msSignIn.back')}
         </button>
-        <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 20 }}>
-          {t('admin.accounts.addTitle')}
-        </div>
-        <AccountForm onSave={handleAdd} onCancel={() => setSubview('list')} />
+        {addStep.step === 'choose' && (
+          <AddAccountChooser status={msStatus} googleStatus={googleStatus} isAdmin={isAdmin} onChoose={chooseProvider}
+            onOpenSettings={() => setAdminTab('mail-signin')} />
+        )}
+        {addStep.step === 'microsoft' && (
+          <MicrosoftSignIn mode={addStep.mode} status={msStatus}
+            onSignedIn={reloadAccounts}
+            onDone={() => { reloadAccounts(); toList(); }}
+            onCancel={toChooser} />
+        )}
+        {addStep.step === 'google' && (
+          <GoogleSignIn onSignedIn={reloadAccounts} onDone={() => { reloadAccounts(); toList(); }} onCancel={toChooser} />
+        )}
+        {addStep.step === 'form' && (
+          <>
+            <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 20 }}>
+              {t('admin.accounts.addTitle')}
+            </div>
+            <AccountForm key={`${addStep.preset}:${addStep.email}`} prefill={addStep} onSave={handleAdd} onCancel={toChooser}
+              onMicrosoftSignIn={(kind) => setAddStep({ step: 'microsoft', mode: kind === 'work' ? 'work' : 'personal' })}
+              onGoogleSignIn={() => setAddStep({ step: 'google' })} />
+          </>
+        )}
       </div>
     );
   }
@@ -774,7 +1056,12 @@ function AccountsTab() {
         <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 20 }}>
           {editTarget.email_address}
         </div>
-        <AccountForm initial={editTarget} onSave={handleEdit} onCancel={() => { setSubview('list'); setEditTarget(null); }} />
+        <AccountForm initial={editTarget} onSave={handleEdit} onCancel={() => { setSubview('list'); setEditTarget(null); }}
+          onSignInAgain={() => setSignInTarget(editTarget)} />
+        {signInTarget && (
+          <SignInAgainDialog account={signInTarget} onClose={() => setSignInTarget(null)}
+            onSignedIn={() => api.getAccounts().then(setAccounts).catch(console.error)} />
+        )}
       </div>
     );
   }
@@ -1043,7 +1330,7 @@ function AccountsTab() {
         <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)' }}>
           {t('admin.accounts.title')}
         </div>
-        <button onClick={() => setSubview('add')} style={{
+        <button onClick={startAdd} style={{
           display: 'flex', alignItems: 'center', gap: 6,
           padding: '7px 12px', background: 'var(--accent)',
           border: 'none', borderRadius: 7, color: 'var(--accent-text)',
@@ -1058,14 +1345,19 @@ function AccountsTab() {
 
       {accounts.length === 0 && (
         <div style={{ textAlign: 'center', padding: '32px 0', color: 'var(--text-tertiary)', fontSize: 14 }}>
-          {t('admin.accounts.empty')}
+          <div>{t('admin.accounts.empty')}</div>
+          <button type="button" onClick={startAdd} style={{
+            marginTop: 14, padding: '8px 16px', background: 'var(--accent)', border: 'none', borderRadius: 8,
+            color: 'var(--accent-text)', fontSize: 13, fontWeight: 500, cursor: 'pointer',
+          }}>{t('admin.accounts.addButton')}</button>
         </div>
       )}
 
       {accounts.map(account => (
-        <div key={account.id} style={{
-          border: '1px solid var(--border-subtle)', borderRadius: 10,
+        <div key={account.id} ref={el => { rowRefs.current[account.id] = el; }} data-account-id={account.id} style={{
+          border: `1px solid ${focusedId === account.id ? 'var(--accent)' : 'var(--border-subtle)'}`, borderRadius: 10,
           background: 'var(--bg-tertiary)', marginBottom: 10, overflow: 'hidden',
+          transition: 'border-color 0.3s',
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', flexWrap: 'wrap' }}>
             <div style={{
@@ -1084,10 +1376,8 @@ function AccountsTab() {
               </div>
               <div style={{ fontSize: 11, marginTop: 3, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 {account.sync_error ? (
-                  <span style={{
-                    color: 'var(--red)',
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  }}>⚠ {account.sync_error}</span>
+                  // The full error, and what to do about it, is in the callout below.
+                  <span style={{ color: 'var(--red)' }}>⚠ {t(describeAccountError(account).labelKey)}</span>
                 ) : (
                   <>
                     <span style={{ color: 'var(--green)' }}>● {t('admin.accounts.connected')}</span>
@@ -1100,7 +1390,7 @@ function AccountsTab() {
             </div>
             <div style={{ display: 'flex', gap: 6, flexShrink: 0, marginLeft: 'auto' }}>
               {account.sync_error && (
-                <IconBtn onClick={() => handleReconnect(account.id)} title={t('sidebar.accountMenu.reconnect')}>
+                <IconBtn onClick={() => handleReconnect(account.id)} title={t('sidebar.accountMenu.tryAgain')}>
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <polyline points="23 4 23 10 17 10"/>
                     <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
@@ -1144,6 +1434,15 @@ function AccountsTab() {
             </div>
           </div>
 
+          <AccountErrorCallout
+            account={account}
+            isAdmin={isAdmin}
+            onRetry={() => handleReconnect(account.id).catch(err => addNotification({ type: 'error', title: t('accountErrors.action.retry'), body: err.message }))}
+            onSignIn={() => setSignInTarget(account)}
+            onEdit={() => { setEditTarget(account); setSubview('edit'); }}
+            onOpenIntegrations={() => setAdminTab('mail-signin')}
+          />
+
           {/* Connection details bar */}
           <div style={{
             padding: '8px 14px', borderTop: '1px solid var(--border-subtle)',
@@ -1153,7 +1452,7 @@ function AccountsTab() {
             {[
               ['IMAP', `${account.imap_host}:${account.imap_port}`],
               ['SMTP', `${account.smtp_host}:${account.smtp_port}`],
-              [t('admin.accounts.lastSync'), account.last_sync ? new Date(account.last_sync).toLocaleTimeString() : t('common.never')],
+              [t('admin.accounts.lastSync'), account.last_sync ? formatTime(account.last_sync) : t('common.never')],
             ].map(([label, val]) => (
               <div key={label} style={{ fontSize: 11 }}>
                 <span style={{ color: 'var(--text-tertiary)' }}>{label} </span>
@@ -1186,6 +1485,13 @@ function AccountsTab() {
         </div>
       ))}
       <ConfirmOverlay dialog={confirmDialog} onClose={() => setConfirmDialog(null)} />
+      {signInTarget && (
+        <SignInAgainDialog
+          account={signInTarget}
+          onClose={() => setSignInTarget(null)}
+          onSignedIn={() => api.getAccounts().then(setAccounts).catch(console.error)}
+        />
+      )}
     </div>
     </>
   );
@@ -1194,7 +1500,7 @@ function AccountsTab() {
 // ─── Themes Tab ───────────────────────────────────────────────────────────────
 function ThemesTab() {
   const { t } = useTranslation();
-  const { theme, setTheme } = useStore();
+  const { theme, setTheme, darkEmailBodies, setDarkEmailBodies } = useStore();
   const [customCss, setCustomCss] = useState('');
   const [cssSaving, setCssSaving] = useState(false);
   const [cssSaved, setCssSaved] = useState(false);
@@ -1234,6 +1540,16 @@ function ThemesTab() {
       </div>
       <div style={{ fontSize: 13, color: 'var(--text-tertiary)', marginBottom: 20 }}>
         {t('admin.appearance.description')}
+      </div>
+
+      {/* Dark email bodies (#228): what is shown dark, and why the rest is not, is in utils/darkScheme.js. */}
+      <div style={{ marginBottom: 20 }}>
+        <ToggleRow
+          label={t('admin.appearance.darkEmailBodies')}
+          desc={t('admin.appearance.darkEmailBodiesDesc')}
+          checked={darkEmailBodies}
+          onChange={setDarkEmailBodies}
+        />
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10 }}>
@@ -1536,6 +1852,28 @@ function LayoutDiagram({ layoutConfig, active }) {
   const lw = isColumn ? 50 : Math.round(10 + (layoutConfig.listWidth / 460) * 32);
   const rw = 72 - lw; // reading pane width
 
+  if (layoutConfig.listFirst) {
+    // List first (#596): sidebar left, the list across the rest, no reading pane.
+    return (
+      <svg width="80" height="52" viewBox="0 0 80 52" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0.5" y="0.5" width="79" height="51" rx="4" fill="var(--bg-secondary)" stroke={accent} strokeWidth={active ? 1.5 : 1}/>
+        <rect x="1" y="1" width={sw} height="50" rx="3" fill={bg1}/>
+        <rect x={sw + 2} y="1" width={63} height="50" fill={bg2}/>
+        <line x1={sw + 1} y1="1" x2={sw + 1} y2="51" stroke={accent} strokeWidth="0.8"/>
+        <rect x="3" y="8" width={sw - 4} height="1.5" rx="0.75" fill={accent} opacity="0.5"/>
+        <rect x="3" y="13" width={sw - 6} height="1.5" rx="0.75" fill={accent} opacity="0.3"/>
+        <rect x="3" y="18" width={sw - 5} height="1.5" rx="0.75" fill={accent} opacity="0.3"/>
+        {[5, 15, 25, 35].map((y, i) => (
+          <g key={y}>
+            <rect x={sw + 4} y={y} width={40 - i * 4} height="1.5" rx="0.75" fill={accent} opacity={0.6 - i * 0.1}/>
+            <rect x={sw + 4} y={y + 4} width={55 - i * 3} height="1" rx="0.5" fill={accent} opacity="0.25"/>
+            <line x1={sw + 2} y1={y + 8} x2="79" y2={y + 8} stroke={accent} strokeWidth="0.5" opacity="0.3"/>
+          </g>
+        ))}
+      </svg>
+    );
+  }
+
   if (isColumn) {
     // Vertical split: sidebar left, right side has list on top + reading pane below
     return (
@@ -1617,11 +1955,315 @@ function SwipeActionIcon({ action, size = 17 }) {
   return <svg {...common}><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a1 1 0 001 1h14a1 1 0 001-1V8"/><polyline points="9 13 12 16 15 13"/><line x1="12" y1="11" x2="12" y2="16"/></svg>;
 }
 
+// ─── Shared setting controls ─────────────────────────────────────────────────
+// Layout and Behavior build every setting from these, so an option has one size and one look
+// wherever it appears.
+
+const choiceStyle = (active) => ({
+  background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
+  border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
+  cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
+});
+const hoverBorder = (active) => ({
+  onMouseEnter: e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; },
+  onMouseLeave: e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; },
+});
+const CHIP_HEIGHT = 34;
+const selectStyle = {
+  height: CHIP_HEIGHT, padding: '0 10px', borderRadius: 8,
+  background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
+  color: 'var(--text-primary)', fontSize: 13, cursor: 'pointer', outline: 'none',
+};
+
+// A group of settings under a heading, set off from the group above it.
+function SettingGroup({ title, desc, first, children }) {
+  return (
+    <section style={first ? undefined : { marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', marginBottom: desc ? 4 : 16 }}>{title}</div>
+      {desc && <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 16 }}>{desc}</div>}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>{children}</div>
+    </section>
+  );
+}
+
+// One setting in a group: its name, an optional line under it, then its control.
+function SettingRow({ label, desc, children }) {
+  return (
+    <div>
+      <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: desc ? 2 : 8 }}>{label}</div>
+      {desc && <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 8 }}>{desc}</div>}
+      {children}
+    </div>
+  );
+}
+
+// Pick one of a few options, each with a line on what it does. Cards in a row share one height;
+// three or more stack on a phone, where side by side they would be too narrow to read.
+function ChoiceCards({ options, value, onChange, keepRow = false }) {
+  const isMobile = useMobile();
+  const columns = isMobile && options.length > 2 && !keepRow ? 1 : options.length;
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, gap: 8 }}>
+      {options.map(({ id, label, desc }) => {
+        const active = value === id;
+        return (
+          <button
+            key={String(id)}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(id)}
+            style={{
+              ...choiceStyle(active), padding: '10px 12px', textAlign: 'left', borderRadius: 8,
+              display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
+            }}
+            {...hoverBorder(active)}
+          >
+            <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2, overflowWrap: 'anywhere' }}>{label}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.4, overflowWrap: 'anywhere' }}>{desc}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Short options (a number, an interval): one row of equal chips. With `wrap`, chips size to their
+// labels and wrap, for longer sets such as the hover actions.
+function ChoiceChips({ options, isActive, onSelect, wrap = false }) {
+  return (
+    <div style={wrap
+      ? { display: 'flex', flexWrap: 'wrap', gap: 6 }
+      : { display: 'grid', gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`, gap: 6 }}>
+      {options.map(({ value, label }) => {
+        const active = isActive(value);
+        return (
+          <button
+            key={String(value)}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onSelect(value)}
+            style={{
+              ...choiceStyle(active), height: CHIP_HEIGHT, padding: '0 12px', borderRadius: 8,
+              fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap',
+              color: active ? 'var(--accent)' : 'var(--text-secondary)',
+            }}
+            {...hoverBorder(active)}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// An on/off setting: its name and what it does, with a switch on the right.
+function ToggleRow({ label, desc, checked, onChange, disabled = false }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16,
+      padding: '10px 12px', borderRadius: 8,
+      background: 'var(--bg-tertiary)', border: '1px solid var(--border-subtle)',
+    }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)' }}>{label}</div>
+        {desc && <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2, lineHeight: 1.4 }}>{desc}</div>}
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        disabled={disabled}
+        onClick={() => onChange(!checked)}
+        style={{
+          width: 44, height: 24, borderRadius: 12,
+          background: checked ? 'var(--accent)' : 'var(--bg-elevated)',
+          border: `1px solid ${checked ? 'var(--accent)' : 'var(--border)'}`,
+          cursor: disabled ? 'not-allowed' : 'pointer',
+          position: 'relative', transition: 'all 0.2s', flexShrink: 0,
+          opacity: disabled ? 0.6 : 1,
+        }}
+      >
+        <span style={{
+          position: 'absolute', top: 3, left: checked ? 22 : 3,
+          width: 16, height: 16, borderRadius: '50%', background: 'white',
+          transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+        }} />
+      </button>
+    </div>
+  );
+}
+
+// ─── Appearance › Layout ─────────────────────────────────────────────────────
+// How things look: the pane arrangement and what the message list shows. How MailFlow acts
+// (reading, writing, sync) is under Behavior.
 function LayoutsTab() {
   const { t } = useTranslation();
   const isMobile = useMobile();
-  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, conversationMode, setConversationMode, plaintextEmail, setPlaintextEmail, hoverQuickActions, setHoverQuickActions, hoverActionSet, setHoverActionSet, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, replyDefault, setReplyDefault, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, senderFavicons, senderFaviconsSaving, setSenderFavicons, showMessagePreviews, setShowMessagePreviews, accounts, defaultSender, setDefaultSender } = useStore();
+  const { layout, setLayout, pageSize, setPageSize, scrollMode, setScrollMode, conversationMode, setConversationMode, hoverQuickActions, setHoverQuickActions, hoverActionSet, setHoverActionSet, showMobileAvatars, setShowMobileAvatars, gravatarAvatars, setGravatarAvatars, senderFavicons, senderFaviconsSaving, setSenderFavicons, showMessagePreviews, setShowMessagePreviews } = useStore();
   const [senderFaviconsError, setSenderFaviconsError] = useState('');
+
+  const handleSelect = (key) => {
+    setLayout(key);
+    applyLayout(key);
+  };
+
+  return (
+    <div>
+      <SettingGroup first title={t('admin.appearance.layout')} desc={t('admin.appearance.layoutDescription')}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10 }}>
+          {Object.entries(LAYOUTS).map(([key, l]) => {
+            const isActive = layout === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                aria-pressed={isActive}
+                onClick={() => handleSelect(key)}
+                style={{
+                  ...choiceStyle(isActive), borderRadius: 10, padding: '14px',
+                  textAlign: 'left', display: 'flex', alignItems: 'center', gap: 14,
+                }}
+                {...hoverBorder(isActive)}
+              >
+                <div style={{ flexShrink: 0 }}>
+                  <LayoutDiagram layoutKey={key} layoutConfig={l} active={isActive} />
+                </div>
+
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+                  }}>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>
+                      {t(l.labelKey, l.label)}
+                    </div>
+                    {isActive && (
+                      <div style={{
+                        width: 18, height: 18, borderRadius: '50%', flexShrink: 0,
+                        background: 'var(--accent)', display: 'flex',
+                        alignItems: 'center', justifyContent: 'center',
+                      }}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3">
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4, lineHeight: 1.4 }}>
+                    {t(l.descriptionKey, l.description)}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </SettingGroup>
+
+      <SettingGroup title={t('admin.messageList.title')}>
+        <SettingRow label={t('admin.messageList.threadingMode')}>
+          <ChoiceCards keepRow value={conversationMode} onChange={setConversationMode} options={[
+            { id: 'off',  label: t('admin.messageList.threadingOff'),  desc: t('admin.messageList.threadingOffDesc') },
+            { id: 'list', label: t('admin.messageList.threadingList'), desc: t('admin.messageList.threadingListDesc') },
+            { id: 'pane', label: t('admin.messageList.threadingPane'), desc: t('admin.messageList.threadingPaneDesc') },
+          ]} />
+        </SettingRow>
+
+        <SettingRow label={t('admin.messageList.showMessagePreviews')}>
+          <ChoiceCards value={showMessagePreviews} onChange={setShowMessagePreviews} options={[
+            { id: false, label: t('admin.messageList.previewOff'), desc: t('admin.messageList.previewOffDesc') },
+            { id: true,  label: t('admin.messageList.previewOn'),  desc: t('admin.messageList.previewOnDesc') },
+          ]} />
+        </SettingRow>
+
+        <SettingRow label={t('admin.messageList.gravatarMode')}>
+          <ChoiceCards value={gravatarAvatars} onChange={setGravatarAvatars} options={[
+            { id: false, label: t('admin.messageList.gravatarOff'), desc: t('admin.messageList.gravatarOffDesc') },
+            { id: true,  label: t('admin.messageList.gravatarOn'),  desc: t('admin.messageList.gravatarOnDesc') },
+          ]} />
+        </SettingRow>
+
+        {isMobile && (
+          <SettingRow label={t('admin.messageList.mobileAvatarsMode')}>
+            <ChoiceCards value={showMobileAvatars} onChange={setShowMobileAvatars} options={[
+              { id: false, label: t('admin.messageList.mobileAvatarsOff'), desc: t('admin.messageList.mobileAvatarsOffDesc') },
+              { id: true,  label: t('admin.messageList.mobileAvatarsOn'),  desc: t('admin.messageList.mobileAvatarsOnDesc') },
+            ]} />
+          </SettingRow>
+        )}
+
+        <div>
+          <ToggleRow
+            label={t('admin.messageList.senderFavicons')}
+            desc={t('admin.messageList.senderFaviconsDesc')}
+            checked={senderFavicons}
+            disabled={senderFaviconsSaving}
+            onChange={async (next) => {
+              setSenderFaviconsError('');
+              try { await setSenderFavicons(next); }
+              catch { setSenderFaviconsError(t('admin.messageList.senderFaviconsSaveError')); }
+            }}
+          />
+          {senderFaviconsError && (
+            <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 8 }}>
+              {senderFaviconsError}
+            </div>
+          )}
+        </div>
+
+        {/* A phone has no pointer to hover with. */}
+        {!isMobile && (
+          <SettingRow label={t('admin.messageList.hoverQuickActionsMode')}>
+            <ChoiceCards value={hoverQuickActions} onChange={setHoverQuickActions} options={[
+              { id: false, label: t('admin.messageList.hoverQuickActionsOff'), desc: t('admin.messageList.hoverQuickActionsOffDesc') },
+              { id: true,  label: t('admin.messageList.hoverQuickActionsOn'),  desc: t('admin.messageList.hoverQuickActionsOnDesc') },
+            ]} />
+            {/* #440: which actions the cluster shows. Membership only — order stays canonical. */}
+            {hoverQuickActions && (
+              <div style={{ marginTop: 10 }}>
+                <ChoiceChips
+                  wrap
+                  isActive={id => hoverActionSet.includes(id)}
+                  onSelect={id => setHoverActionSet(hoverActionSet.includes(id) ? hoverActionSet.filter(k => k !== id) : [...hoverActionSet, id])}
+                  options={[
+                    { value: 'markRead', label: t('admin.messageList.swipeMarkRead') },
+                    { value: 'star', label: t('admin.messageList.swipeStar') },
+                    { value: 'archive', label: t('admin.messageList.swipeArchive') },
+                    { value: 'snooze', label: t('contextMenu.snooze.label') },
+                    { value: 'delete', label: t('admin.messageList.swipeDelete') },
+                    { value: 'move', label: t('contextMenu.moveToFolder') },
+                  ]}
+                />
+              </div>
+            )}
+          </SettingRow>
+        )}
+
+        <SettingRow label={t('admin.messageList.scrollingMode')}>
+          <ChoiceCards value={scrollMode} onChange={setScrollMode} options={[
+            { id: 'infinite',  label: t('admin.messageList.infiniteScroll'), desc: t('admin.messageList.infiniteScrollDesc') },
+            { id: 'paginated', label: t('admin.messageList.paginated'),      desc: t('admin.messageList.paginatedDesc') },
+          ]} />
+        </SettingRow>
+
+        <SettingRow label={scrollMode === 'paginated' ? t('admin.messageList.perPagePaginated') : t('admin.messageList.perPageInfinite')}>
+          <ChoiceChips
+            isActive={n => pageSize === n}
+            onSelect={setPageSize}
+            options={[25, 50, 100, 200].map(n => ({ value: n, label: String(n) }))}
+          />
+        </SettingRow>
+      </SettingGroup>
+    </div>
+  );
+}
+
+// ─── Behavior ────────────────────────────────────────────────────────────────
+// How MailFlow acts: reading, writing, syncing, and opening mailto: links.
+function BehaviorTab() {
+  const { t } = useTranslation();
+  const isMobile = useMobile();
+  const { swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, autoOpenReplyDrafts, setAutoOpenReplyDrafts, plaintextEmail, setPlaintextEmail, replyDefault, setReplyDefault, afterRemove, setAfterRemove, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, accounts, defaultSender, setDefaultSender } = useStore();
 
   // "Set MailFlow as your default email app": registerProtocolHandler is the
   // cross-browser path (works in Firefox and non-installed Chromium) and must be
@@ -1638,11 +2280,6 @@ function LayoutsTab() {
     }
   };
 
-  const handleSelect = (key) => {
-    setLayout(key);
-    applyLayout(key);
-  };
-
   const swipeOptions = [
     { id: 'star', label: t('admin.messageList.swipeStar'), desc: t('admin.messageList.swipeStarDesc') },
     { id: 'archive', label: t('admin.messageList.swipeArchive'), desc: t('admin.messageList.swipeArchiveDesc') },
@@ -1655,13 +2292,15 @@ function LayoutsTab() {
 
   const renderSwipePicker = (direction, title) => (
     <div>
-      <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>{title}</div>
+      <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 6 }}>{title}</div>
       <div style={{ border: '1px solid var(--border-subtle)', borderRadius: 8, overflow: 'hidden' }}>
         {swipeOptions.map((option, i) => {
           const active = (swipeActions?.[direction] || (direction === 'left' ? 'archive' : 'markRead')) === option.id;
           return (
             <button
               key={option.id}
+              type="button"
+              aria-pressed={active}
               onClick={() => setSwipeAction(direction, option.id)}
               style={{
                 width: '100%', display: 'flex', alignItems: 'center', gap: 12,
@@ -1692,626 +2331,148 @@ function LayoutsTab() {
 
   return (
     <div>
-      <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-        {t('admin.appearance.layout')}
-      </div>
-      <div style={{ fontSize: 13, color: 'var(--text-tertiary)', marginBottom: 20 }}>
-        {t('admin.appearance.layoutDescription')}
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10 }}>
-        {Object.entries(LAYOUTS).map(([key, l]) => {
-          const isActive = layout === key;
-          return (
-            <button
-              key={key}
-              onClick={() => handleSelect(key)}
-              style={{
-                background: isActive ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                border: `2px solid ${isActive ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                borderRadius: 10, padding: '14px', cursor: 'pointer',
-                textAlign: 'left', transition: 'all 0.15s', outline: 'none',
-                display: 'flex', alignItems: 'center', gap: 14,
-              }}
-              onMouseEnter={e => { if (!isActive) e.currentTarget.style.borderColor = 'var(--border)'; }}
-              onMouseLeave={e => { if (!isActive) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-            >
-              <div style={{ flexShrink: 0 }}>
-                <LayoutDiagram layoutKey={key} layoutConfig={l} active={isActive} />
-              </div>
-
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
-                }}>
-                  <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>
-                    {t(l.labelKey, l.label)}
-                  </div>
-                  {isActive && (
-                    <div style={{
-                      width: 18, height: 18, borderRadius: '50%', flexShrink: 0,
-                      background: 'var(--accent)', display: 'flex',
-                      alignItems: 'center', justifyContent: 'center',
-                    }}>
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3">
-                        <polyline points="20 6 9 17 4 12"/>
-                      </svg>
-                    </div>
-                  )}
-                </div>
-                <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4, lineHeight: 1.4 }}>
-                  {t(l.descriptionKey, l.description)}
-                </div>
-              </div>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Message list behaviour */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 16 }}>
-          {t('admin.messageList.title')}
-        </div>
-
-        <div style={{ marginBottom: 18 }}>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>{t('admin.messageList.scrollingMode')}</div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {[
-              { id: 'infinite',   label: t('admin.messageList.infiniteScroll'), desc: t('admin.messageList.infiniteScrollDesc') },
-              { id: 'paginated',  label: t('admin.messageList.paginated'),       desc: t('admin.messageList.paginatedDesc') },
-            ].map(({ id, label, desc }) => {
-              const active = scrollMode === id;
-              return (
-                <button
-                  key={id}
-                  onClick={() => setScrollMode(id)}
-                  style={{
-                    flex: 1, padding: '10px 12px', textAlign: 'left',
-                    background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                    border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                    borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                  }}
-                  onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                  onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div style={{ marginBottom: 18 }}>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
-            {scrollMode === 'paginated' ? t('admin.messageList.perPagePaginated') : t('admin.messageList.perPageInfinite')}
-          </div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            {[25, 50, 100, 200].map(n => {
-              const active = pageSize === n;
-              return (
-                <button
-                  key={n}
-                  onClick={() => setPageSize(n)}
-                  style={{
-                    flex: 1, padding: '7px 4px', fontSize: 13, fontWeight: 500,
-                    background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                    border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                    borderRadius: 7, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                    color: active ? 'var(--accent)' : 'var(--text-secondary)',
-                  }}
-                  onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                  onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-                >
-                  {n}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Hover quick actions */}
-        <div>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
-            {t('admin.messageList.hoverQuickActionsMode')}
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {[
-              { id: false, label: t('admin.messageList.hoverQuickActionsOff'), desc: t('admin.messageList.hoverQuickActionsOffDesc') },
-              { id: true, label: t('admin.messageList.hoverQuickActionsOn'), desc: t('admin.messageList.hoverQuickActionsOnDesc') },
-            ].map(({ id, label, desc }) => {
-              const active = hoverQuickActions === id;
-              return (
-                <button
-                  key={String(id)}
-                  onClick={() => setHoverQuickActions(id)}
-                  style={{
-                    flex: 1, padding: '10px 12px', textAlign: 'left',
-                    background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                    border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                    borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                  }}
-                  onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                  onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-                </button>
-              );
-            })}
-          </div>
-          {/* #440: which actions the cluster shows. Membership only — order stays canonical. */}
-          {hoverQuickActions && (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
-              {[
-                { id: 'markRead', label: t('admin.messageList.swipeMarkRead') },
-                { id: 'star', label: t('admin.messageList.swipeStar') },
-                { id: 'archive', label: t('admin.messageList.swipeArchive') },
-                { id: 'snooze', label: t('contextMenu.snooze.label') },
-                { id: 'delete', label: t('admin.messageList.swipeDelete') },
-                { id: 'move', label: t('contextMenu.moveToFolder') },
-              ].map(({ id, label }) => {
-                const active = hoverActionSet.includes(id);
-                return (
-                  <button
-                    key={id}
-                    onClick={() => setHoverActionSet(active ? hoverActionSet.filter(k => k !== id) : [...hoverActionSet, id])}
-                    style={{
-                      padding: '6px 10px', fontSize: 12, borderRadius: 6, cursor: 'pointer',
-                      background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                      border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                      color: 'var(--text-primary)', transition: 'all 0.15s', outline: 'none',
-                    }}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
+      <SettingGroup first title={t('admin.behavior.reading')}>
+        <SettingRow label={t('admin.messageList.markReadBehavior')}>
+          <ChoiceCards value={markReadBehavior} onChange={setMarkReadBehavior} options={[
+            { id: 'immediate', label: t('admin.messageList.markReadImmediate'), desc: t('admin.messageList.markReadImmediateDesc') },
+            { id: 'delay',     label: t('admin.messageList.markReadDelay'),     desc: t('admin.messageList.markReadDelayDesc') },
+            { id: 'manual',    label: t('admin.messageList.markReadManual'),    desc: t('admin.messageList.markReadManualDesc') },
+          ]} />
+          {markReadBehavior === 'delay' && (
+            <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{t('admin.messageList.markReadDelayLabel')}</span>
+              <select
+                value={markReadDelay}
+                onChange={e => setMarkReadDelay(parseInt(e.target.value))}
+                style={selectStyle}
+              >
+                {[1,2,3,5,10].map(s => (
+                  <option key={s} value={s}>{t('admin.messageList.markReadDelaySeconds', { count: s })}</option>
+                ))}
+              </select>
             </div>
           )}
-        </div>
+        </SettingRow>
 
-        <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
-            {t('admin.messageList.showMessagePreviews')}
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {[
-              { id: false, label: t('admin.messageList.previewOff'), desc: t('admin.messageList.previewOffDesc') },
-              { id: true, label: t('admin.messageList.previewOn'), desc: t('admin.messageList.previewOnDesc') },
-            ].map(({ id, label, desc }) => {
-              const active = showMessagePreviews === id;
-              return (
-                <button
-                  key={String(id)}
-                  onClick={() => setShowMessagePreviews(id)}
-                  style={{
-                    flex: 1, padding: '10px 12px', textAlign: 'left',
-                    background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                    border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                    borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                  }}
-                  onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                  onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
-            {t('admin.messageList.gravatarMode')}
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {[
-              { id: false, label: t('admin.messageList.gravatarOff'), desc: t('admin.messageList.gravatarOffDesc') },
-              { id: true, label: t('admin.messageList.gravatarOn'), desc: t('admin.messageList.gravatarOnDesc') },
-            ].map(({ id, label, desc }) => {
-              const active = gravatarAvatars === id;
-              return (
-                <button
-                  key={String(id)}
-                  onClick={() => setGravatarAvatars(id)}
-                  style={{
-                    flex: 1, padding: '10px 12px', textAlign: 'left',
-                    background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                    border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                    borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                  }}
-                  onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                  onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
+        {/* What opens after the open message is deleted, archived or moved (#572) */}
+        <SettingRow label={t('admin.messageList.afterRemove')}>
+          <ChoiceCards value={afterRemove} onChange={setAfterRemove} options={[
+            { id: 'next',     label: t('admin.messageList.afterRemoveNext'),     desc: t('admin.messageList.afterRemoveNextDesc') },
+            { id: 'previous', label: t('admin.messageList.afterRemovePrevious'), desc: t('admin.messageList.afterRemovePreviousDesc') },
+            { id: 'list',     label: t('admin.messageList.afterRemoveList'),     desc: t('admin.messageList.afterRemoveListDesc') },
+          ]} />
+          <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-tertiary)' }}>{t('admin.messageList.afterRemoveMobile')}</div>
+        </SettingRow>
 
         {isMobile && (
-          <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
-              {t('admin.messageList.mobileAvatarsMode')}
-            </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              {[
-                { id: false, label: t('admin.messageList.mobileAvatarsOff'), desc: t('admin.messageList.mobileAvatarsOffDesc') },
-                { id: true, label: t('admin.messageList.mobileAvatarsOn'), desc: t('admin.messageList.mobileAvatarsOnDesc') },
-              ].map(({ id, label, desc }) => {
-                const active = showMobileAvatars === id;
-                return (
-                  <button
-                    key={String(id)}
-                    onClick={() => setShowMobileAvatars(id)}
-                    style={{
-                      flex: 1, padding: '10px 12px', textAlign: 'left',
-                      background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                      border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                      borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                    }}
-                    onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                    onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-                  >
-                    <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16,
-            padding: '12px 14px', borderRadius: 8,
-            background: 'var(--bg-tertiary)', border: '1px solid var(--border-subtle)',
-          }}>
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>
-                {t('admin.messageList.senderFavicons')}
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>
-                {t('admin.messageList.senderFaviconsDesc')}
-              </div>
-            </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={senderFavicons}
-              aria-label={t('admin.messageList.senderFavicons')}
-              disabled={senderFaviconsSaving}
-              onClick={async () => {
-                setSenderFaviconsError('');
-                try { await setSenderFavicons(!senderFavicons); }
-                catch { setSenderFaviconsError(t('admin.messageList.senderFaviconsSaveError')); }
-              }}
-              style={{
-                width: 44, height: 24, borderRadius: 12,
-                background: senderFavicons ? 'var(--accent)' : 'var(--bg-elevated)',
-                border: `1px solid ${senderFavicons ? 'var(--accent)' : 'var(--border)'}`,
-                cursor: senderFaviconsSaving ? 'not-allowed' : 'pointer',
-                position: 'relative', transition: 'all 0.2s', flexShrink: 0,
-                opacity: senderFaviconsSaving ? 0.6 : 1,
-              }}
-            >
-              <span style={{
-                position: 'absolute', top: 3, left: senderFavicons ? 22 : 3,
-                width: 16, height: 16, borderRadius: '50%', background: 'white',
-                transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
-              }} />
-            </button>
-          </div>
-          {senderFaviconsError && (
-            <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 8 }}>
-              {senderFaviconsError}
-            </div>
-          )}
-        </div>
-
-        {isMobile && (
-          <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--border-subtle)' }}>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
-              {t('admin.messageList.swipeActions')}
-            </div>
+          <SettingRow label={t('admin.messageList.swipeActions')}>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 14 }}>
               {renderSwipePicker('left', t('admin.messageList.swipeLeft'))}
               {renderSwipePicker('right', t('admin.messageList.swipeRight'))}
             </div>
-          </div>
+          </SettingRow>
         )}
-      </div>
+      </SettingGroup>
 
-      {/* Sync interval */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {t('admin.messageList.syncFrequency')}
-        </div>
-        <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
-          {t('admin.messageList.syncFrequencyDesc')}
-        </div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          {[
-            { value: 15,  label: '15s' },
-            { value: 30,  label: '30s' },
-            { value: 60,  label: '60s' },
-            { value: 120, label: '2 min' },
-          ].map(({ value, label }) => {
-            const active = syncInterval === value;
-            return (
-              <button
-                key={value}
-                onClick={() => setSyncInterval(value)}
-                style={{
-                  flex: 1, padding: '7px 4px', fontSize: 13, fontWeight: 500,
-                  background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                  border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                  borderRadius: 7, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                  color: active ? 'var(--accent)' : 'var(--text-secondary)',
-                }}
-                onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-              >
-                {label}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Folder-structure sync interval */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {t('admin.messageList.folderSyncFrequency')}
-        </div>
-        <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
-          {t('admin.messageList.folderSyncFrequencyDesc')}
-        </div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          {[
-            { value: 900,  label: '15 min' },
-            { value: 1800, label: '30 min' },
-            { value: 3600, label: '1 hour' },
-            { value: 0,    label: t('common.never') },
-          ].map(({ value, label }) => {
-            const active = folderSyncInterval === value;
-            return (
-              <button
-                key={value}
-                onClick={() => setFolderSyncInterval(value)}
-                style={{
-                  flex: 1, padding: '7px 4px', fontSize: 13, fontWeight: 500,
-                  background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                  border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                  borderRadius: 7, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                  color: active ? 'var(--accent)' : 'var(--text-secondary)',
-                }}
-                onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-              >
-                {label}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Threading mode */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {t('admin.messageList.threadingMode')}
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          {[
-            { id: 'off', label: t('admin.messageList.threadingOff'), desc: t('admin.messageList.threadingOffDesc') },
-            { id: 'list', label: t('admin.messageList.threadingList'), desc: t('admin.messageList.threadingListDesc') },
-            { id: 'pane', label: t('admin.messageList.threadingPane'), desc: t('admin.messageList.threadingPaneDesc') },
-          ].map(({ id, label, desc }) => {
-            const active = conversationMode === id;
-            return (
-              <button
-                key={String(id)}
-                onClick={() => setConversationMode(id)}
-                style={{
-                  flex: 1, minWidth: 0, padding: '10px 12px', textAlign: 'left',
-                  background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                  border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                  borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                }}
-                onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-              >
-                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2, overflowWrap: 'anywhere' }}>{label}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-tertiary)', overflowWrap: 'anywhere' }}>{desc}</div>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Compose format */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {t('admin.messageList.composeFormat')}
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          {[
-            { id: false, label: t('admin.messageList.composeRichText'),  desc: t('admin.messageList.composeRichTextDesc') },
-            { id: true,  label: t('admin.messageList.composePlainText'), desc: t('admin.messageList.composePlainTextDesc') },
-          ].map(({ id, label, desc }) => {
-            const active = plaintextEmail === id;
-            return (
-              <button
-                key={String(id)}
-                onClick={() => setPlaintextEmail(id)}
-                style={{
-                  flex: 1, padding: '10px 12px', textAlign: 'left',
-                  background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                  border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                  borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                }}
-                onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-              >
-                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Default sender (#417) */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {t('admin.messageList.defaultSender')}
-        </div>
-        <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 10 }}>
-          {t('admin.messageList.defaultSenderDesc')}
-        </div>
-        <select
-          // A default can outlive the account or alias it names. Showing '' rather than an
-          // unmatched value keeps the control honest: it reflects what the composer will
-          // actually do, which is fall back to last-used.
-          value={isValidFromValue(defaultSender, accounts) ? defaultSender : ''}
-          onChange={e => setDefaultSender(e.target.value)}
-          style={{
-            width: '100%', maxWidth: 420, padding: '8px 10px', borderRadius: 8,
-            background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
-            color: 'var(--text-primary)', fontSize: 12, cursor: 'pointer', outline: 'none',
-          }}
-        >
-          <option value="">{t('admin.messageList.defaultSenderLastUsed')}</option>
-          {accounts.map(acc => [
-            <option key={acc.id} value={`account:${acc.id}`}>
-              {acc.sender_name ? `${acc.sender_name} <${acc.email_address}>` : acc.email_address}
-            </option>,
-            ...(acc.aliases || []).map(al => (
-              <option key={al.id} value={`alias:${al.id}:${acc.id}`}>
-                {`\u00a0\u00a0${al.name ? `${al.name} <${al.email}>` : al.email}`}
-              </option>
-            )),
-          ])}
-        </select>
-      </div>
-
-      {/* Default reply action */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {t('admin.messageList.defaultReplyAction')}
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          {[
+      <SettingGroup title={t('admin.behavior.writing')}>
+        <SettingRow label={t('admin.messageList.defaultReplyAction')}>
+          <ChoiceCards value={replyDefault} onChange={setReplyDefault} options={[
             { id: 'reply',    label: t('admin.messageList.defaultReply'),    desc: t('admin.messageList.defaultReplyDesc') },
             { id: 'replyAll', label: t('admin.messageList.defaultReplyAll'), desc: t('admin.messageList.defaultReplyAllDesc') },
-          ].map(({ id, label, desc }) => {
-            const active = replyDefault === id;
-            return (
-              <button
-                key={id}
-                onClick={() => setReplyDefault(id)}
-                style={{
-                  flex: 1, padding: '10px 12px', textAlign: 'left',
-                  background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                  border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                  borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                }}
-                onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-              >
-                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-              </button>
-            );
-          })}
-        </div>
-      </div>
+          ]} />
+        </SettingRow>
 
-      {/* Mark as read behaviour */}
-      <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-          {t('admin.messageList.markReadBehavior')}
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          {[
-            { id: 'immediate', label: t('admin.messageList.markReadImmediate'), desc: t('admin.messageList.markReadImmediateDesc') },
-            { id: 'delay',     label: t('admin.messageList.markReadDelay'),     desc: t('admin.messageList.markReadDelayDesc') },
-            { id: 'manual',    label: t('admin.messageList.markReadManual'),    desc: t('admin.messageList.markReadManualDesc') },
-          ].map(({ id, label, desc }) => {
-            const active = markReadBehavior === id;
-            return (
-              <button
-                key={id}
-                onClick={() => setMarkReadBehavior(id)}
-                style={{
-                  flex: 1, padding: '10px 12px', textAlign: 'left',
-                  background: active ? 'var(--bg-hover)' : 'var(--bg-tertiary)',
-                  border: `2px solid ${active ? 'var(--accent)' : 'var(--border-subtle)'}`,
-                  borderRadius: 8, cursor: 'pointer', transition: 'all 0.15s', outline: 'none',
-                }}
-                onMouseEnter={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border)'; }}
-                onMouseLeave={e => { if (!active) e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-              >
-                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 2 }}>{label}</div>
-                <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{desc}</div>
-              </button>
-            );
-          })}
-        </div>
-        {markReadBehavior === 'delay' && (
-          <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{t('admin.messageList.markReadDelayLabel')}</span>
-            <select
-              value={markReadDelay}
-              onChange={e => setMarkReadDelay(parseInt(e.target.value))}
-              style={{
-                background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
-                borderRadius: 6, padding: '4px 8px', color: 'var(--text-primary)',
-                fontSize: 12, outline: 'none', cursor: 'pointer',
-              }}
-            >
-              {[1,2,3,5,10].map(s => (
-                <option key={s} value={s}>{t('admin.messageList.markReadDelaySeconds', { count: s })}</option>
-              ))}
-            </select>
-          </div>
-        )}
-      </div>
+        <SettingRow label={t('admin.messageList.composeFormat')}>
+          <ChoiceCards value={plaintextEmail} onChange={setPlaintextEmail} options={[
+            { id: false, label: t('admin.messageList.composeRichText'),  desc: t('admin.messageList.composeRichTextDesc') },
+            { id: true,  label: t('admin.messageList.composePlainText'), desc: t('admin.messageList.composePlainTextDesc') },
+          ]} />
+        </SettingRow>
+
+        {/* Default sender (#417) */}
+        <SettingRow label={t('admin.messageList.defaultSender')} desc={t('admin.messageList.defaultSenderDesc')}>
+          <select
+            // A default can outlive the account or alias it names. Showing '' rather than an
+            // unmatched value keeps the control honest: it reflects what the composer will
+            // actually do, which is fall back to last-used.
+            value={isValidFromValue(defaultSender, accounts) ? defaultSender : ''}
+            onChange={e => setDefaultSender(e.target.value)}
+            style={{ ...selectStyle, width: '100%', maxWidth: 420 }}
+          >
+            <option value="">{t('admin.messageList.defaultSenderLastUsed')}</option>
+            {accounts.map(acc => [
+              <option key={acc.id} value={`account:${acc.id}`}>
+                {acc.sender_name ? `${acc.sender_name} <${acc.email_address}>` : acc.email_address}
+              </option>,
+              ...(acc.aliases || []).map(al => (
+                <option key={al.id} value={`alias:${al.id}:${acc.id}`}>
+                  {`\u00a0\u00a0${al.name ? `${al.name} <${al.email}>` : al.email}`}
+                </option>
+              )),
+            ])}
+          </select>
+        </SettingRow>
+
+        <ToggleRow
+          label={t('admin.messageList.autoOpenReplyDrafts', 'Automatically open saved replies when selecting inbox messages')}
+          checked={autoOpenReplyDrafts}
+          onChange={setAutoOpenReplyDrafts}
+        />
+      </SettingGroup>
+
+      <SettingGroup title={t('admin.behavior.sync')}>
+        <SettingRow label={t('admin.messageList.syncFrequency')} desc={t('admin.messageList.syncFrequencyDesc')}>
+          <ChoiceChips
+            isActive={v => syncInterval === v}
+            onSelect={setSyncInterval}
+            options={[
+              { value: 15,  label: '15s' },
+              { value: 30,  label: '30s' },
+              { value: 60,  label: '60s' },
+              { value: 120, label: '2 min' },
+            ]}
+          />
+        </SettingRow>
+
+        <SettingRow label={t('admin.messageList.folderSyncFrequency')} desc={t('admin.messageList.folderSyncFrequencyDesc')}>
+          <ChoiceChips
+            isActive={v => folderSyncInterval === v}
+            onSelect={setFolderSyncInterval}
+            options={[
+              { value: 900,  label: '15 min' },
+              { value: 1800, label: '30 min' },
+              { value: 3600, label: '1 hour' },
+              { value: 0,    label: t('common.never') },
+            ]}
+          />
+        </SettingRow>
+      </SettingGroup>
 
       {typeof navigator !== 'undefined' && 'registerProtocolHandler' in navigator && (
-        <div style={{ marginTop: 28, paddingTop: 22, borderTop: '1px solid var(--border-subtle)' }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
-            {t('admin.messageList.defaultMailApp')}
+        <SettingGroup title={t('admin.messageList.defaultMailApp')} desc={t('admin.messageList.defaultMailAppDesc')}>
+          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+            <button
+              type="button"
+              onClick={registerMailtoHandler}
+              style={{
+                height: CHIP_HEIGHT, padding: '0 14px', background: 'var(--accent)', color: 'var(--accent-text)',
+                border: 'none', borderRadius: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500,
+              }}
+            >
+              {t('admin.messageList.defaultMailAppBtn')}
+            </button>
+            {mailtoStatus === 'ok' && (
+              <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                {t('admin.messageList.defaultMailAppOk')}
+              </span>
+            )}
+            {mailtoStatus === 'error' && (
+              <span style={{ fontSize: 12, color: 'var(--red)' }}>
+                {t('admin.messageList.defaultMailAppError')}
+              </span>
+            )}
           </div>
-          <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 12 }}>
-            {t('admin.messageList.defaultMailAppDesc')}
-          </div>
-          <button
-            onClick={registerMailtoHandler}
-            style={{
-              padding: '8px 14px', background: 'var(--accent)', color: 'var(--accent-text)',
-              border: 'none', borderRadius: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500,
-            }}
-          >
-            {t('admin.messageList.defaultMailAppBtn')}
-          </button>
-          {mailtoStatus === 'ok' && (
-            <span style={{ marginLeft: 12, fontSize: 12, color: 'var(--text-secondary)' }}>
-              {t('admin.messageList.defaultMailAppOk')}
-            </span>
-          )}
-          {mailtoStatus === 'error' && (
-            <span style={{ marginLeft: 12, fontSize: 12, color: 'var(--red)' }}>
-              {t('admin.messageList.defaultMailAppError')}
-            </span>
-          )}
-        </div>
+        </SettingGroup>
       )}
     </div>
   );
@@ -2402,7 +2563,7 @@ function CardDavCard() {
                 <div style={{ marginTop: 4 }}>
                   {t('admin.integrations.carddav.summary', { contacts: status.contactCount ?? 0, books: status.bookCount ?? 0 })}
                   {' · '}
-                  {t('admin.integrations.carddav.lastSync', { when: status.lastSyncAt ? new Date(status.lastSyncAt).toLocaleString() : t('common.never') })}
+                  {t('admin.integrations.carddav.lastSync', { when: status.lastSyncAt ? formatDateTime(status.lastSyncAt) : t('common.never') })}
                 </div>
                 {status.lastError && (
                   <div style={{ marginTop: 4, color: 'var(--red, #f87171)' }}>{t('admin.integrations.carddav.syncFailed', { error: status.lastError })}</div>
@@ -2465,29 +2626,7 @@ function CardDavCard() {
 
 function IntegrationsTab() {
   const { t } = useTranslation();
-  const { setAccounts, setTodoistConnected, user } = useStore();
-  const isAdmin = !!user?.isAdmin;
-  const [subTab, setSubTab] = useState('emailProviders');
-  const [configs, setConfigs] = useState({});
-  // Non-admins can't read the full config (admin-only), but need to know whether
-  // Microsoft OAuth is configured so the connect buttons enable. (#315)
-  const [msStatus, setMsStatus] = useState(null); // { configured } for non-admins
-  // Admins read config from the DB, but a provider can equally be configured via
-  // plain .env vars, which never appear in integration_config. Fetch the capability
-  // status for admins too so an env-only setup still enables the connect buttons.
-  const [googleStatus, setGoogleStatus] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [msForm, setMsForm] = useState({ clientId: '', clientSecret: '', tenantId: '', redirectUri: '' });
-  const [msExpanded, setMsExpanded] = useState(false);
-  const [googleForm, setGoogleForm] = useState({ clientId: '', clientSecret: '', redirectUri: '' });
-  const [googleExpanded, setGoogleExpanded] = useState(false);
-  const [connectingGoogle, setConnectingGoogle] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saveMsg, setSaveMsg] = useState('');
-  const [connectingMs, setConnectingMs] = useState(false);
-  const [deviceFlow, setDeviceFlow] = useState(null); // { userCode, verificationUri, interval }
-  const [deviceStatus, setDeviceStatus] = useState(null); // 'pending'|'success'|'declined'|'expired'|'error'
-  const devicePollRef = useRef(null);
+  const { setTodoistConnected } = useStore();
 
   // Todoist state
   const [tdConnected, setTdConnected] = useState(false);
@@ -2499,44 +2638,6 @@ function IntegrationsTab() {
   const [tdError, setTdError] = useState('');
 
   useEffect(() => {
-    if (isAdmin) {
-      api.getIntegrations()
-        .then(data => {
-          setConfigs(data);
-          if (data.microsoft) {
-            setMsForm({
-              clientId: data.microsoft.clientId || '',
-              clientSecret: data.microsoft.clientSecret || '',
-              tenantId: data.microsoft.tenantId || '',
-              redirectUri: data.microsoft.redirectUri || '',
-            });
-            setMsExpanded(true);
-          }
-          if (data.google) {
-            setGoogleForm({
-              clientId: data.google.clientId || '',
-              clientSecret: data.google.clientSecret || '',
-              redirectUri: data.google.redirectUri || '',
-            });
-            setGoogleExpanded(true);
-          }
-        })
-        .catch(console.error)
-        .finally(() => setLoading(false));
-    }
-
-    // Capability status is cheap and non-sensitive, so fetch it for everyone.
-    // Admins need it to detect providers configured via .env rather than the UI.
-    api.getIntegrationsStatus()
-      .then(data => {
-        setMsStatus(data.microsoft || null);
-        setGoogleStatus(data.google || null);
-        if (data.microsoft?.configured) setMsExpanded(true);
-        if (data.google?.configured) setGoogleExpanded(true);
-      })
-      .catch(console.error)
-      .finally(() => { if (!isAdmin) setLoading(false); });
-
     api.todoist.status()
       .then(({ connected }) => {
         setTdConnected(connected);
@@ -2545,145 +2646,7 @@ function IntegrationsTab() {
       })
       .catch(console.error)
       .finally(() => setTdLoading(false));
-
-    // Listen for oauth_success / oauth_error messages from the OAuth popup tab.
-    // URL-param detection has been moved to MailApp so it works regardless of
-    // which tab/modal is currently open.
-    const handleMessage = (e) => {
-      if (e.origin !== window.location.origin) return;
-      if (e.data?.type === 'oauth_success' && e.data?.provider === 'microsoft') {
-        setSaveMsg(t('admin.integrations.microsoft.connectedNote'));
-        setConnectingMs(false);
-        // Reload both so the new account appears in the sidebar immediately.
-        // getIntegrations is admin-only; non-admins already have the capability status.
-        if (isAdmin) api.getIntegrations().then(setConfigs).catch(console.error);
-        api.getAccounts().then(setAccounts).catch(console.error);
-      } else if (e.data?.type === 'oauth_success' && e.data?.provider === 'google') {
-        setSaveMsg(t('admin.integrations.google.connectedNote'));
-        setConnectingGoogle(false);
-        if (isAdmin) api.getIntegrations().then(setConfigs).catch(console.error);
-        api.getAccounts().then(setAccounts).catch(console.error);
-      } else if (e.data?.type === 'oauth_error') {
-        setSaveMsg('Error: ' + e.data.error);
-        setConnectingMs(false);
-        setConnectingGoogle(false);
-      }
-    };
-    window.addEventListener('message', handleMessage);
-    return () => {
-      window.removeEventListener('message', handleMessage);
-      if (devicePollRef.current) clearInterval(devicePollRef.current);
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- mount-only; re-running on t/setAccounts change would clear an in-progress device-code poll
-
-  const handleSaveMs = async () => {
-    if (!msForm.clientId || !msForm.tenantId) {
-      setSaveMsg('Client ID and Tenant ID are required');
-      return;
-    }
-    setSaving(true);
-    setSaveMsg('');
-    try {
-      await api.saveIntegration('microsoft', msForm);
-      // Update local state so "Connect account" button enables immediately
-      // without requiring a page reload.
-      setConfigs(prev => ({
-        ...prev,
-        microsoft: { clientId: msForm.clientId, tenantId: msForm.tenantId, redirectUri: msForm.redirectUri },
-      }));
-      setSaveMsg(t('admin.integrations.microsoft.savedNote'));
-    } catch (err) {
-      setSaveMsg('Error: ' + err.message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const stopDeviceFlow = () => {
-    if (devicePollRef.current) { clearInterval(devicePollRef.current); devicePollRef.current = null; }
-    setDeviceFlow(null);
-    setDeviceStatus(null);
-  };
-
-  const handleStartDeviceFlow = async () => {
-    stopDeviceFlow();
-    setDeviceStatus('pending');
-    try {
-      const data = await api.startMsDeviceFlow();
-      setDeviceFlow(data);
-      const intervalMs = (data.interval || 5) * 1000;
-      devicePollRef.current = setInterval(async () => {
-        try {
-          const result = await api.pollMsDeviceFlow();
-          if (result.status === 'pending') return;
-          clearInterval(devicePollRef.current);
-          devicePollRef.current = null;
-          setDeviceStatus(result.status);
-          if (result.status === 'success') {
-            setSaveMsg(t('admin.integrations.microsoft.connectedNote'));
-            api.getAccounts().then(setAccounts).catch(console.error);
-            setTimeout(stopDeviceFlow, 3000);
-          }
-        } catch {
-          clearInterval(devicePollRef.current);
-          devicePollRef.current = null;
-          setDeviceStatus('error');
-        }
-      }, intervalMs);
-    } catch (err) {
-      setDeviceStatus('error');
-      setSaveMsg('Error: ' + err.message);
-    }
-  };
-
-  const handleConnectMs = () => {
-    setConnectingMs(true);
-    // Use a real anchor click so the browser treats it as a normal navigation
-    // window.open gets intercepted by some browser extensions (e.g. claude.ai in Zen)
-    const a = document.createElement('a');
-    a.href = '/oauth/microsoft';
-    a.target = '_blank';
-    a.rel = 'opener';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => setConnectingMs(false), 5000);
-  };
-
-  const handleSaveGoogle = async () => {
-    if (!googleForm.clientId || !googleForm.clientSecret) {
-      setSaveMsg('Client ID and Client Secret are required');
-      return;
-    }
-    setSaving(true);
-    setSaveMsg('');
-    try {
-      await api.saveIntegration('google', googleForm);
-      setConfigs(prev => ({
-        ...prev,
-        google: { clientId: googleForm.clientId, redirectUri: googleForm.redirectUri },
-      }));
-      setGoogleStatus({ configured: true });
-      setSaveMsg(t('admin.integrations.google.savedNote'));
-    } catch (err) {
-      setSaveMsg('Error: ' + err.message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleConnectGoogle = () => {
-    setConnectingGoogle(true);
-    // Real anchor click rather than window.open — see handleConnectMs.
-    const a = document.createElement('a');
-    a.href = '/oauth/google';
-    a.target = '_blank';
-    a.rel = 'opener';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => setConnectingGoogle(false), 5000);
-  };
+  }, [setTodoistConnected]);
 
   const handleTdConnect = async () => {
     const trimmed = tdToken.trim();
@@ -2716,530 +2679,12 @@ function IntegrationsTab() {
     }
   };
 
-  // A provider counts as configured if it's in the DB config (UI-managed) OR the
-  // server reports it configured from .env. Checking only the former left the
-  // connect button disabled on env-only installs.
-  const msConfigured = (isAdmin && configs.microsoft?.clientId) || msStatus?.configured;
-  const googleConfigured = (isAdmin && configs.google?.clientId) || googleStatus?.configured;
-
-  const subTabStyle = (key) => ({
-    padding: '7px 14px',
-    background: 'none',
-    border: 'none',
-    borderBottom: `2px solid ${subTab === key ? 'var(--accent)' : 'transparent'}`,
-    marginBottom: -1,
-    color: subTab === key ? 'var(--accent)' : 'var(--text-secondary)',
-    cursor: 'pointer',
-    fontSize: 13,
-    fontWeight: subTab === key ? 600 : 400,
-    transition: 'color 0.1s',
-  });
-
   return (
     <div>
-      <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
+      <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 20 }}>
         {t('admin.integrations.title')}
       </div>
-
-      {/* Sub-tabs */}
-      <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', marginBottom: 20 }}>
-        <button style={subTabStyle('emailProviders')} onClick={() => setSubTab('emailProviders')}>
-          {t('admin.integrations.tabEmailProviders')}
-        </button>
-        <button style={subTabStyle('apps')} onClick={() => setSubTab('apps')}>
-          {t('admin.integrations.tabApps')}
-        </button>
-      </div>
-
-      {subTab === 'emailProviders' && (
-        <div>
-          {loading && <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{t('admin.integrations.loading')}</div>}
-          {!loading && (
-            <div>
-              {/* Google / Gmail */}
-          <div style={{
-            border: '1px solid var(--border-subtle)', borderRadius: 12,
-            overflow: 'hidden', marginBottom: 12,
-          }}>
-            <div
-              onClick={() => setGoogleExpanded(!googleExpanded)}
-              style={{
-                padding: '14px 16px', display: 'flex', alignItems: 'center',
-                gap: 12, cursor: 'pointer', background: 'var(--bg-tertiary)',
-                transition: 'background 0.1s',
-              }}
-              onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-              onMouseLeave={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
-            >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2">
-                <rect x="2" y="4" width="20" height="16" rx="2"/>
-                <polyline points="2 7 12 14 22 7"/>
-              </svg>
-              <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
-                    {t('admin.integrations.google.title')}
-                  </span>
-                </div>
-                <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>
-                  {t('admin.integrations.google.description')}
-                </div>
-              </div>
-              {googleConfigured ? (
-                <span style={{
-                  fontSize: 11, padding: '3px 8px', borderRadius: 20,
-                  background: 'rgba(52,168,83,0.12)', color: 'var(--green)',
-                  border: '1px solid rgba(52,168,83,0.25)',
-                }}>
-                  {t('admin.integrations.google.configured')}
-                </span>
-              ) : (
-                <span style={{
-                  fontSize: 11, padding: '3px 8px', borderRadius: 20,
-                  background: 'var(--bg-elevated)', color: 'var(--text-tertiary)',
-                  border: '1px solid var(--border)',
-                }}>
-                  {t('admin.integrations.google.notConfigured')}
-                </span>
-              )}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
-                stroke="var(--text-tertiary)" strokeWidth="2"
-                style={{ transform: googleExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>
-                <polyline points="6 9 12 15 18 9"/>
-              </svg>
-            </div>
-
-            {googleExpanded && (
-              <div style={{ padding: '16px', borderTop: '1px solid var(--border-subtle)' }}>
-                {isAdmin && (<>
-                <div style={{
-                  padding: '12px 14px', borderRadius: 8, marginBottom: 16,
-                  background: 'rgba(124,106,247,0.06)',
-                  border: '1px solid rgba(124,106,247,0.15)',
-                  fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7,
-                }}>
-                  <div style={{ fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>
-                    {t('admin.integrations.google.setupTitle')}
-                  </div>
-                  <ol style={{ margin: 0, paddingLeft: 18 }}>
-                    <li>{t('admin.integrations.google.step1')}</li>
-                    <li>{t('admin.integrations.google.step2')}</li>
-                    <li>{t('admin.integrations.google.step3')}</li>
-                    <li>{t('admin.integrations.google.step4')}</li>
-                  </ol>
-                  <div style={{ marginTop: 8, color: 'var(--text-tertiary)' }}>
-                    {t('admin.integrations.google.scopeNote')}
-                  </div>
-                </div>
-
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
-                  <Field label={t('admin.integrations.google.clientId')} required>
-                    <input value={googleForm.clientId} onChange={e => setGoogleForm(f => ({ ...f, clientId: e.target.value }))}
-                      placeholder={t('admin.integrations.google.clientIdPh')}
-                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
-                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-                  </Field>
-                  <Field label={t('admin.integrations.google.clientSecret')} required>
-                    <input type="password" value={googleForm.clientSecret} onChange={e => setGoogleForm(f => ({ ...f, clientSecret: e.target.value }))}
-                      placeholder={t('admin.integrations.google.clientSecretPh')}
-                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
-                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-                  </Field>
-                </div>
-
-                <div style={{ marginBottom: 14 }}>
-                  <Field label={t('admin.integrations.google.redirectUri')} required>
-                    <input value={googleForm.redirectUri} onChange={e => setGoogleForm(f => ({ ...f, redirectUri: e.target.value }))}
-                      placeholder={`${window.location.protocol}//${window.location.host}/oauth/google/callback`}
-                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
-                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>
-                      {t('admin.integrations.google.redirectUriNote', { uri: `${window.location.protocol}//${window.location.host}/oauth/google/callback` })}
-                    </div>
-                  </Field>
-                </div>
-                </>)}
-
-                {!isAdmin && (
-                  <div style={{
-                    padding: '12px 14px', borderRadius: 8, marginBottom: 16,
-                    background: 'rgba(124,106,247,0.06)',
-                    border: '1px solid rgba(124,106,247,0.15)',
-                    fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6,
-                  }}>
-                    {googleConfigured
-                      ? t('admin.integrations.google.userNoteConfigured')
-                      : t('admin.integrations.google.userNoteNotConfigured')}
-                  </div>
-                )}
-
-                <div style={{ display: 'flex', gap: 8 }}>
-                  {isAdmin && (
-                    <button onClick={handleSaveGoogle} disabled={saving} style={{
-                      padding: '9px 16px', background: 'var(--bg-elevated)',
-                      border: '1px solid var(--border)', borderRadius: 8,
-                      color: 'var(--text-primary)', cursor: saving ? 'not-allowed' : 'pointer',
-                      fontSize: 13, fontWeight: 500, opacity: saving ? 0.7 : 1,
-                    }}>
-                      {saving ? t('common.saving') : t('admin.integrations.google.save')}
-                    </button>
-                  )}
-
-                  <button
-                    onClick={handleConnectGoogle}
-                    disabled={!googleConfigured || connectingGoogle}
-                    title={!googleConfigured ? t('admin.integrations.google.save') : ''}
-                    style={{
-                      padding: '9px 16px', background: googleConfigured ? 'var(--accent)' : 'var(--bg-elevated)',
-                      border: `1px solid ${googleConfigured ? 'var(--accent)' : 'var(--border)'}`,
-                      borderRadius: 8, color: googleConfigured ? 'white' : 'var(--text-tertiary)',
-                      cursor: googleConfigured && !connectingGoogle ? 'pointer' : 'not-allowed',
-                      fontSize: 13, fontWeight: 500,
-                      opacity: !googleConfigured || connectingGoogle ? 0.6 : 1,
-                      display: 'flex', alignItems: 'center', gap: 6,
-                    }}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <rect x="2" y="4" width="20" height="16" rx="2"/>
-                      <polyline points="2 7 12 14 22 7"/>
-                    </svg>
-                    {connectingGoogle ? t('admin.integrations.google.redirecting') : t('admin.integrations.google.connect')}
-                  </button>
-
-                  {isAdmin && configs.google?.clientId && (
-                    <button onClick={async () => {
-                      await api.deleteIntegration('google');
-                      setConfigs(c => { const n = {...c}; delete n.google; return n; });
-                      setGoogleForm({ clientId: '', clientSecret: '', redirectUri: '' });
-                      setGoogleStatus({ configured: false });
-                      setSaveMsg('');
-                    }} style={{
-                      padding: '9px 12px', background: 'transparent',
-                      border: '1px solid transparent', borderRadius: 8,
-                      color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: 13,
-                      marginLeft: 'auto',
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.color = 'var(--red)'; e.currentTarget.style.borderColor = 'rgba(248,113,113,0.3)'; }}
-                    onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-tertiary)'; e.currentTarget.style.borderColor = 'transparent'; }}
-                    >
-                      {t('admin.integrations.google.remove')}
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-              {/* Microsoft 365 */}
-          <div style={{
-            border: '1px solid var(--border-subtle)', borderRadius: 12,
-            overflow: 'hidden', marginBottom: 12,
-          }}>
-            {/* Header */}
-            <div
-              onClick={() => setMsExpanded(!msExpanded)}
-              style={{
-                padding: '14px 16px', display: 'flex', alignItems: 'center',
-                gap: 12, cursor: 'pointer', background: 'var(--bg-tertiary)',
-                transition: 'background 0.1s',
-              }}
-              onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-              onMouseLeave={e => e.currentTarget.style.background = 'var(--bg-tertiary)'}
-            >
-              {/* Microsoft icon */}
-              <svg width="20" height="20" viewBox="0 0 21 21" fill="none">
-                <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
-                <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
-                <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
-                <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
-              </svg>
-
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-primary)' }}>
-                  {t('admin.integrations.microsoft.title')}
-                </div>
-                <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 1 }}>
-                  {t('admin.integrations.microsoft.description')}
-                </div>
-              </div>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                {msConfigured ? (
-                  <span style={{
-                    fontSize: 11, padding: '3px 8px', borderRadius: 20,
-                    background: 'rgba(74,222,128,0.1)', color: 'var(--green)',
-                    border: '1px solid rgba(74,222,128,0.2)', fontWeight: 500,
-                  }}>
-                    {t('admin.integrations.microsoft.configured')}
-                  </span>
-                ) : (
-                  <span style={{
-                    fontSize: 11, padding: '3px 8px', borderRadius: 20,
-                    background: 'var(--bg-elevated)', color: 'var(--text-tertiary)',
-                    border: '1px solid var(--border)',
-                  }}>
-                    {t('admin.integrations.microsoft.notConfigured')}
-                  </span>
-                )}
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
-                  stroke="var(--text-tertiary)" strokeWidth="2"
-                  style={{ transform: msExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>
-                  <polyline points="6 9 12 15 18 9"/>
-                </svg>
-              </div>
-            </div>
-
-            {/* Expanded form */}
-            {msExpanded && (
-              <div style={{ padding: '16px', borderTop: '1px solid var(--border-subtle)' }}>
-                {/* Admin-only: setup instructions + credential form. Non-admins can't
-                    read or write the global config, so they see only the note + connect
-                    buttons below. (#315) */}
-                {isAdmin && (<>
-                {/* Setup instructions */}
-                <div style={{
-                  padding: '12px 14px', borderRadius: 8, marginBottom: 16,
-                  background: 'rgba(124,106,247,0.06)',
-                  border: '1px solid rgba(124,106,247,0.15)',
-                  fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7,
-                }}>
-                  <div style={{ fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>
-                    {t('admin.integrations.microsoft.setupTitle')}
-                  </div>
-                  <ol style={{ margin: 0, paddingLeft: 18 }}>
-                    <li>{t('admin.integrations.microsoft.step1')}</li>
-                    <li>{t('admin.integrations.microsoft.step2')}</li>
-                    <li>{t('admin.integrations.microsoft.step3')}</li>
-                    <li>{t('admin.integrations.microsoft.step4')}</li>
-                    <li>{t('admin.integrations.microsoft.step5')}</li>
-                    <li>{t('admin.integrations.microsoft.step6')}</li>
-                  </ol>
-                </div>
-
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
-                  <Field label={t('admin.integrations.microsoft.clientId')} required>
-                    <input value={msForm.clientId} onChange={e => setMsForm(f => ({ ...f, clientId: e.target.value }))}
-                      placeholder={t('admin.integrations.microsoft.clientIdPh')}
-                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
-                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-                  </Field>
-                  <Field label={t('admin.integrations.microsoft.tenantId')} required>
-                    <input value={msForm.tenantId} onChange={e => setMsForm(f => ({ ...f, tenantId: e.target.value }))}
-                      placeholder={t('admin.integrations.microsoft.tenantIdPh')}
-                      style={{ ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}
-                      onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-                      onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>
-                      {t('admin.integrations.microsoft.tenantIdNote')}
-                    </div>
-                  </Field>
-                </div>
-
-                <Field label={t('admin.integrations.microsoft.clientSecret')}>
-                  <input type="password" autoComplete="new-password" value={msForm.clientSecret}
-                    onChange={e => setMsForm(f => ({ ...f, clientSecret: e.target.value }))}
-                    placeholder={t('admin.integrations.microsoft.clientSecretPh')}
-                    style={inputStyle}
-                    onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-                    onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-                </Field>
-
-                <Field label={t('admin.integrations.microsoft.redirectUri')}>
-                  <input value={msForm.redirectUri}
-                    onChange={e => setMsForm(f => ({ ...f, redirectUri: e.target.value }))}
-                    placeholder={`http://${window.location.hostname}:8080/oauth/microsoft/callback`}
-                    style={inputStyle}
-                    onFocus={e => e.target.style.borderColor = 'var(--accent)'}
-                    onBlur={e => e.target.style.borderColor = 'var(--border)'} />
-                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>
-                    {t('admin.integrations.microsoft.redirectUriNote', { uri: `${window.location.protocol}//${window.location.hostname}${window.location.port ? ':' + window.location.port : ''}/oauth/microsoft/callback` })}
-                  </div>
-                </Field>
-                </>)}
-
-                {/* Non-admin: no config form; just a short note about connecting */}
-                {!isAdmin && (
-                  <div style={{
-                    padding: '12px 14px', borderRadius: 8, marginBottom: 16,
-                    background: 'rgba(124,106,247,0.06)',
-                    border: '1px solid rgba(124,106,247,0.15)',
-                    fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6,
-                  }}>
-                    {msConfigured
-                      ? t('admin.integrations.microsoft.userNoteConfigured')
-                      : t('admin.integrations.microsoft.userNoteNotConfigured')}
-                  </div>
-                )}
-
-                {saveMsg && (
-                  <div style={{
-                    padding: '10px 14px', borderRadius: 8, marginBottom: 12, fontSize: 13,
-                    background: saveMsg.startsWith('Error') ? 'rgba(248,113,113,0.1)' : 'rgba(74,222,128,0.1)',
-                    border: `1px solid ${saveMsg.startsWith('Error') ? 'rgba(248,113,113,0.3)' : 'rgba(74,222,128,0.2)'}`,
-                    color: saveMsg.startsWith('Error') ? 'var(--red)' : 'var(--green)',
-                  }}>
-                    {saveMsg}
-                  </div>
-                )}
-
-                <div style={{ display: 'flex', gap: 8 }}>
-                  {isAdmin && (
-                  <button onClick={handleSaveMs} disabled={saving} style={{
-                    padding: '9px 16px', background: 'var(--bg-elevated)',
-                    border: '1px solid var(--border)', borderRadius: 8,
-                    color: 'var(--text-primary)', cursor: saving ? 'not-allowed' : 'pointer',
-                    fontSize: 13, fontWeight: 500, opacity: saving ? 0.7 : 1,
-                  }}>
-                    {saving ? t('common.saving') : t('admin.integrations.microsoft.save')}
-                  </button>
-                  )}
-
-                  <button
-                    onClick={handleConnectMs}
-                    disabled={!msConfigured || connectingMs}
-                    title={!msConfigured ? t('admin.integrations.microsoft.save') : ''}
-                    style={{
-                      padding: '9px 16px', background: msConfigured ? 'var(--accent)' : 'var(--bg-elevated)',
-                      border: `1px solid ${msConfigured ? 'var(--accent)' : 'var(--border)'}`,
-                      borderRadius: 8, color: msConfigured ? 'white' : 'var(--text-tertiary)',
-                      cursor: msConfigured && !connectingMs ? 'pointer' : 'not-allowed',
-                      fontSize: 13, fontWeight: 500,
-                      opacity: !msConfigured || connectingMs ? 0.6 : 1,
-                      display: 'flex', alignItems: 'center', gap: 6,
-                    }}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 21 21" fill="none">
-                      <rect x="1" y="1" width="9" height="9" fill="currentColor" opacity="0.9"/>
-                      <rect x="11" y="1" width="9" height="9" fill="currentColor" opacity="0.7"/>
-                      <rect x="1" y="11" width="9" height="9" fill="currentColor" opacity="0.7"/>
-                      <rect x="11" y="11" width="9" height="9" fill="currentColor" opacity="0.5"/>
-                    </svg>
-                    {connectingMs ? t('admin.integrations.microsoft.redirecting') : t('admin.integrations.microsoft.connect')}
-                  </button>
-
-                  {isAdmin && msConfigured && (
-                    <button onClick={async () => {
-                      stopDeviceFlow();
-                      await api.deleteIntegration('microsoft');
-                      setConfigs(c => { const n = {...c}; delete n.microsoft; return n; });
-                      setMsForm({ clientId: '', clientSecret: '', tenantId: '', redirectUri: '' });
-                      setSaveMsg('');
-                    }} style={{
-                      padding: '9px 12px', background: 'transparent',
-                      border: '1px solid transparent', borderRadius: 8,
-                      color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: 13,
-                      marginLeft: 'auto',
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.color = 'var(--red)'; e.currentTarget.style.borderColor = 'rgba(248,113,113,0.3)'; }}
-                    onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-tertiary)'; e.currentTarget.style.borderColor = 'transparent'; }}
-                    >
-                      {t('admin.integrations.microsoft.remove')}
-                    </button>
-                  )}
-                </div>
-
-                {/* Device code flow */}
-                <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border-subtle)' }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 6 }}>
-                    {t('admin.integrations.microsoft.deviceCodeTitle')}
-                  </div>
-                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 10, lineHeight: 1.5 }}>
-                    {t('admin.integrations.microsoft.deviceCodeNote')}
-                  </div>
-
-                  {!deviceFlow && (
-                    <button
-                      onClick={handleStartDeviceFlow}
-                      disabled={!msConfigured}
-                      title={!msConfigured ? t('admin.integrations.microsoft.save') : ''}
-                      style={{
-                        padding: '8px 14px', background: 'var(--bg-elevated)',
-                        border: '1px solid var(--border)', borderRadius: 8,
-                        color: msConfigured ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                        cursor: msConfigured ? 'pointer' : 'not-allowed',
-                        fontSize: 12, fontWeight: 500, opacity: msConfigured ? 1 : 0.5,
-                      }}
-                    >
-                      {t('admin.integrations.microsoft.deviceCodeStart')}
-                    </button>
-                  )}
-
-                  {deviceFlow && (
-                    <div style={{
-                      padding: '14px 16px', borderRadius: 8,
-                      background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-                    }}>
-                      {deviceStatus === 'success' ? (
-                        <div style={{ color: 'var(--green)', fontSize: 13, fontWeight: 500 }}>
-                          {t('admin.integrations.microsoft.connectedNote')}
-                        </div>
-                      ) : deviceStatus === 'declined' ? (
-                        <div style={{ color: 'var(--red)', fontSize: 13 }}>{t('admin.integrations.microsoft.deviceCodeDeclined')}</div>
-                      ) : deviceStatus === 'expired' ? (
-                        <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{t('admin.integrations.microsoft.deviceCodeExpired')}</div>
-                      ) : deviceStatus === 'error' ? (
-                        <div style={{ color: 'var(--red)', fontSize: 13 }}>{t('admin.integrations.microsoft.deviceCodeError')}</div>
-                      ) : (
-                        <>
-                          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 10 }}>
-                            {t('admin.integrations.microsoft.deviceCodeInstructions')}
-                          </div>
-                          <div style={{ marginBottom: 8 }}>
-                            <span style={{ fontSize: 11, color: 'var(--text-tertiary)', marginRight: 6 }}>
-                              {t('admin.integrations.microsoft.deviceCodeVisit')}
-                            </span>
-                            <a href={deviceFlow.verificationUri} target="_blank" rel="noreferrer"
-                              style={{ fontSize: 12, color: 'var(--accent)', fontWeight: 500 }}>
-                              {deviceFlow.verificationUri}
-                            </a>
-                          </div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
-                            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-                              {t('admin.integrations.microsoft.deviceCodeEnter')}
-                            </span>
-                            <span style={{
-                              fontFamily: 'JetBrains Mono, monospace', fontSize: 20, fontWeight: 700,
-                              letterSpacing: '0.15em', color: 'var(--text-primary)',
-                              padding: '6px 14px', background: 'var(--bg-tertiary)',
-                              border: '1px solid var(--border)', borderRadius: 6,
-                            }}>
-                              {deviceFlow.userCode}
-                            </span>
-                          </div>
-                          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ animation: 'spin 1.5s linear infinite' }}>
-                              <path d="M21 12a9 9 0 11-6.219-8.56"/>
-                            </svg>
-                            {t('admin.integrations.microsoft.deviceCodeWaiting')}
-                          </div>
-                        </>
-                      )}
-                      {deviceStatus !== 'success' && (
-                        <button onClick={stopDeviceFlow} style={{
-                          marginTop: 10, padding: '5px 10px', background: 'transparent',
-                          border: '1px solid var(--border)', borderRadius: 6,
-                          color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: 11,
-                        }}>
-                          {t('admin.integrations.microsoft.deviceCodeCancel')}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-        </div>
-      )}
-
-      {subTab === 'apps' && (
-        <div>
+      <div>
           {/* Todoist */}
           <div style={{
             border: '1px solid var(--border-subtle)', borderRadius: 12,
@@ -3362,8 +2807,259 @@ function IntegrationsTab() {
           </div>
 
           <CardDavCard />
-        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Email providers (admin) ─────────────────────────────────────────────────
+// How people sign in to Microsoft and Google mailboxes: MailFlow's shared Microsoft app for
+// personal accounts, and the instance's own Microsoft and Google apps. Configuration only;
+// everyone adds their own accounts under Accounts > Add account. (#674)
+function MailSignInTab() {
+  const { t } = useTranslation();
+  const [configs, setConfigs] = useState({});
+  const [status, setStatus] = useState(null); // GET /api/integrations/status
+  const [loading, setLoading] = useState(true);
+  const [msForm, setMsForm] = useState({ clientId: '', clientSecret: '', tenantId: '', redirectUri: '' });
+  const [googleForm, setGoogleForm] = useState({ clientId: '', clientSecret: '', redirectUri: '' });
+  const [msSetupOpen, setMsSetupOpen] = useState(false);
+  const [googleSetupOpen, setGoogleSetupOpen] = useState(false);
+  const [saving, setSaving] = useState(null); // 'microsoft' | 'google'
+  const [messages, setMessages] = useState({}); // provider -> { error, text }
+
+  const refreshStatus = () => api.getIntegrationsStatus().then(setStatus).catch(console.error);
+  useEffect(() => {
+    Promise.all([
+      api.getIntegrations().then((data) => {
+        setConfigs(data || {});
+        if (data?.microsoft) setMsForm({ clientId: data.microsoft.clientId || '', clientSecret: data.microsoft.clientSecret || '', tenantId: data.microsoft.tenantId || '', redirectUri: data.microsoft.redirectUri || '' });
+        if (data?.google) setGoogleForm({ clientId: data.google.clientId || '', clientSecret: data.google.clientSecret || '', redirectUri: data.google.redirectUri || '' });
+      }).catch(console.error),
+      refreshStatus(),
+    ]).finally(() => setLoading(false));
+  }, []);
+
+  const origin = window.location.origin;
+  const msRedirect = `${origin}/oauth/microsoft/callback`;
+  const googleRedirect = `${origin}/oauth/google/callback`;
+  const ms = status?.microsoft || {};
+  const googleConfigured = !!configs.google?.clientId || !!status?.google?.configured;
+  // Sign-in on Google's page cannot work without a redirect URI; one in .env will do (#676).
+  const googleRequired = ['clientId', 'clientSecret', ...(status?.google?.envRedirectUri ? [] : ['redirectUri'])];
+  const say = (provider, text, error = false) => setMessages(m => ({ ...m, [provider]: text ? { text, error } : null }));
+
+  const save = async (provider, form, required) => {
+    if (required.some(k => !String(form[k] ?? '').trim())) { say(provider, t('mailSignIn.required'), true); return; }
+    setSaving(provider);
+    say(provider, '');
+    try {
+      await api.saveIntegration(provider, form);
+      setConfigs(c => ({ ...c, [provider]: { ...form } }));
+      await refreshStatus();
+      say(provider, t('mailSignIn.saved'));
+    } catch (err) {
+      say(provider, err.code === 'redirect_uri_required'
+        ? t('mailSignIn.redirectRequired', { defaultValue: err.message })
+        : t('common.error', { message: err.message }), true);
+    } finally {
+      setSaving(null);
+    }
+  };
+  const remove = async (provider) => {
+    say(provider, '');
+    try {
+      await api.deleteIntegration(provider);
+      setConfigs(c => { const n = { ...c }; delete n[provider]; return n; });
+      if (provider === 'microsoft') setMsForm({ clientId: '', clientSecret: '', tenantId: '', redirectUri: '' });
+      else setGoogleForm({ clientId: '', clientSecret: '', redirectUri: '' });
+      await refreshStatus();
+    } catch (err) {
+      say(provider, t('common.error', { message: err.message }), true);
+    }
+  };
+  const toggleShared = async (on) => {
+    say('microsoft', '');
+    try {
+      await api.setMsBuiltinApp(on);
+      await refreshStatus();
+    } catch (err) {
+      say('microsoft', t('common.error', { message: err.message }), true);
+    }
+  };
+
+  const card = { border: '1px solid var(--border-subtle)', borderRadius: 12, overflow: 'hidden', marginBottom: 14 };
+  const header = { padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12, background: 'var(--bg-tertiary)' };
+  const section = { padding: 16, borderTop: '1px solid var(--border-subtle)' };
+  const sectionTitle = { fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 };
+  const pill = (on, label) => (
+    <span data-status={on ? 'on' : 'off'} style={{
+      display: 'inline-block', fontSize: 11, padding: '3px 8px', borderRadius: 20, fontWeight: 500,
+      background: on ? 'rgba(74,222,128,0.1)' : 'var(--bg-elevated)', color: on ? 'var(--green)' : 'var(--text-tertiary)',
+      border: `1px solid ${on ? 'rgba(74,222,128,0.25)' : 'var(--border)'}`,
+    }}>{label}</span>
+  );
+  const disclosure = (open, setOpen, label) => (
+    <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} style={{
+      display: 'flex', alignItems: 'center', gap: 6, marginTop: 12, padding: 0, background: 'none', border: 'none',
+      color: 'var(--accent)', fontSize: 13, fontWeight: 500, cursor: 'pointer',
+    }}>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>
+        <polyline points="9 18 15 12 9 6"/>
+      </svg>
+      {label}
+    </button>
+  );
+  const guide = (titleKey, stepKeys, extraKey) => (
+    <div style={{
+      padding: '12px 14px', borderRadius: 8, margin: '12px 0 16px',
+      background: 'rgba(124,106,247,0.06)', border: '1px solid rgba(124,106,247,0.15)',
+      fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7,
+    }}>
+      <div style={{ fontWeight: 600, color: 'var(--accent)', marginBottom: 6 }}>{t(titleKey)}</div>
+      <ol style={{ margin: 0, paddingLeft: 18, listStyle: 'decimal' }}>{stepKeys.map(k => <li key={k}>{t(k)}</li>)}</ol>
+      {extraKey && <div style={{ marginTop: 8, color: 'var(--text-tertiary)' }}>{t(extraKey)}</div>}
+    </div>
+  );
+  const mono = { ...inputStyle, fontFamily: 'JetBrains Mono, monospace', fontSize: 12 };
+  const message = (provider) => messages[provider] && (
+    <div role={messages[provider].error ? 'alert' : 'status'} style={{
+      padding: '9px 12px', borderRadius: 8, margin: '12px 0 0', fontSize: 13,
+      background: messages[provider].error ? 'rgba(248,113,113,0.1)' : 'rgba(74,222,128,0.1)',
+      border: `1px solid ${messages[provider].error ? 'rgba(248,113,113,0.3)' : 'rgba(74,222,128,0.2)'}`,
+      color: messages[provider].error ? 'var(--red)' : 'var(--green)',
+    }}>{messages[provider].text}</div>
+  );
+  const BUTTON_KEYS = {
+    microsoft: { save: 'admin.integrations.microsoft.save', remove: 'admin.integrations.microsoft.remove' },
+    google: { save: 'admin.integrations.google.save', remove: 'admin.integrations.google.remove' },
+  };
+  const buttons = (provider, form, required, configured) => (
+    <div style={{ display: 'flex', gap: 8, marginTop: 4, flexWrap: 'wrap' }}>
+      <button type="button" onClick={() => save(provider, form, required)} disabled={saving === provider} style={{
+        padding: '8px 16px', background: 'var(--accent)', border: 'none', borderRadius: 8, color: 'var(--accent-text)',
+        cursor: saving === provider ? 'not-allowed' : 'pointer', fontSize: 13, fontWeight: 500, opacity: saving === provider ? 0.7 : 1,
+      }}>{saving === provider ? t('common.saving') : t(BUTTON_KEYS[provider].save)}</button>
+      {configured && (
+        <button type="button" onClick={() => remove(provider)} style={{
+          padding: '8px 14px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 8,
+          color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 13,
+        }}>{t(BUTTON_KEYS[provider].remove)}</button>
       )}
+    </div>
+  );
+
+  const personalLabel = ms.personalVia === 'own' ? t('mailSignIn.ms.statusOwn')
+    : ms.personalVia === 'shared' ? t('mailSignIn.ms.statusShared') : t('mailSignIn.ms.statusOff');
+
+  return (
+    <div className="mf-signin-form">
+      <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>{t('mailSignIn.title')}</div>
+      <div style={{ fontSize: 13, color: 'var(--text-tertiary)', marginBottom: 20, lineHeight: 1.5 }}>{t('mailSignIn.description')}</div>
+      {loading && <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{t('admin.integrations.loading')}</div>}
+      {!loading && (<>
+        <div style={card} data-card="microsoft">
+          <div style={header}>
+            <svg width="20" height="20" viewBox="0 0 21 21" fill="none" aria-hidden="true">
+              <rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+              <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+            </svg>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>{t('mailSignIn.ms.title')}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>{t('mailSignIn.ms.description')}</div>
+            </div>
+          </div>
+
+          <div style={section} data-section="personal">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+              <div style={sectionTitle}>{t('mailSignIn.ms.personalTitle')}</div>
+              {pill(!!ms.personalVia, personalLabel)}
+            </div>
+            {ms.builtinAppShipped && (
+              <ToggleRow label={t('mailSignIn.ms.sharedSwitch')} desc={t('mailSignIn.ms.sharedSwitchDesc')}
+                checked={!!ms.builtinApp} onChange={toggleShared} />
+            )}
+            {ms.personalVia === 'own' && (
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 10, lineHeight: 1.5 }}>{t('mailSignIn.ms.ownHandlesPersonal')}</div>
+            )}
+          </div>
+
+          <div style={section} data-section="work">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+              <div style={sectionTitle}>{t('mailSignIn.ms.workTitle')}</div>
+              {pill(!!ms.workAccounts, ms.workAccounts ? t('mailSignIn.ms.statusOwn') : t('mailSignIn.ms.workOff'))}
+            </div>
+            {disclosure(msSetupOpen, setMsSetupOpen, t('mailSignIn.ms.setupToggle'))}
+            {msSetupOpen && (
+              <div>
+                {guide('admin.integrations.microsoft.setupTitle', ['admin.integrations.microsoft.step1', 'admin.integrations.microsoft.step2', 'admin.integrations.microsoft.step3', 'admin.integrations.microsoft.step4', 'admin.integrations.microsoft.step5', 'admin.integrations.microsoft.step6'])}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
+                  <Field label={t('admin.integrations.microsoft.clientId')} required>
+                    <input value={msForm.clientId} onChange={e => setMsForm(f => ({ ...f, clientId: e.target.value }))}
+                      placeholder={t('admin.integrations.microsoft.clientIdPh')} style={mono} />
+                  </Field>
+                  <Field label={t('admin.integrations.microsoft.tenantId')} required>
+                    <input value={msForm.tenantId} onChange={e => setMsForm(f => ({ ...f, tenantId: e.target.value }))}
+                      placeholder={t('admin.integrations.microsoft.tenantIdPh')} style={mono} />
+                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>{t('admin.integrations.microsoft.tenantIdNote')}</div>
+                  </Field>
+                </div>
+                <Field label={t('admin.integrations.microsoft.clientSecret')}>
+                  <input type="password" autoComplete="new-password" value={msForm.clientSecret}
+                    onChange={e => setMsForm(f => ({ ...f, clientSecret: e.target.value }))}
+                    placeholder={t('admin.integrations.microsoft.clientSecretPh')} style={inputStyle} />
+                </Field>
+                <Field label={t('admin.integrations.microsoft.redirectUri')}>
+                  <input value={msForm.redirectUri} onChange={e => setMsForm(f => ({ ...f, redirectUri: e.target.value }))}
+                    placeholder={msRedirect} style={inputStyle} />
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>{t('admin.integrations.microsoft.redirectUriNote', { uri: msRedirect })}</div>
+                </Field>
+                {buttons('microsoft', msForm, ['clientId', 'tenantId'], !!configs.microsoft?.clientId)}
+              </div>
+            )}
+            {message('microsoft')}
+          </div>
+        </div>
+
+        <div style={card} data-card="google">
+          <div style={header}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ea4335" strokeWidth="2" aria-hidden="true">
+              <rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2 7 12 14 22 7"/>
+            </svg>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>{t('admin.integrations.google.title')}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 2 }}>{t('admin.integrations.google.description')}</div>
+            </div>
+            {pill(googleConfigured, googleConfigured ? t('admin.integrations.google.configured') : t('admin.integrations.google.notConfigured'))}
+          </div>
+          <div style={section}>
+            {disclosure(googleSetupOpen, setGoogleSetupOpen, t('mailSignIn.google.setupToggle'))}
+            {googleSetupOpen && (
+              <div>
+                {guide('admin.integrations.google.setupTitle', ['admin.integrations.google.step1', 'admin.integrations.google.step2', 'admin.integrations.google.step3', 'admin.integrations.google.step4'], 'admin.integrations.google.scopeNote')}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
+                  <Field label={t('admin.integrations.google.clientId')} required>
+                    <input value={googleForm.clientId} onChange={e => setGoogleForm(f => ({ ...f, clientId: e.target.value }))}
+                      placeholder={t('admin.integrations.google.clientIdPh')} style={mono} />
+                  </Field>
+                  <Field label={t('admin.integrations.google.clientSecret')} required>
+                    <input type="password" autoComplete="new-password" value={googleForm.clientSecret}
+                      onChange={e => setGoogleForm(f => ({ ...f, clientSecret: e.target.value }))}
+                      placeholder={t('admin.integrations.google.clientSecretPh')} style={mono} />
+                  </Field>
+                </div>
+                <Field label={t('admin.integrations.google.redirectUri')} required={googleRequired.includes('redirectUri')}>
+                  <input value={googleForm.redirectUri} onChange={e => setGoogleForm(f => ({ ...f, redirectUri: e.target.value }))}
+                    placeholder={googleRedirect} style={mono} />
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>{t('admin.integrations.google.redirectUriNote', { uri: googleRedirect })}</div>
+                </Field>
+                {buttons('google', googleForm, googleRequired, !!configs.google?.clientId)}
+              </div>
+            )}
+            {message('google')}
+          </div>
+        </div>
+      </>)}
     </div>
   );
 }
@@ -4141,9 +3837,10 @@ function AISection() {
     });
 
     Promise.all([
-      api.ai.getConfig().then(({ config: cfg }) => {
+      api.ai.getConfig().then(({ config: cfg, newUsersEnabled }) => {
         if (!active) return;
-        const normalized = normalizeAiForm(cfg || {});
+        // "Allow AI for new users" is kept when no provider is configured, so it comes on its own.
+        const normalized = normalizeAiForm({ ...(cfg || {}), newUsersEnabled });
         setConfig(cfg);
         formRef.current = normalized;
         setForm(normalized);
@@ -4247,20 +3944,25 @@ function AISection() {
     </div>
   );
 
+  // A switch inside its label, so the text toggles it too and a screen reader reads its state.
   const toggle = (label, checked, onChange) => (
     <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', marginBottom: 10 }}>
-      <div
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
         onClick={onChange}
         style={{
           width: 36, height: 20, borderRadius: 10, position: 'relative', cursor: 'pointer', flexShrink: 0,
+          padding: 0, border: 'none',
           background: checked ? 'var(--accent)' : 'var(--border)', transition: 'background 0.2s',
         }}
       >
-        <div style={{
+        <span style={{
           position: 'absolute', top: 2, left: checked ? 18 : 2, width: 16, height: 16,
           borderRadius: '50%', background: '#fff', transition: 'left 0.2s',
         }} />
-      </div>
+      </button>
       <span style={{ fontSize: 13, color: 'var(--text-primary)' }}>{label}</span>
     </label>
   );
@@ -4412,7 +4114,7 @@ function AISection() {
                       {cancelling ? t('admin.ai.cancelling') : t('common.cancel')}
                     </button>
                   </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 8 }}>{t('admin.ai.deviceExpires', { time: new Date(pendingDevice.expiresAt).toLocaleTimeString() })}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 8 }}>{t('admin.ai.deviceExpires', { time: formatTime(pendingDevice.expiresAt) })}</div>
                 </div>
               )}
             </div>
@@ -4424,6 +4126,9 @@ function AISection() {
             <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>{t('admin.ai.features')}</div>
             {toggle(t('admin.ai.featureCompose'), form.features.compose, () => setForm(f => ({ ...f, features: { ...f.features, compose: !f.features.compose } })))}
             {toggle(t('admin.ai.featureSummarize'), form.features.summarize, () => setForm(f => ({ ...f, features: { ...f.features, summarize: !f.features.summarize } })))}
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '16px 0 8px' }}>{t('admin.ai.access')}</div>
+            {toggle(t('admin.ai.newUsersEnabled'), form.newUsersEnabled, () => setForm(f => ({ ...f, newUsersEnabled: !f.newUsersEnabled })))}
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: -4, lineHeight: 1.4 }}>{t('admin.ai.newUsersEnabledHint')}</div>
           </div>
         )}
 
@@ -5031,9 +4736,10 @@ function UsersTab() {
 }
 
 function UsersAndInvitesPanel() {
-  const { t } = useTranslation();
-  const { user: currentUser } = useStore();
+  const { t, i18n } = useTranslation();
+  const { user: currentUser, addNotification } = useStore();
   const [users, setUsers] = useState([]);
+  const [editingUser, setEditingUser] = useState(null);
   const [userTotal, setUserTotal] = useState(0);
   const [usersLoadingMore, setUsersLoadingMore] = useState(false);
   const [invites, setInvites] = useState([]);
@@ -5092,6 +4798,18 @@ function UsersAndInvitesPanel() {
     const newVal = !u.isAdmin;
     await api.admin.updateUser(u.id, { isAdmin: newVal });
     setUsers(us => us.map(x => x.id === u.id ? { ...x, isAdmin: newVal } : x));
+  };
+
+  // Per-user AI access (#644). The server reads it on every AI request, so it applies at once.
+  const handleToggleAi = async (u) => {
+    const newVal = u.aiEnabled === false;
+    try {
+      await api.admin.updateUser(u.id, { aiEnabled: newVal });
+    } catch (err) {
+      addNotification({ type: 'error', title: t('admin.users.aiToggleFailed', { username: u.username }), body: err.message });
+      return;
+    }
+    setUsers(us => us.map(x => x.id === u.id ? { ...x, aiEnabled: newVal } : x));
   };
 
   const handleDeleteUser = (u) => {
@@ -5181,23 +4899,28 @@ function UsersAndInvitesPanel() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 28 }}>
         {users.map(u => (
           <div key={u.id} style={{
-            display: 'flex', alignItems: 'center', gap: 10,
+            // On a phone the actions wrap below the name rather than squeezing it to nothing. The
+            // name column's 120px basis still fits the widest row (switch, edit, admin, 2FA,
+            // delete) on one line at the desktop settings width.
+            display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10,
             padding: '10px 12px', borderRadius: 8,
             background: 'var(--bg-tertiary)', border: '1px solid var(--border-subtle)',
           }}>
             <div style={{
-              width: 32, height: 32, borderRadius: '50%', flexShrink: 0,
+              width: 32, height: 32, borderRadius: '50%', flexShrink: 0, overflow: 'hidden',
               background: u.isAdmin ? 'var(--accent)' : 'var(--bg-elevated)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               fontSize: 13, fontWeight: 600, color: u.isAdmin ? 'white' : 'var(--text-secondary)',
-              border: '1px solid var(--border)',
+              border: u.isAdmin ? '2px solid var(--accent)' : '1px solid var(--border)',
             }}>
-              {u.username[0].toUpperCase()}
+              {u.avatar
+                ? <img src={u.avatar} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                : u.username[0].toUpperCase()}
             </div>
 
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>
+            <div style={{ flex: '1 1 120px', minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+                <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', minWidth: 0, overflowWrap: 'anywhere' }}>
                   {u.username}
                 </span>
                 {u.isAdmin && (
@@ -5215,43 +4938,90 @@ function UsersAndInvitesPanel() {
                 )}
               </div>
               <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 1 }}>
-                {t('admin.users.joined', { date: new Date(u.created_at).toLocaleDateString() })}
+                {t('admin.users.joined', { date: formatDay(u.created_at) })}
+              </div>
+              {/* Last request, not last login: sessions roll, so a daily user rarely logs in. */}
+              <div
+                title={u.lastSeenAt ? formatDateTime(u.lastSeenAt) : undefined}
+                style={{
+                  fontSize: 11, marginTop: 1,
+                  color: u.lastSeenAt && daysSince(u.lastSeenAt) > 90 ? 'var(--amber)' : 'var(--text-tertiary)',
+                }}
+              >
+                {u.lastSeenAt
+                  ? t('admin.users.lastSeen', { when: formatRelativeTime(u.lastSeenAt, htmlLang(i18n.language)) })
+                  : t('admin.users.neverSeen')}
               </div>
             </div>
 
-            {u.id !== currentUser?.id && (
-              <div style={{ display: 'flex', gap: 5, flexShrink: 0 }}>
-                <button
-                  onClick={() => handleToggleAdmin(u)}
-                  title={u.isAdmin ? t('admin.users.removeAdmin') : t('admin.users.makeAdmin')}
-                  style={{
-                    padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 500,
-                    border: '1px solid var(--border)',
-                    background: u.isAdmin ? 'var(--bg-elevated)' : 'transparent',
-                    color: u.isAdmin ? 'var(--text-secondary)' : 'var(--accent)',
-                    cursor: 'pointer', transition: 'all 0.1s',
-                  }}
-                  onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--accent)'}
-                  onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}
-                >
-                  {u.isAdmin ? t('admin.users.removeAdmin') : t('admin.users.makeAdmin')}
-                </button>
-                {u.totpEnabled && (
-                  <IconBtn onClick={() => handleDisableTotp(u)} title={t('admin.users.disable2fa')}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginLeft: 'auto', flexShrink: 0 }}>
+              {/* Shown for every user, the admin included: AI may run on the admin's own subscription. */}
+              <button
+                type="button"
+                role="switch"
+                aria-checked={u.aiEnabled !== false}
+                aria-label={t('admin.users.aiAccessLabel', { username: u.username })}
+                onClick={() => handleToggleAi(u)}
+                title={u.aiEnabled !== false ? t('admin.users.aiOnHint') : t('admin.users.aiOffHint')}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
+                  padding: '5px 8px', borderRadius: 6, fontSize: 11, fontWeight: 500,
+                  border: '1px solid var(--border)', background: 'transparent',
+                  color: u.aiEnabled !== false ? 'var(--text-secondary)' : 'var(--text-tertiary)', cursor: 'pointer',
+                }}
+              >
+                <span aria-hidden="true" style={{
+                  width: 24, height: 14, borderRadius: 7, position: 'relative', flexShrink: 0,
+                  background: u.aiEnabled !== false ? 'var(--accent)' : 'var(--border)', transition: 'background 0.2s',
+                }}>
+                  <span style={{
+                    position: 'absolute', top: 2, left: u.aiEnabled !== false ? 12 : 2, width: 10, height: 10,
+                    borderRadius: '50%', background: '#fff', transition: 'left 0.2s',
+                  }} />
+                </span>
+                {u.aiEnabled !== false ? t('admin.users.aiOn') : t('admin.users.aiOff')}
+              </button>
+
+              <IconBtn onClick={() => setEditingUser(u)} title={t('admin.users.edit')}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                </svg>
+              </IconBtn>
+
+              {u.id !== currentUser?.id && (
+                <div style={{ display: 'flex', gap: 5, flexShrink: 0 }}>
+                  <button
+                    onClick={() => handleToggleAdmin(u)}
+                    title={u.isAdmin ? t('admin.users.removeAdmin') : t('admin.users.makeAdmin')}
+                    style={{
+                      padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 500,
+                      border: '1px solid var(--border)',
+                      background: u.isAdmin ? 'var(--bg-elevated)' : 'transparent',
+                      color: u.isAdmin ? 'var(--text-secondary)' : 'var(--accent)',
+                      cursor: 'pointer', transition: 'all 0.1s',
+                    }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--accent)'}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}
+                  >
+                    {u.isAdmin ? t('admin.users.removeAdmin') : t('admin.users.makeAdmin')}
+                  </button>
+                  {u.totpEnabled && (
+                    <IconBtn onClick={() => handleDisableTotp(u)} title={t('admin.users.disable2fa')}>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <rect x="5" y="11" width="14" height="11" rx="2" ry="2"/>
+                        <path d="M11 15v2M8 11V7a4 4 0 018 0v4"/>
+                      </svg>
+                    </IconBtn>
+                  )}
+                  <IconBtn onClick={() => handleDeleteUser(u)} title={t('admin.users.deleteUser')} danger>
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <rect x="5" y="11" width="14" height="11" rx="2" ry="2"/>
-                      <path d="M11 15v2M8 11V7a4 4 0 018 0v4"/>
+                      <polyline points="3 6 5 6 21 6"/>
+                      <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
                     </svg>
                   </IconBtn>
-                )}
-                <IconBtn onClick={() => handleDeleteUser(u)} title={t('admin.users.deleteUser')} danger>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <polyline points="3 6 5 6 21 6"/>
-                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
-                  </svg>
-                </IconBtn>
-              </div>
-            )}
+                </div>
+              )}
+            </div>
           </div>
         ))}
         {users.length < userTotal && (
@@ -5402,7 +5172,7 @@ function UsersAndInvitesPanel() {
                       {inv.email}
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 1 }}>
-                      {t('admin.users.inviteExpires', { date: new Date(inv.expires_at).toLocaleDateString() })}
+                      {t('admin.users.inviteExpires', { date: formatDay(inv.expires_at) })}
                     </div>
                   </div>
                   <button
@@ -5452,8 +5222,8 @@ function UsersAndInvitesPanel() {
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 1 }}>
                     {inv.used_at
-                      ? t('admin.users.inviteUsedBy', { username: inv.used_by_username || 'unknown', date: new Date(inv.used_at).toLocaleDateString() })
-                      : t('admin.users.inviteExpired', { date: new Date(inv.expires_at).toLocaleDateString() })}
+                      ? t('admin.users.inviteUsedBy', { username: inv.used_by_username || 'unknown', date: formatDay(inv.used_at) })
+                      : t('admin.users.inviteExpired', { date: formatDay(inv.expires_at) })}
                   </div>
                 </div>
                 <IconBtn onClick={() => handleRevokeInvite(inv.id)} title={t('admin.users.inviteDelete')} danger>
@@ -5483,6 +5253,21 @@ function UsersAndInvitesPanel() {
         </button>
       )}
       <ConfirmOverlay dialog={confirmDialog} onClose={() => setConfirmDialog(null)} />
+      {editingUser && (
+        <AdminUserEditor
+          user={editingUser}
+          isSelf={editingUser.id === currentUser?.id}
+          onClose={() => setEditingUser(null)}
+          onChanged={updated => {
+            setUsers(us => us.map(x => (x.id === updated.id ? { ...x, ...updated } : x)));
+            setEditingUser(updated);
+          }}
+          onSaved={updated => {
+            setUsers(us => us.map(x => (x.id === updated.id ? { ...x, ...updated } : x)));
+            setEditingUser(null);
+          }}
+        />
+      )}
     </div>
     </>
   );
@@ -5886,7 +5671,7 @@ function ConfirmOverlay({ dialog, onClose }) {
         background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
         borderRadius: 12, padding: '24px 24px 20px', maxWidth: 360, width: '100%',
         boxShadow: 'var(--shadow-modal)',
-        animation: 'modal-enter var(--motion-normal) var(--ease-emphasized) both',
+        animation: 'modal-enter var(--motion-normal) var(--ease-emphasized) backwards',
       }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: '0 0 8px', fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
           {dialog.title}
@@ -5930,6 +5715,7 @@ const LANGUAGES = [
   { code: 'pl', nativeName: 'Polski' },
   { code: 'cs', nativeName: 'Čeština' },
   { code: 'ptBR', nativeName: 'Português (Brasil)' },
+  { code: 'ko', nativeName: '한국어' },
 ];
 
 function LanguageTab() {
@@ -6441,11 +6227,13 @@ function RulesTab() {
   function actionSummary(rule) {
     const acts = Array.isArray(rule.actions) ? rule.actions : [];
     if (!acts.length) return '—';
-    const labels = { mark_read: t('admin.rules.actionMarkRead'), star: t('admin.rules.actionStar'), forward: t('admin.rules.actionForward'), archive: t('admin.rules.actionArchive'), delete: t('admin.rules.actionDelete'), move: t('admin.rules.actionMove') };
-    // Show the move destination so same-named rules are tellable apart at a glance.
-    return acts.map(a => a.type === 'move' && a.value
-      ? `${labels.move} → ${a.value}`
-      : (labels[a.type] || a.type)).join(', ');
+    const labels = { mark_read: t('admin.rules.actionMarkRead'), star: t('admin.rules.actionStar'), forward: t('admin.rules.actionForward'), archive: t('admin.rules.actionArchive'), delete: t('admin.rules.actionDelete'), move: t('admin.rules.actionMove'), set_category: t('admin.rules.actionSetCategory'), notify: t('admin.rules.actionNotify') };
+    // Show the move destination and the category so same-named rules are tellable apart at a glance.
+    return acts.map(a => {
+      if (a.type === 'move' && a.value) return `${labels.move} → ${a.value}`;
+      if (a.type === 'set_category' && a.value) return `${labels.set_category} → ${t(`messageList.categories.${a.value}`)}`;
+      return labels[a.type] || a.type;
+    }).join(', ');
   }
 
   const FIELDS = [
@@ -6465,6 +6253,7 @@ function RulesTab() {
     { value: 'ends_with',    label: t('admin.rules.opEndsWith') },
   ];
   const HEADER_OPERATORS = [...OPERATORS, { value: 'regex', label: t('admin.rules.opRegex') }];
+  const RULE_CATEGORIES = ['primary', 'newsletter', 'promotion', 'automated', 'social'];
   const ACTION_TYPES = [
     { type: 'mark_read', label: t('admin.rules.actionMarkRead') },
     { type: 'star',      label: t('admin.rules.actionStar') },
@@ -6472,6 +6261,8 @@ function RulesTab() {
     { type: 'archive',   label: t('admin.rules.actionArchive') },
     { type: 'delete',    label: t('admin.rules.actionDelete') },
     { type: 'move',      label: t('admin.rules.actionMove') },
+    { type: 'set_category', label: t('admin.rules.actionSetCategory') },
+    { type: 'notify',    label: t('admin.rules.actionNotify') },
   ];
 
   if (formMode) {
@@ -6680,6 +6471,24 @@ function RulesTab() {
                     />
                   );
                 })()}
+                {type === 'notify' && (
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginLeft: 22, marginTop: 2 }}>
+                    {t('admin.rules.actionNotifyHint')}
+                  </div>
+                )}
+                {type === 'set_category' && checked && (
+                  <select
+                    aria-label={t('admin.rules.actionSetCategory')}
+                    style={{ ...inputStyle, marginTop: 6, marginLeft: 22 }}
+                    value={fd.actions.find(action => action.type === 'set_category')?.value || ''}
+                    onChange={event => setActionValue('set_category', event.target.value)}
+                  >
+                    <option value="">{t('admin.rules.actionSetCategorySelect')}</option>
+                    {RULE_CATEGORIES.map(cat => (
+                      <option key={cat} value={cat}>{t(`messageList.categories.${cat}`)}</option>
+                    ))}
+                  </select>
+                )}
                 {type === 'forward' && checked && (
                   <input
                     type="email"
@@ -6999,21 +6808,44 @@ function MailboxCleanupTab() {
 
   useEffect(() => { if (accountId) load(accountId); }, [accountId, load]);
 
-  const cleanupSender = async (s) => {
+  // Senders ticked for a batch run; keyed by fromEmail. Only ever read through
+  // `selectedSenders`, so senders that vanish after a refresh drop out on their own.
+  const [selected, setSelected] = useState(() => new Set());
+  const senders = data?.tier1Senders || [];
+  const selectedSenders = senders.filter(s => selected.has(s.fromEmail));
+  const allSelected = senders.length > 0 && selectedSenders.length === senders.length;
+  // The row-button busy marker for a batch run; not a valid fromEmail, so no row matches it.
+  const BATCH = '*';
+  useEffect(() => { setSelected(new Set()); }, [accountId]);
+
+  const toggleSender = (email) => setSelected(prev => {
+    const next = new Set(prev);
+    if (!next.delete(email)) next.add(email);
+    return next;
+  });
+
+  // One confirm and one progress bar for the whole list; each sender is still resolved server-side
+  // (own account, INBOX, exact sender) and moved in <=500-id batches, in sequence.
+  const cleanupSenders = async (list) => {
     const isArchive = action === 'archive';
-    const label = s.fromName ? `${s.fromName} <${s.fromEmail}>` : s.fromEmail;
+    const labelOf = (s) => (s.fromName ? `${s.fromName} <${s.fromEmail}>` : s.fromEmail);
+    const shown = list.slice(0, 3).map(labelOf).join(', ');
+    const label = list.length > 3 ? `${shown} +${list.length - 3}` : shown;
+    const grandTotal = list.reduce((n, s) => n + s.count, 0);
     const confirmKey = isArchive ? 'admin.cleanup.confirmArchive' : 'admin.cleanup.confirm';
-    if (!window.confirm(t(confirmKey, { count: s.count, sender: label }))) return;
-    setBusySender(s.fromEmail); setError(''); setProgress({ done: 0, total: s.count });
+    if (!window.confirm(t(confirmKey, { count: grandTotal, sender: label }))) return;
+    setBusySender(list.length === 1 ? list[0].fromEmail : BATCH); setError(''); setProgress({ done: 0, total: grandTotal });
     try {
-      const { ids } = await api.cleanupPreview(accountId, s.fromEmail);
       const runBatch = isArchive ? api.bulkArchive : api.bulkDelete;
       let done = 0;
-      for (let i = 0; i < ids.length; i += 500) {
-        const batch = ids.slice(i, i + 500);
-        await runBatch(batch);
-        done += batch.length;
-        setProgress({ done, total: ids.length });
+      for (const s of list) {
+        const { ids } = await api.cleanupPreview(accountId, s.fromEmail);
+        for (let i = 0; i < ids.length; i += 500) {
+          const batch = ids.slice(i, i + 500);
+          await runBatch(batch);
+          done += batch.length;
+          setProgress({ done, total: grandTotal });
+        }
       }
     } catch (e) { setError(e.message); }
     finally {
@@ -7035,7 +6867,7 @@ function MailboxCleanupTab() {
 
       {accounts.length > 1 && (
         <Field label={t('admin.cleanup.account')}>
-          <select value={accountId} onChange={e => setAccountId(e.target.value)} style={{ ...inputStyle, appearance: 'none' }}>
+          <select value={accountId} disabled={!!busySender} onChange={e => setAccountId(e.target.value)} style={{ ...inputStyle, appearance: 'none' }}>
             {accounts.map(a => <option key={a.id} value={a.id}>{a.email_address}</option>)}
           </select>
         </Field>
@@ -7090,8 +6922,44 @@ function MailboxCleanupTab() {
             <div style={muted}>{t('admin.cleanup.noneFound')}</div>
           ) : (
             <div style={{ marginBottom: 20 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 4px', borderBottom: '1px solid var(--border-subtle)' }}>
+                <input
+                  type="checkbox"
+                  id="cleanup-select-all"
+                  checked={allSelected}
+                  disabled={!!busySender}
+                  onChange={() => setSelected(allSelected ? new Set() : new Set(senders.map(s => s.fromEmail)))}
+                />
+                <label htmlFor="cleanup-select-all" style={{ ...muted, flex: 1, cursor: 'pointer' }}>
+                  {t(allSelected ? 'messageList.deselectAll' : 'messageList.selectAll')}
+                </label>
+                <button
+                  type="button"
+                  disabled={!!busySender || selectedSenders.length === 0}
+                  onClick={() => cleanupSenders(selectedSenders)}
+                  style={{
+                    flexShrink: 0, padding: '6px 12px', borderRadius: 7, fontSize: 12, fontWeight: 500,
+                    border: '1px solid var(--border)',
+                    cursor: (busySender || selectedSenders.length === 0) ? 'not-allowed' : 'pointer',
+                    background: action === 'archive' ? 'var(--accent)' : 'var(--amber, #d97706)',
+                    color: action === 'archive' ? 'var(--accent-text, white)' : 'white',
+                    opacity: selectedSenders.length === 0 || (busySender && busySender !== BATCH) ? 0.5 : 1,
+                  }}
+                >
+                  {busySender === BATCH && progress
+                    ? `${progress.done.toLocaleString()}/${progress.total.toLocaleString()}`
+                    : `${t(action === 'archive' ? 'admin.cleanup.archive' : 'admin.cleanup.moveToTrash')} (${selectedSenders.length})`}
+                </button>
+              </div>
               {data.tier1Senders.map(s => (
                 <div key={s.fromEmail} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 4px', borderBottom: '1px solid var(--border-subtle)' }}>
+                  <input
+                    type="checkbox"
+                    checked={selected.has(s.fromEmail)}
+                    disabled={!!busySender}
+                    onChange={() => toggleSender(s.fromEmail)}
+                    aria-label={s.fromName || s.fromEmail}
+                  />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.fromName || s.fromEmail}</div>
                     {s.fromName && <div style={{ ...muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.fromEmail}</div>}
@@ -7100,7 +6968,7 @@ function MailboxCleanupTab() {
                   <button
                     type="button"
                     disabled={!!busySender}
-                    onClick={() => cleanupSender(s)}
+                    onClick={() => cleanupSenders([s])}
                     style={{
                       flexShrink: 0, padding: '6px 12px', borderRadius: 7, fontSize: 12, fontWeight: 500,
                       border: '1px solid var(--border)', cursor: busySender ? 'not-allowed' : 'pointer',
@@ -7141,21 +7009,17 @@ function MailboxCleanupTab() {
 }
 
 const TAB_GROUPS = [
-  { id: 'account-mail', labelKey: 'admin.tabs.groupAccountMail', tabIds: ['accounts', 'notifications', 'rules', 'categories', 'cleanup', 'antispam'] },
-  { id: 'display', labelKey: 'admin.tabs.groupDisplay', tabIds: ['appearance', 'shortcuts'] },
-  { id: 'security-integrations', labelKey: 'admin.tabs.groupSecurityIntegrations', tabIds: ['security', 'integrations', 'ai', 'ai-actions', 'plugins'] },
-  { id: 'admin', labelKey: 'admin.tabs.groupAdmin', tabIds: ['users', 'sso'] },
+  { id: 'mail', labelKey: 'admin.tabs.groupMail', tabIds: ['accounts', 'rules', 'categories', 'antispam', 'cleanup'] },
+  { id: 'preferences', labelKey: 'admin.tabs.groupPreferences', tabIds: ['appearance', 'behavior', 'notifications', 'shortcuts', 'security'] },
+  { id: 'ai-extensions', labelKey: 'admin.tabs.groupAiExtensions', tabIds: ['ai-actions', 'ai', 'integrations', 'plugins'] },
+  { id: 'admin', labelKey: 'admin.tabs.groupAdmin', tabIds: ['users', 'sso', 'mail-signin', 'backup'] },
 ];
 
 const TABS = [
-  // Account & Mail
+  // Mail
   {
     id: 'accounts', labelKey: 'admin.tabs.accounts',
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
-  },
-  {
-    id: 'notifications', labelKey: 'admin.tabs.notifications',
-    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/><path d="M19.07 4.93a10 10 0 010 14.14"/></svg>,
   },
   {
     id: 'rules', labelKey: 'admin.tabs.rules',
@@ -7166,31 +7030,39 @@ const TABS = [
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
   },
   {
-    id: 'cleanup', labelKey: 'admin.tabs.cleanup', beta: true,
-    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M19 3l-6 6"/><path d="M14 4l6 6"/><path d="M11 8l-7 7c-1 1-1 3 0 4s3 1 4 0l7-7"/><path d="M6 20l-3-3"/></svg>,
-  },
-  {
     id: 'antispam', labelKey: 'admin.tabs.antispam',
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z"/><path d="M19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14z"/><path d="M5 15l.6 1.8L7.5 17l-1.9.7L5 19.5l-.6-1.8L2.5 17l1.9-.7L5 15z"/></svg>,
   },
-  // Display
+  {
+    id: 'cleanup', labelKey: 'admin.tabs.cleanup', beta: true,
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M19 3l-6 6"/><path d="M14 4l6 6"/><path d="M11 8l-7 7c-1 1-1 3 0 4s3 1 4 0l7-7"/><path d="M6 20l-3-3"/></svg>,
+  },
+  // Preferences
   {
     id: 'appearance', labelKey: 'admin.tabs.appearance',
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>,
+  },
+  {
+    id: 'behavior', labelKey: 'admin.tabs.behavior',
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>,
+  },
+  {
+    id: 'notifications', labelKey: 'admin.tabs.notifications',
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/><path d="M19.07 4.93a10 10 0 010 14.14"/></svg>,
   },
   {
     id: 'shortcuts', labelKey: 'admin.tabs.shortcuts',
     mobileHidden: true,
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><rect x="2" y="7" width="6" height="4" rx="1"/><rect x="9" y="7" width="6" height="4" rx="1"/><rect x="16" y="7" width="6" height="4" rx="1"/><rect x="2" y="13" width="9" height="4" rx="1"/><rect x="13" y="13" width="9" height="4" rx="1"/></svg>,
   },
-  // Security & Integrations
   {
     id: 'security', labelKey: 'admin.tabs.security',
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>,
   },
+  // AI & Extensions
   {
-    id: 'integrations', labelKey: 'admin.tabs.integrations',
-    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><circle cx="12" cy="12" r="3"/><path d="M6.343 6.343a8 8 0 000 11.314M17.657 6.343a8 8 0 010 11.314M3 12h1m16 0h1M12 3v1m0 16v1"/></svg>,
+    id: 'ai-actions', labelKey: 'admin.tabs.aiActions',
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h.01M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></svg>,
   },
   {
     id: 'ai', labelKey: 'admin.tabs.ai',
@@ -7198,14 +7070,14 @@ const TABS = [
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></svg>,
   },
   {
-    id: 'ai-actions', labelKey: 'admin.tabs.aiActions',
-    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h.01M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></svg>,
+    id: 'integrations', labelKey: 'admin.tabs.integrations',
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><circle cx="12" cy="12" r="3"/><path d="M6.343 6.343a8 8 0 000 11.314M17.657 6.343a8 8 0 010 11.314M3 12h1m16 0h1M12 3v1m0 16v1"/></svg>,
   },
   {
     id: 'plugins', labelKey: 'admin.tabs.plugins', beta: true,
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M6 3v6M18 3v6M6 21v-6M18 21v-6M4 9h16v3a6 6 0 01-6 6h-4a6 6 0 01-6-6V9z"/></svg>,
   },
-  // Admin
+  // Administration
   {
     id: 'users', labelKey: 'admin.tabs.users',
     adminOnly: true,
@@ -7215,6 +7087,16 @@ const TABS = [
     id: 'sso', labelKey: 'admin.tabs.sso',
     adminOnly: true,
     icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>,
+  },
+  {
+    id: 'mail-signin', labelKey: 'admin.tabs.mailSignIn',
+    adminOnly: true,
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2 7 12 13 22 7"/><circle cx="18" cy="17" r="3" fill="var(--bg-secondary)"/><path d="M18 15.5v1.5l1 .8"/></svg>,
+  },
+  {
+    id: 'backup', labelKey: 'admin.tabs.backup',
+    adminOnly: true,
+    icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
   },
   // About (ungrouped, pinned to bottom)
   {
@@ -7228,9 +7110,9 @@ function ShortcutsTab() {
   const { t } = useTranslation();
   const { shortcuts, setShortcuts } = useStore();
   const [recording, setRecording] = useState(null); // action name currently being recorded
-  const [pendingConflict, setPendingConflict] = useState(null); // { action: conflictingAction, key }
 
   const effective = getEffectiveShortcuts(shortcuts);
+  const conflicts = getShortcutConflicts(shortcuts);
   const groups = getGroupedActions();
 
   // Listen for key presses while recording
@@ -7243,19 +7125,10 @@ function ShortcutsTab() {
 
       if (e.key === 'Escape') {
         setRecording(null);
-        setPendingConflict(null);
         return;
       }
 
-      const key = (e.ctrlKey || e.metaKey) ? `ctrl+${e.key.toLowerCase()}` : e.key;
-
-      // Detect conflicts with other actions (excluding the one being edited)
-      const conflictEntry = Object.entries(effective).find(([a, k]) => k === key && a !== recording);
-      if (conflictEntry) {
-        setPendingConflict({ action: conflictEntry[0], key });
-      } else {
-        setPendingConflict(null);
-      }
+      const key = shortcutBindingFromEvent(e);
 
       const updated = { ...shortcuts, [recording]: key };
       setShortcuts(updated);
@@ -7263,25 +7136,22 @@ function ShortcutsTab() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [recording, effective, shortcuts]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [recording, shortcuts, setShortcuts]);
 
   const clearShortcut = (action) => {
     const updated = { ...shortcuts, [action]: null };
     setShortcuts(updated);
-    setPendingConflict(null);
   };
 
   const resetAction = (action) => {
     const updated = { ...shortcuts };
     delete updated[action];
     setShortcuts(updated);
-    setPendingConflict(null);
   };
 
   const resetAll = () => {
     setShortcuts({});
     setRecording(null);
-    setPendingConflict(null);
   };
 
   const kbdStyle = {
@@ -7364,15 +7234,15 @@ function ShortcutsTab() {
         </button>
       </div>
 
-      {pendingConflict && (
-        <div style={{
+      {conflicts.map(({ key, loser, winner }) => (
+        <div key={`${key}:${loser}`} style={{
           marginBottom: 16, padding: '10px 14px',
           background: 'rgba(234, 179, 8, 0.1)', border: '1px solid rgba(234, 179, 8, 0.4)',
           borderRadius: 7, fontSize: 12, color: 'var(--text-secondary)',
         }}>
-          {t('admin.shortcuts.conflict', { key: pendingConflict.key, action: shortcutActionText(t, pendingConflict.action, 'label') })}
+          {t('admin.shortcuts.conflict', { key, action: shortcutActionText(t, winner, 'label') })}
         </div>
-      )}
+      ))}
 
       {Object.entries(groups).map(([groupName, actions]) => (
         <div key={groupName} style={{ marginBottom: 24 }}>
@@ -7913,6 +7783,15 @@ function SecurityTab() {
       totp_success:  t('admin.security.eventTotpSuccess'),
       totp_fail:     t('admin.security.eventTotpFail'),
       sso_login:     t('admin.security.eventSsoLogin'),
+      admin_password_set: t('admin.security.eventAdminPasswordSet'),
+      admin_user_update:  t('admin.security.eventAdminUserUpdate'),
+      admin_totp_disable: t('admin.security.eventAdminTotpDisable'),
+      admin_user_delete:  t('admin.security.eventAdminUserDelete'),
+      identity_linked:    t('admin.security.eventIdentityLinked'),
+      identity_unlinked:  t('admin.security.eventIdentityUnlinked'),
+      api_token_created:   t('admin.security.eventApiTokenCreated'),
+      api_token_revoked:   t('admin.security.eventApiTokenRevoked'),
+      api_token_auth_fail: t('admin.security.eventApiTokenAuthFail'),
     };
     return map[type] || type;
   };
@@ -8307,6 +8186,8 @@ function SecurityTab() {
         )}
       </div>
 
+      <ApiTokensSection />
+
       {/* MFA enforcement — admin only */}
       {user?.isAdmin && (
         <div style={{
@@ -8497,10 +8378,14 @@ function SecurityTab() {
                   {authEvents.map(ev => (
                     <tr key={ev.id} style={{ borderBottom: '1px solid var(--border-subtle, var(--border))' }}>
                       <td style={{ padding: '6px 8px', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
-                        {new Date(ev.created_at).toLocaleString()}
+                        {formatDateTime(ev.created_at)}
                       </td>
                       <td style={{ padding: '6px 8px', color: 'var(--text-primary)', whiteSpace: 'nowrap' }}>
                         {eventLabel(ev.event_type)}
+                        {/* Admin changes to a user: the User column is the account changed, this is who changed it. */}
+                        {ev.actor_username && (
+                          <span style={{ color: 'var(--text-secondary)' }}> {t('admin.security.byActor', { actor: ev.actor_username })}</span>
+                        )}
                       </td>
                       <td style={{ padding: '6px 8px', color: 'var(--text-secondary)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {ev.username || '—'}
@@ -8529,21 +8414,75 @@ function SecurityTab() {
   );
 }
 
-function LinkedIdentitiesSection() {
+const ssoProviderButtonStyle = {
+  padding: '7px 14px', borderRadius: 7, fontSize: 13, fontWeight: 500,
+  background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
+  color: 'var(--text-secondary)', textDecoration: 'none', cursor: 'pointer',
+  display: 'inline-flex', alignItems: 'center', gap: 6,
+};
+
+// The single sign-on identities linked to the account. Linking one more takes the confirmation
+// creating an API token does (#714): the server says which (GET /auth/oidc/identities answers
+// `reauth`) and POST /auth/oidc/link-confirm checks it before the browser goes to the provider.
+// `navigate` is how it goes there; a test passes its own, as jsdom cannot navigate.
+export function LinkedIdentitiesSection({ navigate = (url) => { window.location.href = url; } }) {
   const { t } = useTranslation();
   const [identities, setIdentities] = useState(null); // null = loading
   const [providers, setProviders] = useState([]);
+  const [reauth, setReauth] = useState(null); // 'password' | 'totp' | 'oidc' | 'totpSetup'
+  const [oidc, setOidc] = useState(null); // with 'oidc': { providers, confirmedUntil }
   const [confirmDialog, setConfirmDialog] = useState(null);
+  const [linking, setLinking] = useState(null); // the provider whose link waits for its confirmation
+  const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [checking, setChecking] = useState(false);
+  const [linkError, setLinkError] = useState('');
 
-  useEffect(() => {
-    Promise.all([
-      api.oidc.getIdentities(),
-      api.oidc.getProviders(),
-    ]).then(([idData, provData]) => {
-      setIdentities(idData.identities);
-      setProviders(provData.providers || []);
-    }).catch(() => setIdentities([]));
-  }, []);
+  const load = useCallback(() => Promise.all([
+    api.oidc.getIdentities(),
+    api.oidc.getProviders(),
+  ]).then(([idData, provData]) => {
+    setIdentities(idData.identities);
+    setReauth(idData.reauth ?? null);
+    setOidc(idData.oidc ?? null);
+    setProviders(provData.providers || []);
+  }).catch(() => setIdentities(ids => ids ?? [])), []);
+  useEffect(() => { load(); }, [load]);
+
+  // An account without password sign-in confirms with a sign-in just made through a provider it
+  // has (the buttons in the form below); the server says until when the last one counts.
+  const oidcProviders = Array.isArray(oidc?.providers) ? oidc.providers : [];
+  const oidcConfirmed = reauth === 'oidc' && !!oidc?.confirmedUntil && new Date(oidc.confirmedUntil) > new Date();
+  const canContinue = !checking && (reauth === 'totp' ? code.length === 6 : reauth === 'password' ? !!password : false);
+
+  const openLinkForm = (provider) => { setLinking(provider); setPassword(''); setCode(''); setLinkError(''); };
+  const closeLinkForm = () => openLinkForm(null);
+
+  // The confirmation, then the provider: the link start spends what the server just recorded.
+  const confirmAndLink = async (provider, body) => {
+    setChecking(true);
+    setLinkError('');
+    try {
+      await api.oidc.confirmLink(body);
+      navigate(`/auth/oidc/${provider.slug}/start?action=link`);
+    } catch (err) {
+      setLinking(provider);
+      setLinkError(err.message);
+      // A code works once, and a refused password is typed again, as when turning 2FA off.
+      setPassword('');
+      setCode('');
+      setChecking(false);
+      // A refusal can mean what confirms a link changed: two-factor turned on, or the policy.
+      load();
+    }
+  };
+  // With a sign-in through single sign-on already made, there is nothing left to ask for.
+  const startLink = (provider) => (oidcConfirmed ? confirmAndLink(provider, {}) : openLinkForm(provider));
+  const submitLinkForm = (e) => {
+    e.preventDefault();
+    if (!canContinue) return;
+    confirmAndLink(linking, reauth === 'totp' ? { totpCode: code } : { password });
+  };
 
   const handleUnlink = (identity) => {
     setConfirmDialog({
@@ -8575,6 +8514,11 @@ function LinkedIdentitiesSection() {
         <div style={{ fontSize: 13, color: 'var(--text-tertiary)', marginBottom: 16 }}>
           {t('admin.security.ssoDescription')}
         </div>
+        {oidcConfirmed && (
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 16 }}>
+            {t('admin.security.ssoLinkConfirmed', { time: formatTime(oidc.confirmedUntil) })}
+          </div>
+        )}
 
         {/* Linked identities */}
         {identities.length > 0 && (
@@ -8608,26 +8552,114 @@ function LinkedIdentitiesSection() {
           </div>
         )}
 
-        {/* Link new provider */}
-        {unlinkableProviders.length > 0 && (
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {unlinkableProviders.map(p => (
-              <a
-                key={p.id}
-                href={`/auth/oidc/${p.slug}/start?action=link`}
+        {/* Link new provider: first its confirmation (#714), then the provider */}
+        {linking ? (
+          <form onSubmit={submitLinkForm} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {reauth === 'password' && (
+              <>
+                <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)' }}>
+                  {t('admin.security.ssoLinkConfirmPassword', { provider: linking.name })}
+                </p>
+                <PasswordInput
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  autoFocus
+                  placeholder={t('admin.security.totpDisablePh')}
+                  style={{ ...inputStyle }}
+                  onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+                  onBlur={e => e.target.style.borderColor = 'var(--border)'}
+                />
+              </>
+            )}
+            {reauth === 'totp' && (
+              <>
+                <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)' }}>
+                  {t('admin.security.ssoLinkConfirmTotp', { provider: linking.name })}
+                </p>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={6}
+                  value={code}
+                  onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  autoFocus
+                  placeholder={t('admin.security.totpVerifyPh')}
+                  style={{ ...inputStyle, letterSpacing: '0.3em', fontVariantNumeric: 'tabular-nums' }}
+                  onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+                  onBlur={e => e.target.style.borderColor = 'var(--border)'}
+                />
+              </>
+            )}
+            {reauth === 'oidc' && (
+              <>
+                <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)' }}>
+                  {oidcProviders.length > 0
+                    ? t('admin.security.ssoLinkConfirmOidc', { provider: linking.name })
+                    : t('admin.security.ssoLinkConfirmNoProvider')}
+                </p>
+                {oidcProviders.length > 0 && (
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    {oidcProviders.map(p => (
+                      <a key={p.slug} href={`/auth/oidc/${p.slug}/start?action=reauth`} style={ssoProviderButtonStyle}>
+                        {t('admin.security.ssoLinkConfirmOidcButton', { provider: p.name })}
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+            {reauth === 'totpSetup' && (
+              <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)' }}>
+                {t('admin.security.ssoLinkConfirmTotpSetup')}
+              </p>
+            )}
+            {linkError && (
+              <div role="alert" style={{
+                padding: '8px 10px', background: 'rgba(248,113,113,0.1)',
+                border: '1px solid rgba(248,113,113,0.3)', borderRadius: 7, color: 'var(--red)', fontSize: 12,
+              }}>
+                {linkError}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              {(reauth === 'password' || reauth === 'totp') && (
+                <button
+                  type="submit"
+                  disabled={!canContinue}
+                  style={{
+                    padding: '8px 16px', background: 'var(--accent)', border: 'none',
+                    borderRadius: 7, color: 'var(--accent-text)', fontSize: 13, fontWeight: 500,
+                    cursor: canContinue ? 'pointer' : 'not-allowed', opacity: canContinue ? 1 : 0.6,
+                  }}
+                >
+                  {checking ? t('admin.security.ssoLinkChecking') : t('admin.security.ssoLinkContinue')}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={closeLinkForm}
                 style={{
-                  padding: '7px 14px', borderRadius: 7, fontSize: 13, fontWeight: 500,
-                  background: 'var(--bg-tertiary)', border: '1px solid var(--border)',
-                  color: 'var(--text-secondary)', textDecoration: 'none', cursor: 'pointer',
-                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '8px 16px', background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--border)', borderRadius: 7,
+                  color: 'var(--text-secondary)', fontSize: 13, cursor: 'pointer',
                 }}
               >
+                {t('common.cancel')}
+              </button>
+            </div>
+          </form>
+        ) : unlinkableProviders.length > 0 && (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {unlinkableProviders.map(p => (
+              <button key={p.id} type="button" onClick={() => startLink(p)} style={ssoProviderButtonStyle}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/>
                   <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>
                 </svg>
                 {t('admin.security.ssoLink', { provider: p.name })}
-              </a>
+              </button>
             ))}
           </div>
         )}
@@ -8647,6 +8679,7 @@ function LinkedIdentitiesSection() {
 function makeSearchIndex(t) {
   const tabLabel = (id) => t(`admin.tabs.${id}`);
   const layoutCrumb = `${tabLabel('appearance')} › ${t('admin.appearance.layout')}`;
+  const behaviorCrumb = tabLabel('behavior');
   const fontsCrumb = `${tabLabel('appearance')} › ${tabLabel('fontsAndLanguage')}`;
   const secCrumb = `${tabLabel('security')} › ${tabLabel('security')}`;
   const privCrumb = `${tabLabel('security')} › ${tabLabel('privacy')}`;
@@ -8654,40 +8687,50 @@ function makeSearchIndex(t) {
     // Accounts
     { label: t('admin.accounts.title'), keywords: ['account', 'email', 'imap', 'smtp', 'gmail', 'yahoo', 'icloud', 'password', 'add account', 'connect'], tab: 'accounts', breadcrumb: tabLabel('accounts') },
     { label: t('admin.accounts.signatureSection'), keywords: ['signature', 'sign off', 'footer', 'alias', 'send as'], tab: 'accounts', breadcrumb: tabLabel('accounts') },
+    { label: t('admin.accounts.autoRecipientsSection'), keywords: ['cc', 'bcc', 'copy', 'carbon copy', 'blind copy', 'always bcc', 'automatic', 'copy to myself'], tab: 'accounts', breadcrumb: tabLabel('accounts') },
     // Rules
     { label: t('admin.rules.title'), keywords: ['rule', 'filter', 'condition', 'action', 'move', 'auto', 'automate', 'inbox rule', 'sort'], tab: 'rules', subtab: 'rules', breadcrumb: `${tabLabel('rules')} › ${t('admin.rules.subTabRules')}` },
     { label: t('admin.rules.subTabBlockList'), keywords: ['block', 'blocked', 'sender', 'blacklist', 'spam', 'domain'], tab: 'rules', subtab: 'block-list', breadcrumb: `${tabLabel('rules')} › ${t('admin.rules.subTabBlockList')}` },
     // Appearance > Theme
     { label: tabLabel('theme'), keywords: ['theme', 'dark', 'light', 'color', 'colour', 'dark mode', 'light mode'], tab: 'appearance', subtab: 'theme', breadcrumb: `${tabLabel('appearance')} › ${tabLabel('theme')}` },
+    { label: t('admin.appearance.darkEmailBodies'), keywords: ['dark email', 'email body', 'dark mode', 'dark message', 'white background'], tab: 'appearance', subtab: 'theme', breadcrumb: `${tabLabel('appearance')} › ${tabLabel('theme')}` },
     // Appearance > Layout
     { label: t('admin.appearance.layout'), keywords: ['layout', 'pane', 'split', 'preview', 'reading pane', 'side by side', 'stacked'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.scrollingMode'), keywords: ['scroll', 'infinite', 'paginated', 'pagination', 'pages'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.perPagePaginated'), keywords: ['per page', 'batch', 'messages per page', 'count', '25', '50', '100', '200', 'page size'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
-    { label: t('admin.messageList.hoverQuickActionsMode'), keywords: ['hover', 'quick actions', 'hover buttons', 'row actions'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
+    { label: t('admin.messageList.hoverQuickActionsMode'), keywords: ['hover', 'quick actions', 'hover buttons', 'row actions'], tab: 'appearance', subtab: 'layout', mobileHidden: true, breadcrumb: layoutCrumb },
     {
       label: t('admin.messageList.senderFavicons'),
       keywords: ['sender', 'favicon', 'avatar', 'contact photo', 'website icon', 'logo'],
       tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb,
     },
-    { label: t('admin.messageList.swipeActions'), keywords: ['swipe', 'gesture', 'mobile', 'swipe left', 'swipe right', 'touch'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
-    { label: t('admin.messageList.syncFrequency'), keywords: ['sync', 'interval', 'frequency', 'refresh', 'poll', 'check mail', '15s', '30s', '60s'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
-    { label: t('admin.messageList.folderSyncFrequency'), keywords: ['folder', 'sync', 'structure', 'list', 'refresh', 'mailbox', '15 min', '30 min', '1 hour', 'never'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
     { label: t('admin.messageList.threadingMode'), keywords: ['thread', 'conversation', 'grouping', 'threading', 'group'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
-    { label: t('admin.messageList.composeFormat'), keywords: ['compose', 'format', 'rich text', 'plain text', 'html', 'editor'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
-    { label: t('admin.messageList.defaultReplyAction'), keywords: ['reply', 'reply all', 'default reply'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
-    { label: t('admin.messageList.markReadBehavior'), keywords: ['mark read', 'mark as read', 'read delay', 'auto read', 'manual read', 'unread'], tab: 'appearance', subtab: 'layout', breadcrumb: layoutCrumb },
+    // Behavior
+    { label: t('admin.messageList.swipeActions'), keywords: ['swipe', 'gesture', 'mobile', 'swipe left', 'swipe right', 'touch'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.syncFrequency'), keywords: ['sync', 'interval', 'frequency', 'refresh', 'poll', 'check mail', '15s', '30s', '60s'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.folderSyncFrequency'), keywords: ['folder', 'sync', 'structure', 'list', 'refresh', 'mailbox', '15 min', '30 min', '1 hour', 'never'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.composeFormat'), keywords: ['compose', 'format', 'rich text', 'plain text', 'html', 'editor'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.defaultReplyAction'), keywords: ['reply', 'reply all', 'default reply'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.afterRemove'), keywords: ['next message', 'auto advance', 'after delete', 'after archive', 'open next', 'previous message'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.markReadBehavior'), keywords: ['mark read', 'mark as read', 'read delay', 'auto read', 'manual read', 'unread'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.defaultSender'), keywords: ['from', 'sender', 'default sender', 'send from', 'alias', 'identity'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('admin.messageList.defaultMailApp'), keywords: ['mailto', 'default app', 'default email', 'protocol handler', 'links'], tab: 'behavior', breadcrumb: behaviorCrumb },
     // Appearance > Fonts & Language
-    { label: t('admin.appearance.language'), keywords: ['language', 'locale', 'french', 'english', 'spanish', 'german', 'deutsch', 'russian', 'chinese', 'italian', 'czech', 'čeština', 'portuguese', 'português', 'brasil', 'français', 'español'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
+    { label: t('admin.appearance.language'), keywords: ['language', 'locale', 'french', 'english', 'spanish', 'german', 'deutsch', 'russian', 'chinese', 'italian', 'czech', 'čeština', 'portuguese', 'português', 'brasil', 'korean', '한국어', 'français', 'español'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
     { label: t('admin.appearance.fontSize'), keywords: ['font size', 'text size', 'zoom', 'scale', 'accessibility', 'larger text'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
     { label: t('admin.appearance.typography'), keywords: ['font', 'typography', 'typeface', 'serif', 'sans', 'monospace', 'reading font'], tab: 'appearance', subtab: 'fonts', breadcrumb: fontsCrumb },
+    // Email providers (admin)
+    { label: t('mailSignIn.ms.title'), keywords: ['microsoft', 'outlook', 'hotmail', '365', 'oauth', 'azure', 'entra', 'client id', 'tenant', 'ms365', 'office', 'shared app', 'sign in', 'email providers', 'mailbox', 'mail sign-in'], tab: 'mail-signin', adminOnly: true, breadcrumb: t('admin.tabs.mailSignIn') },
+    { label: t('admin.integrations.google.title'), keywords: ['google', 'gmail', 'workspace', 'oauth', 'client id', 'sign in', 'email providers', 'mailbox'], tab: 'mail-signin', adminOnly: true, breadcrumb: t('admin.tabs.mailSignIn') },
     // Integrations
-    { label: t('admin.integrations.microsoft.title'), keywords: ['microsoft', 'outlook', '365', 'oauth', 'azure', 'client id', 'tenant', 'ms365', 'office'], tab: 'integrations', breadcrumb: tabLabel('integrations') },
+    { label: t('admin.integrations.todoist.title'), keywords: ['todoist', 'tasks', 'to-do', 'carddav', 'contacts sync'], tab: 'integrations', breadcrumb: tabLabel('integrations') },
     { label: t('admin.ai.title'), keywords: ['ai', 'artificial intelligence', 'chatgpt', 'ollama', 'llm', 'language model', 'summarize', 'draft', 'compose assistant', 'openai', 'local ai', 'inference', 'gpt'], tab: 'ai', adminOnly: true, breadcrumb: tabLabel('ai') },
     { label: t('admin.plugins.title'), keywords: ['plugin', 'plugins', 'extension', 'extensions', 'add-on', 'addon', 'gtd', 'activate', 'enable feature', 'modules'], tab: 'plugins', breadcrumb: tabLabel('plugins') },
     { label: t('admin.categories.title'), keywords: ['categories', 'categorize', 'newsletter', 'promotion', 'social', 'automated', 'inbox tabs', 'sort emails', 'classify'], tab: 'categories', breadcrumb: tabLabel('categories') },
     { label: t('admin.categories.gtdReveal'), keywords: ['gtd', 'todo', 'getting things done', 'watch', 'delegated', 'someday', 'reference', 'next action', 'waiting', 'inbox zero', 'pet'], tab: 'categories', subtab: 'gtd', breadcrumb: `${tabLabel('categories')} › ${t('admin.categories.gtdReveal')}` },
     // Security
     { label: t('admin.security.totpTitle'), keywords: ['2fa', 'totp', 'authenticator', 'two factor', 'otp', 'two-factor', 'mfa', 'security code'], tab: 'security', subtab: 'security', breadcrumb: secCrumb },
+    { label: t('admin.apiTokens.title'), keywords: ['api', 'token', 'api token', 'access token', 'personal access token', 'bearer', 'mcp', 'script', 'revoke'], tab: 'security', subtab: 'security', breadcrumb: secCrumb },
     { label: t('admin.security.ssoTitle'), keywords: ['sso', 'linked', 'identity', 'provider', 'link', 'unlink', 'oidc', 'connect identity'], tab: 'security', subtab: 'security', breadcrumb: secCrumb },
     { label: t('admin.security.loginProtectionTitle'), keywords: ['login', 'attempts', 'brute force', 'lockout', 'max attempts', 'rate limit'], tab: 'security', subtab: 'security', adminOnly: true, breadcrumb: secCrumb },
     { label: t('admin.security.mailPolicyTitle'), keywords: ['server', 'tls', 'insecure', 'private ip', 'port', 'mail server', 'ssl'], tab: 'security', subtab: 'security', adminOnly: true, breadcrumb: secCrumb },
@@ -8704,7 +8747,8 @@ function makeSearchIndex(t) {
     // Admin-only
     { label: t('admin.systemEmail.tabUsers'), keywords: ['user', 'invite', 'admin', 'role', 'manage users', 'add user'], tab: 'users', adminOnly: true, breadcrumb: tabLabel('users') },
     { label: t('admin.systemEmail.tabEmail'), keywords: ['system email', 'smtp', 'admin email', 'invite email', 'outgoing email'], tab: 'users', adminOnly: true, breadcrumb: tabLabel('users') },
-    { label: t('admin.sso.title'), keywords: ['sso', 'oidc', 'single sign on', 'oauth', 'provider', 'identity provider'], tab: 'sso', adminOnly: true, breadcrumb: tabLabel('sso') },
+    { label: t('admin.sso.title'), keywords: ['sso', 'oidc', 'single sign on', 'single sign-on', 'oauth', 'provider', 'identity provider', 'log in to mailflow'], tab: 'sso', adminOnly: true, breadcrumb: tabLabel('sso') },
+    { label: t('admin.backup.title'), keywords: ['backup', 'restore', 'export', 'import', 'migrate', 'move server', 'transfer', 'download settings'], tab: 'backup', adminOnly: true, breadcrumb: tabLabel('backup') },
   ];
 }
 
@@ -8741,7 +8785,7 @@ function SearchResultsView({ results, query, onNavigate, t }) {
 
 export default function AdminPanel() {
   const { t } = useTranslation();
-  const { setShowAdmin, adminTab, setAdminTab, user } = useStore();
+  const { setShowAdmin, adminTab, setAdminTab, user, fontSize } = useStore();
   const isMobile = useMobile();
   const visibleTabs = TABS.filter(tab => (!tab.adminOnly || user?.isAdmin) && (!tab.mobileHidden || !isMobile));
 
@@ -8825,9 +8869,12 @@ export default function AdminPanel() {
       {adminTab === 'cleanup' && <MailboxCleanupTab />}
       {adminTab === 'appearance' && <AppearanceTab initialSubTab={pendingSubTab} />}
       {adminTab === 'integrations' && <IntegrationsTab />}
+      {adminTab === 'mail-signin' && user?.isAdmin && <MailSignInTab />}
       {adminTab === 'users' && <UsersTab />}
       {adminTab === 'sso' && <SSOTab />}
+      {adminTab === 'backup' && <BackupSettings />}
       {adminTab === 'security' && <SecurityPrivacyTab initialSubTab={pendingSubTab} />}
+      {adminTab === 'behavior' && <BehaviorTab />}
       {adminTab === 'notifications' && <NotificationsTab />}
       {adminTab === 'shortcuts' && !isMobile && <ShortcutsTab />}
       {adminTab === 'ai' && <AISection />}
@@ -8936,9 +8983,11 @@ export default function AdminPanel() {
       <div className="admin-panel admin-window" style={{
         background: 'var(--bg-secondary)', border: '1px solid var(--border)',
         borderRadius: 16, width: '100%', maxWidth: 740,
-        height: '82vh', maxHeight: 700, display: 'flex', overflow: 'hidden',
+        // vh is the real screen, but the app is drawn scaled by the font size (MailApp), so at
+        // 125% a plain 82vh came out taller than the screen and the top went off it.
+        height: `calc(82vh / ${(fontSize || 100) / 100})`, maxHeight: 700, display: 'flex', overflow: 'hidden',
         boxShadow: 'var(--shadow-modal)',
-        animation: 'modal-enter var(--motion-normal) var(--ease-emphasized) both',
+        animation: 'modal-enter var(--motion-normal) var(--ease-emphasized) backwards',
       }}>
         {/* Left sidebar */}
         <div style={{

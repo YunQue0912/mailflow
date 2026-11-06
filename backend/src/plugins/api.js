@@ -27,20 +27,26 @@ export { listThreadHeadsByLabels } from '../services/labelsRead.js';
 // "Did an ordinary mail mutation touch one of my labelled threads?" → scoped user broadcast.
 export { notifyOnLabelTouch } from '../services/labelsRead.js';
 
+// Verify a physical copy's live RFC Message-ID before it authorizes another deletion.
+export const hasMessageCopy = (account, uid, folder, messageId) => getMailEngine().hasMessageCopy(account, uid, folder, messageId);
+export const isLabelStoreAccount = (account) => getMailEngine().isLabelStore(account);
+export const supportsUidPlus = (account) => getMailEngine().supportsUidPlus(account);
+
 // ── Labels (write) ────────────────────────────────────────────────────────────
 // Apply/remove a label (a message copy in a label folder) and mark a thread read. The mail
 // engine is bound in by the platform (getMailEngine) so a plugin performs these mail actions
 // without ever holding the engine itself. resolveLabelCopyUid is pure (no engine).
-export const applyLabel = (account, message, labelFolder) => labelsWrite.applyLabel(getMailEngine(), account, message, labelFolder);
+export const applyLabel = (account, message, labelFolder, options) => labelsWrite.applyLabel(getMailEngine(), account, message, labelFolder, options);
 export const removeLabel = (message, labelFolder) => labelsWrite.removeLabel(getMailEngine(), message, labelFolder);
 export const removeExactLabelCopy = (message, labelFolder, uid) => labelsWrite.removeExactLabelCopy(getMailEngine(), message, labelFolder, uid);
-export const markThreadRead = (account, message) => labelsWrite.markThreadRead(getMailEngine(), account, message);
+export const markThreadRead = (account, message, options) => labelsWrite.markThreadRead(getMailEngine(), account, message, options);
+export const markCopySeen = (account, message) => labelsWrite.markCopySeen(getMailEngine(), account, message);
 export const ensureLabelFolders = (account, folderPaths) => labelsWrite.ensureLabelFolders(getMailEngine(), account, folderPaths);
 export const resolveLabelCopyUid = labelsWrite.resolveLabelCopyUid;
 
 // ── Archive ───────────────────────────────────────────────────────────────────
 // Archive a message's INBOX copy (used by GTD "done"). Engine bound by the platform.
-export const archiveInboxCopy = (account, inboxCopy) => _archiveInboxCopy(getMailEngine(), account, inboxCopy);
+export const archiveInboxCopy = (account, inboxCopy, fromFolder) => _archiveInboxCopy(getMailEngine(), account, inboxCopy, fromFolder);
 
 // ── Realtime broadcast ────────────────────────────────────────────────────────
 // Push a payload to a specific user's live sessions. A plugin can notify its own clients; it
@@ -49,7 +55,8 @@ export const broadcast = (payload, userId) => getMailEngine().broadcast(payload,
 
 // ── Summarize ─────────────────────────────────────────────────────────────────
 // Condense a message into one line via the configured AI provider (fails closed when the
-// provider is off / the summarize feature is disabled). No access to keys or the provider itself.
+// provider is off / the summarize feature is disabled / the user's AI access is off; both take
+// the user, and summarizeMessage checks it itself). No access to keys or the provider itself.
 export { summarizeMessage, summarizeAvailable } from '../services/summarize.js';
 
 // ── Per-plugin storage ────────────────────────────────────────────────────────
@@ -75,9 +82,9 @@ export { isPluginActivated, isPluginActivatedForAccount } from './activation.js'
 export { getAccountConfig, setAccountConfig } from './accountConfig.js';
 
 // ── Folder resolution ─────────────────────────────────────────────────────────
-// Resolve an account's Drafts folder paths (across provider naming). A safe read over the
+// Resolve an account's Drafts, Trash and Junk paths (across provider naming). A safe read over the
 // account's folder mapping — no mail engine, no raw DB.
-export { resolveAllDraftsPaths } from '../utils/mailUtils.js';
+export { resolveAllDraftsPaths, resolveAllTrashPaths, resolveAllSpamPaths } from '../utils/mailUtils.js';
 
 // ── Mail/account reads ────────────────────────────────────────────────────────
 // A fixed, reviewed set of ownership-scoped read queries (see services/mailAccess.js). A plugin
@@ -95,5 +102,6 @@ export {
   getMessageCopyFolders,
   getMessageFields,
   getMessageAnnotations,
+  getLabelMetadata,
   setMessageAnnotation,
 } from '../services/mailAccess.js';
