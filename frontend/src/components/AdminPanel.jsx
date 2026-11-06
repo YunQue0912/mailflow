@@ -2376,7 +2376,7 @@ function BehaviorTab() {
         )}
       </SettingGroup>
 
-      <SettingGroup title={t('verificationCodes.title')} desc={t('verificationCodes.description')}>
+      <SettingGroup title={t('verificationCodes.title')}>
         <ToggleRow
           label={t('verificationCodes.autoCopy')}
           desc={t('verificationCodes.autoCopyDescription')}

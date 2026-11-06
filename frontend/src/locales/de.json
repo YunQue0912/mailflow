@@ -1,13 +1,12 @@
 {
   "verificationCodes": {
     "title": "Bestätigungscodes",
-    "description": "Bestätigungscodes aus E-Mails und neuen Nachrichtenhinweisen mit einem Klick kopieren.",
     "copy": "Kopieren",
     "copyLabel": "Bestätigungscode {{code}} kopieren",
     "copied": "Kopiert",
-    "copyFailed": "Kopieren fehlgeschlagen. Markieren Sie den Code und kopieren Sie ihn manuell.",
+    "copyFailed": "Kopieren fehlgeschlagen. Kopieren Sie den Code manuell.",
     "autoCopy": "Bestätigungscodes automatisch kopieren",
-    "autoCopyDescription": "Nur für dieses Konto auf diesem Gerät. Wenn MailFlow aktiv und entsperrt ist, wird ein eindeutiger Code aus höchstens 10 Minuten alten neuen Nachrichten in die Zwischenablage kopiert und ersetzt deren Inhalt. Standardmäßig aus.",
+    "autoCopyDescription": "Nur auf diesem Gerät bei aktivem, entsperrtem MailFlow; ersetzt die Zwischenablage.",
     "autoCopied": "Bestätigungscode automatisch kopiert"
   },
   "common": {

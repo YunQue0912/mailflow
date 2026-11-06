@@ -1,13 +1,12 @@
 {
   "verificationCodes": {
     "title": "Codes de vérification",
-    "description": "Copiez les codes des e-mails et des notifications de nouveaux messages en un clic.",
     "copy": "Copier",
     "copyLabel": "Copier le code de vérification {{code}}",
     "copied": "Copié",
-    "copyFailed": "Échec de la copie. Sélectionnez le code et copiez-le manuellement.",
+    "copyFailed": "Échec de la copie. Copiez le code manuellement.",
     "autoCopy": "Copier automatiquement les codes",
-    "autoCopyDescription": "Uniquement pour ce compte sur cet appareil. Lorsque MailFlow est actif et déverrouillé, un code unique et identifiable d’un nouveau message reçu depuis moins de 10 minutes remplace le presse-papiers. Désactivé par défaut.",
+    "autoCopyDescription": "Sur cet appareil, avec MailFlow actif et déverrouillé ; remplace le presse-papiers.",
     "autoCopied": "Code de vérification copié automatiquement"
   },
   "common": {

@@ -74,22 +74,25 @@ export default function VerificationCodeNotice({ message, body, compact = false 
 
   return (
     <section aria-label={t('verificationCodes.title')} onClick={event => event.stopPropagation()} style={{
-      display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px 12px',
-      padding: compact ? '4px 8px' : '8px 12px', marginTop: compact ? 6 : 0,
-      marginBottom: compact ? 0 : 12, borderRadius: 8,
-      background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
+      display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px 10px',
+      padding: compact ? 0 : '4px 0', marginTop: compact ? 6 : 0,
+      marginBottom: compact ? 0 : 12,
       color: 'var(--text-primary)', minWidth: 0,
     }}>
       <span style={{ color: 'var(--text-secondary)', fontSize: 12, fontWeight: 500 }}>
         {t('verificationCodes.title')}
       </span>
       {codes.map(code => (
-        <span key={code} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, maxWidth: '100%' }}>
+        <span key={code} style={{
+          display: 'inline-flex', alignItems: 'center', gap: 8, maxWidth: '100%',
+          paddingLeft: 10, borderRadius: 6,
+          background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
+        }}>
           <code ref={element => {
             if (element) codeElements.current.set(code, element);
             else codeElements.current.delete(code);
           }} tabIndex={0} style={{
-            fontSize: compact ? 14 : 16, fontWeight: 600, letterSpacing: '0.08em',
+            fontSize: compact ? 14 : 15, fontWeight: 600, letterSpacing: '0.06em',
             overflowWrap: 'anywhere', userSelect: 'text',
           }}>{code}</code>
           <button type="button" onClick={() => copy(code)}
@@ -97,7 +100,7 @@ export default function VerificationCodeNotice({ message, body, compact = false 
             disabled={activeFeedback?.kind === 'pending'}
             style={{
               flexShrink: 0, minHeight: 44, padding: '6px 10px', borderRadius: 6,
-              border: '1px solid var(--border)', background: 'var(--bg-primary)',
+              border: 'none', borderLeft: '1px solid var(--border-subtle)', background: 'transparent',
               color: 'var(--accent)', cursor: activeFeedback?.kind === 'pending' ? 'wait' : 'pointer',
               fontSize: 12, fontWeight: 500,
             }}>

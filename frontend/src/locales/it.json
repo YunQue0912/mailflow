@@ -1,13 +1,12 @@
 {
   "verificationCodes": {
     "title": "Codici di verifica",
-    "description": "Copia i codici dalle email e dagli avvisi di nuovi messaggi con un clic.",
     "copy": "Copia",
     "copyLabel": "Copia il codice di verifica {{code}}",
     "copied": "Copiato",
-    "copyFailed": "Copia non riuscita. Seleziona il codice e copialo manualmente.",
+    "copyFailed": "Copia non riuscita. Copia il codice manualmente.",
     "autoCopy": "Copia automaticamente i codici",
-    "autoCopyDescription": "Solo per questo account su questo dispositivo. Quando MailFlow è attivo e sbloccato, un unico codice chiaro da un nuovo messaggio ricevuto negli ultimi 10 minuti sostituisce gli appunti. Disattivato per impostazione predefinita.",
+    "autoCopyDescription": "Solo su questo dispositivo, con MailFlow attivo e sbloccato; sostituisce gli appunti.",
     "autoCopied": "Codice di verifica copiato automaticamente"
   },
   "common": {

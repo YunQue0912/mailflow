@@ -1,13 +1,12 @@
 {
   "verificationCodes": {
     "title": "Códigos de verificação",
-    "description": "Copie códigos dos e-mails e dos avisos de novas mensagens com um clique.",
     "copy": "Copiar",
     "copyLabel": "Copiar código de verificação {{code}}",
     "copied": "Código copiado",
-    "copyFailed": "Falha ao copiar. Selecione o código e copie-o manualmente.",
+    "copyFailed": "Falha ao copiar. Copie o código manualmente.",
     "autoCopy": "Copiar códigos automaticamente",
-    "autoCopyDescription": "Somente para esta conta neste dispositivo. Com o MailFlow ativo e desbloqueado, um único código claro de uma nova mensagem recebida nos últimos 10 minutos substitui a área de transferência. Desativado por padrão.",
+    "autoCopyDescription": "Somente neste dispositivo, com o MailFlow ativo e desbloqueado; substitui a área de transferência.",
     "autoCopied": "Código de verificação copiado de forma automática"
   },
   "common": {
