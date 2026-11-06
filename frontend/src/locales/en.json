@@ -1,4 +1,14 @@
 {
+  "verificationCodes": {
+    "title": "Verification codes",
+    "copy": "Copy",
+    "copyLabel": "Copy verification code {{code}}",
+    "copied": "Copied",
+    "copyFailed": "Copy failed. Copy the code manually.",
+    "autoCopy": "Automatically copy verification codes",
+    "autoCopyDescription": "On this device while MailFlow is active and unlocked; replaces the clipboard.",
+    "autoCopied": "Verification code copied automatically"
+  },
   "common": {
     "cancel": "Cancel",
     "save": "Save",

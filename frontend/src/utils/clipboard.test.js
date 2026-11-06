@@ -101,6 +101,33 @@ describe('copyToClipboard: total failure', () => {
   });
 });
 
+describe('copyToClipboard: caller context changes', () => {
+  test('skips all clipboard writes when the caller context is no longer valid', async () => {
+    const written = [];
+    setNavigator({ writeText: async value => written.push(value) });
+    assert.deepEqual(await copyToClipboard('001234', { shouldCopy: () => false }), { ok: false, method: null });
+    assert.deepEqual(written, []);
+    assert.deepEqual(execCalls, []);
+  });
+
+  test('does not execute a late legacy fallback after the caller locks or signs out', async () => {
+    let allowed = true;
+    let rejectWrite;
+    setNavigator({ writeText: () => new Promise((_, reject) => { rejectWrite = reject; }) });
+    const copying = copyToClipboard('001234', { shouldCopy: () => allowed });
+    allowed = false;
+    rejectWrite(new Error('Permission denied'));
+    assert.deepEqual(await copying, { ok: false, method: null });
+    assert.deepEqual(execCalls, []);
+  });
+
+  test('treats a failed context check as a cancelled copy', async () => {
+    assert.deepEqual(await copyToClipboard('001234', { shouldCopy: () => { throw new Error('Gone'); } }),
+      { ok: false, method: null });
+    assert.deepEqual(execCalls, []);
+  });
+});
+
 describe('copyToClipboard: housekeeping', () => {
   test('restores focus to whatever was focused before', async () => {
     setNavigator(null);

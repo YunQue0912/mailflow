@@ -67,8 +67,15 @@ function execCommandCopy(value) {
  * copying failed but that every call site assumed it could not, so the button gave no
  * feedback at all. `method` is 'async' or 'execCommand' on success, null on failure.
  */
-export async function copyToClipboard(text) {
+export async function copyToClipboard(text, { shouldCopy } = {}) {
   const value = text == null ? '' : String(text);
+  // A caller can stop a delayed fallback when its account, lock, or message changed.
+  // A write already handed to the OS cannot be revoked; do not overwrite it afterwards.
+  const allowed = () => {
+    try { return typeof shouldCopy !== 'function' || shouldCopy() === true; }
+    catch { return false; }
+  };
+  if (!allowed()) return { ok: false, method: null };
 
   try {
     if (globalThis.navigator?.clipboard?.writeText) {
@@ -81,6 +88,7 @@ export async function copyToClipboard(text) {
   }
 
   try {
+    if (!allowed()) return { ok: false, method: null };
     if (execCommandCopy(value)) return { ok: true, method: 'execCommand' };
   } catch { /* fall through to the failure result */ }
 

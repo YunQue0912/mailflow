@@ -12,6 +12,7 @@ import { buildPrintDocument, openPrintWindow, printInWindow } from '../utils/pri
 import { openReplyFromMessage, openForwardFromMessage } from '../utils/composeFromMessage.js';
 import { shortcutBus } from '../utils/shortcutBus.js';
 import MessageBodyView from './MessageBodyView.jsx';
+import VerificationCodeNotice from './VerificationCodeNotice.jsx';
 import AttachmentStrip from './AttachmentStrip.jsx';
 import { isDarkTheme, canShowDark, showDark } from '../utils/darkScheme.js';
 import AiResultBox from './AiResultBox.jsx';
@@ -379,6 +380,7 @@ export default function ConversationMessageCard({ message, expanded, onToggle, o
             </div>
           )}
           {error && <div style={{ color: 'var(--red, #e03131)', fontSize: 13 }}>{error}</div>}
+          <VerificationCodeNotice message={message} body={body} />
           {/* Attachments, the reading pane's strip (#634), where the reading pane has it: above the
               message. The body response already carries them. */}
           <AttachmentStrip messageId={message.id} attachments={body?.attachments} style={{ marginBottom: 12 }} />

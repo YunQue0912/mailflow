@@ -1,4 +1,14 @@
 {
+  "verificationCodes": {
+    "title": "Kody weryfikacyjne",
+    "copy": "Kopiuj",
+    "copyLabel": "Kopiuj kod weryfikacyjny {{code}}",
+    "copied": "Skopiowano",
+    "copyFailed": "Nie udało się skopiować. Skopiuj kod ręcznie.",
+    "autoCopy": "Automatycznie kopiuj kody",
+    "autoCopyDescription": "Tylko na tym urządzeniu, gdy MailFlow jest aktywny i odblokowany; zastępuje schowek.",
+    "autoCopied": "Kod weryfikacyjny skopiowany automatycznie"
+  },
   "common": {
     "cancel": "Anuluj",
     "save": "Zapisz",

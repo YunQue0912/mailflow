@@ -1,4 +1,14 @@
 {
+  "verificationCodes": {
+    "title": "Códigos de verificación",
+    "copy": "Copiar código",
+    "copyLabel": "Copiar el código de verificación {{code}}",
+    "copied": "Copiado al portapapeles",
+    "copyFailed": "Error al copiar. Copia el código manualmente.",
+    "autoCopy": "Copiar códigos automáticamente",
+    "autoCopyDescription": "Solo en este dispositivo, con MailFlow activo y desbloqueado; reemplaza el portapapeles.",
+    "autoCopied": "Código de verificación copiado automáticamente"
+  },
   "common": {
     "cancel": "Cancelar",
     "save": "Guardar",

@@ -1,4 +1,14 @@
 {
+  "verificationCodes": {
+    "title": "Bestätigungscodes",
+    "copy": "Kopieren",
+    "copyLabel": "Bestätigungscode {{code}} kopieren",
+    "copied": "Kopiert",
+    "copyFailed": "Kopieren fehlgeschlagen. Kopieren Sie den Code manuell.",
+    "autoCopy": "Bestätigungscodes automatisch kopieren",
+    "autoCopyDescription": "Nur auf diesem Gerät bei aktivem, entsperrtem MailFlow; ersetzt die Zwischenablage.",
+    "autoCopied": "Bestätigungscode automatisch kopiert"
+  },
   "common": {
     "cancel": "Abbrechen",
     "save": "Speichern",

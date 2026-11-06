@@ -260,38 +260,54 @@ export function createAiProvider({
       ...(Number.isFinite(maxTokens) ? { max_tokens: maxTokens } : {}),
       stream: false,
     };
-    const request = await openProviderRequest(fetchFn, `${config.apiKeyConfig.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: apiKeyHeaders(apiKey),
-      body: JSON.stringify(body),
-    }, { signal });
-    try {
-      const { response } = request;
-      const text = await readLimited(response, response.ok ? JSON_BODY_LIMIT_BYTES : ERROR_BODY_LIMIT_BYTES);
-      if (!response.ok) throw providerError(response.status, text, [apiKey]);
-      const parsed = parseJson(text);
-      const choice = parsed?.choices?.[0];
-      const content = choice?.message?.content;
-      if (typeof content === 'string') return content;
-      // A reasoning model — or any turn truncated by max_tokens — can return a
-      // null `content`: the output went entirely to reasoning, or the budget was
-      // spent before any text was emitted. That is a well-formed response, not a
-      // transport failure. Callers that only need to confirm the endpoint works
-      // (the connection test) accept it as empty; real completions surface the
-      // finish reason instead of a generic error.
-      if (choice && content == null) {
-        if (allowEmpty) return '';
-        const reason = typeof choice.finish_reason === 'string' ? choice.finish_reason : 'unknown';
-        throw new AiProviderError(
-          `AI provider returned an empty completion (finish_reason: ${reason})`,
-          { status: 502, expose: true },
-        );
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const request = await openProviderRequest(fetchFn, `${config.apiKeyConfig.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: apiKeyHeaders(apiKey),
+        body: JSON.stringify(body),
+      }, { signal });
+      try {
+        const { response } = request;
+        const text = await readLimited(response, response.ok ? JSON_BODY_LIMIT_BYTES : ERROR_BODY_LIMIT_BYTES);
+        const parsed = parseJson(text);
+        if (!response.ok) {
+          const error = parsed?.error;
+          // Older compatible providers still need max_tokens. Only retry a rejected
+          // request when the provider explicitly asks for its replacement, preserving
+          // the same budget and never replaying successful generations or other errors.
+          if (attempt === 0 && Number.isFinite(maxTokens) && response.status === 400
+              && error?.code === 'unsupported_parameter' && error.param === 'max_tokens'
+              && typeof error.message === 'string' && /\bmax_completion_tokens\b/.test(error.message)) {
+            if (request.signal.aborted) throw request.signal.reason;
+            delete body.max_tokens;
+            body.max_completion_tokens = maxTokens;
+            continue;
+          }
+          throw providerError(response.status, text, [apiKey]);
+        }
+        const choice = parsed?.choices?.[0];
+        const content = choice?.message?.content;
+        if (typeof content === 'string') return content;
+        // A reasoning model — or any turn truncated by the token budget — can return a
+        // null `content`: the output went entirely to reasoning, or the budget was
+        // spent before any text was emitted. That is a well-formed response, not a
+        // transport failure. Callers that only need to confirm the endpoint works
+        // (the connection test) accept it as empty; real completions surface the
+        // finish reason instead of a generic error.
+        if (choice && content == null) {
+          if (allowEmpty) return '';
+          const reason = typeof choice.finish_reason === 'string' ? choice.finish_reason : 'unknown';
+          throw new AiProviderError(
+            `AI provider returned an empty completion (finish_reason: ${reason})`,
+            { status: 502, expose: true },
+          );
+        }
+        throw new AiProviderError('AI provider returned an invalid completion', { status: 502, expose: true });
+      } catch (error) {
+        throw providerRequestError(error, request, signal);
+      } finally {
+        request.cleanup();
       }
-      throw new AiProviderError('AI provider returned an invalid completion', { status: 502, expose: true });
-    } catch (error) {
-      throw providerRequestError(error, request, signal);
-    } finally {
-      request.cleanup();
     }
   }
 

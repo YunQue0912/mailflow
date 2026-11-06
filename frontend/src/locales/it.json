@@ -1,4 +1,14 @@
 {
+  "verificationCodes": {
+    "title": "Codici di verifica",
+    "copy": "Copia",
+    "copyLabel": "Copia il codice di verifica {{code}}",
+    "copied": "Copiato",
+    "copyFailed": "Copia non riuscita. Copia il codice manualmente.",
+    "autoCopy": "Copia automaticamente i codici",
+    "autoCopyDescription": "Solo su questo dispositivo, con MailFlow attivo e sbloccato; sostituisce gli appunti.",
+    "autoCopied": "Codice di verifica copiato automaticamente"
+  },
   "common": {
     "cancel": "Annulla",
     "save": "Salva",

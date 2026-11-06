@@ -1,4 +1,14 @@
 {
+  "verificationCodes": {
+    "title": "验证码",
+    "copy": "复制",
+    "copyLabel": "复制验证码 {{code}}",
+    "copied": "已复制",
+    "copyFailed": "复制失败，请手动复制。",
+    "autoCopy": "自动复制验证码",
+    "autoCopyDescription": "仅此设备，前台解锁时生效，会覆盖剪贴板。",
+    "autoCopied": "验证码已自动复制"
+  },
   "common": {
     "cancel": "取消",
     "save": "保存",
