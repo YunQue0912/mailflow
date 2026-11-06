@@ -1,4 +1,15 @@
 {
+  "verificationCodes": {
+    "title": "인증 코드",
+    "description": "이메일과 새 메일 알림에서 인증 코드를 한 번에 복사합니다.",
+    "copy": "복사",
+    "copyLabel": "인증 코드 {{code}} 복사",
+    "copied": "복사됨",
+    "copyFailed": "복사하지 못했습니다. 코드를 선택한 후 직접 복사하세요.",
+    "autoCopy": "인증 코드 자동 복사",
+    "autoCopyDescription": "이 기기의 현재 계정에만 적용됩니다. MailFlow가 활성 상태이고 잠금 해제되어 있을 때 최근 10분 이내에 받은 새 메일에서 명확한 코드가 하나만 발견되면 클립보드를 덮어씁니다. 기본적으로 꺼져 있습니다.",
+    "autoCopied": "인증 코드가 자동으로 복사되었습니다"
+  },
   "common": {
     "edit": "편집",
     "delete": "삭제",

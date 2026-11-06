@@ -5,6 +5,7 @@ import { getPluginMeta } from '../plugins/registry.js';
 import { PluginSlot } from '../plugins/PluginSlot.jsx';
 import { newAiAction, AI_ACTION_LIMITS } from '../aiActions.js';
 import { useMobile } from '../hooks/useMobile.js';
+import { useVerificationCodePreferences } from '../hooks/useVerificationCodePreferences.js';
 import { api } from '../utils/api.js';
 import { spamApi } from '../utils/spamApi.js';
 import { copyToClipboard } from '../utils/clipboard.js';
@@ -2263,6 +2264,7 @@ function LayoutsTab() {
 function BehaviorTab() {
   const { t } = useTranslation();
   const isMobile = useMobile();
+  const verificationCodes = useVerificationCodePreferences();
   const { swipeActions, setSwipeAction, syncInterval, setSyncInterval, folderSyncInterval, setFolderSyncInterval, autoOpenReplyDrafts, setAutoOpenReplyDrafts, plaintextEmail, setPlaintextEmail, replyDefault, setReplyDefault, afterRemove, setAfterRemove, markReadBehavior, setMarkReadBehavior, markReadDelay, setMarkReadDelay, accounts, defaultSender, setDefaultSender } = useStore();
 
   // "Set MailFlow as your default email app": registerProtocolHandler is the
@@ -2372,6 +2374,16 @@ function BehaviorTab() {
             </div>
           </SettingRow>
         )}
+      </SettingGroup>
+
+      <SettingGroup title={t('verificationCodes.title')} desc={t('verificationCodes.description')}>
+        <ToggleRow
+          label={t('verificationCodes.autoCopy')}
+          desc={t('verificationCodes.autoCopyDescription')}
+          checked={verificationCodes.enabled}
+          onChange={verificationCodes.setEnabled}
+          disabled={!verificationCodes.available}
+        />
       </SettingGroup>
 
       <SettingGroup title={t('admin.behavior.writing')}>
@@ -8713,6 +8725,7 @@ function makeSearchIndex(t) {
     { label: t('admin.messageList.defaultReplyAction'), keywords: ['reply', 'reply all', 'default reply'], tab: 'behavior', breadcrumb: behaviorCrumb },
     { label: t('admin.messageList.afterRemove'), keywords: ['next message', 'auto advance', 'after delete', 'after archive', 'open next', 'previous message'], tab: 'behavior', breadcrumb: behaviorCrumb },
     { label: t('admin.messageList.markReadBehavior'), keywords: ['mark read', 'mark as read', 'read delay', 'auto read', 'manual read', 'unread'], tab: 'behavior', breadcrumb: behaviorCrumb },
+    { label: t('verificationCodes.autoCopy'), keywords: ['verification code', 'otp', 'clipboard', 'copy code', '验证码', '自动复制', '剪贴板'], tab: 'behavior', breadcrumb: behaviorCrumb },
     { label: t('admin.messageList.defaultSender'), keywords: ['from', 'sender', 'default sender', 'send from', 'alias', 'identity'], tab: 'behavior', breadcrumb: behaviorCrumb },
     { label: t('admin.messageList.defaultMailApp'), keywords: ['mailto', 'default app', 'default email', 'protocol handler', 'links'], tab: 'behavior', breadcrumb: behaviorCrumb },
     // Appearance > Fonts & Language

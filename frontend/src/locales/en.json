@@ -1,4 +1,15 @@
 {
+  "verificationCodes": {
+    "title": "Verification codes",
+    "description": "Copy verification codes from emails and new-mail notices with one click.",
+    "copy": "Copy",
+    "copyLabel": "Copy verification code {{code}}",
+    "copied": "Copied",
+    "copyFailed": "Copy failed. Select the code and copy it manually.",
+    "autoCopy": "Automatically copy verification codes",
+    "autoCopyDescription": "For this account on this device only. While MailFlow is active and unlocked, copy a single clear code from mail received within 10 minutes, replacing the clipboard. Off by default.",
+    "autoCopied": "Verification code copied automatically"
+  },
   "common": {
     "cancel": "Cancel",
     "save": "Save",

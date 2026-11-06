@@ -1,4 +1,15 @@
 {
+  "verificationCodes": {
+    "title": "Kody weryfikacyjne",
+    "description": "Kopiuj kody z wiadomości i powiadomień o nowej poczcie jednym kliknięciem.",
+    "copy": "Kopiuj",
+    "copyLabel": "Kopiuj kod weryfikacyjny {{code}}",
+    "copied": "Skopiowano",
+    "copyFailed": "Nie udało się skopiować. Zaznacz kod i skopiuj go ręcznie.",
+    "autoCopy": "Automatycznie kopiuj kody",
+    "autoCopyDescription": "Tylko dla tego konta na tym urządzeniu. Gdy MailFlow jest aktywny i odblokowany, jeden jednoznaczny kod z nowej wiadomości odebranej w ostatnich 10 minutach zastępuje schowek. Domyślnie wyłączone.",
+    "autoCopied": "Kod weryfikacyjny skopiowany automatycznie"
+  },
   "common": {
     "cancel": "Anuluj",
     "save": "Zapisz",

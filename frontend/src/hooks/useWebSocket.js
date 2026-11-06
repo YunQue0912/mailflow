@@ -9,6 +9,8 @@ import { dispatchPluginWsMessage, dispatchPluginReconnect } from '../plugins/eve
 import { recordDiagEvent } from '../utils/diagEvents.js';
 import { scheduledFeed } from '../utils/scheduledFeed.js';
 import { SOCKET_CAUGHT_UP_EVENT } from '../utils/resumeRefresh.js';
+import { createVerificationCodeAutoCopy } from '../utils/verificationCodeAutoCopy.js';
+import { VERIFICATION_CODE_PREFERENCES_EVENT } from '../utils/verificationCodePreferences.js';
 
 function _applyServerCounts(counts) {
   useStore.getState().setUnreadCounts(counts);
@@ -58,6 +60,18 @@ export function useWebSocket() {
   // reconnecting, which made a wake-triggered reconnect look like a first connect.
   const hasConnectedBefore = useRef(false);
   const { addNotification, updateAccount, setFolders, setBackfillProgress } = useStore();
+  const translateRef = useRef(t);
+  translateRef.current = t;
+  const verificationCodeCopy = useRef(null);
+  if (!verificationCodeCopy.current) {
+    verificationCodeCopy.current = createVerificationCodeAutoCopy({
+      getState: () => mountedRef.current ? useStore.getState() : null,
+      fetchBody: id => api.getMessageBody(id),
+      onCopied: () => useStore.getState().addNotification({
+        type: 'success', title: translateRef.current('verificationCodes.autoCopied'),
+      }),
+    });
+  }
 
   const connect = useCallback(() => {
     // Clean up any existing socket before opening a new one — prevents duplicate
@@ -149,6 +163,7 @@ export function useWebSocket() {
         const alertMessages = data.alertMessages ?? messages;
         const alertCount = data.alertCount ?? count;
         const isInbox = !folder || folder === 'INBOX';
+        void verificationCodeCopy.current.handleNewMessages(data);
 
         // Note: no raw folder name here — a custom folder name would be identifying,
         // and the scrub net only catches emails/IPs/tokens. isInbox is the safe signal.
@@ -393,9 +408,19 @@ export function useWebSocket() {
 
   useEffect(() => {
     mountedRef.current = true;
+    const cancelCodeCopy = () => verificationCodeCopy.current.cancel();
+    const unsubscribe = useStore.subscribe((state, previous) => {
+      if (state.user?.id !== previous.user?.id || state.isLocked !== previous.isLocked) cancelCodeCopy();
+    });
+    window.addEventListener(VERIFICATION_CODE_PREFERENCES_EVENT, cancelCodeCopy);
+    window.addEventListener('storage', cancelCodeCopy);
     connect();
     return () => {
       mountedRef.current = false;
+      cancelCodeCopy();
+      unsubscribe();
+      window.removeEventListener(VERIFICATION_CODE_PREFERENCES_EVENT, cancelCodeCopy);
+      window.removeEventListener('storage', cancelCodeCopy);
       clearTimeout(reconnectTimer.current);
       if (wsRef.current) wsRef.current.close();
     };

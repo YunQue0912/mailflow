@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { UNDO_WINDOW_MS } from '../utils/undoableAction.js';
+import VerificationCodeNotice from './VerificationCodeNotice.jsx';
 
 // Kept off screen but readable, for the live regions.
 const offScreen = {
@@ -271,6 +272,9 @@ function Toast({ notification, onDismiss, isMobile }) {
         }}>
           {notification.body}
         </div>
+        {notification.type === 'new_mail' && notification.message && (
+          <VerificationCodeNotice message={notification.message} compact />
+        )}
       </div>
       {notification.onAction && (
         <button

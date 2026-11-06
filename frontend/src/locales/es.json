@@ -1,4 +1,15 @@
 {
+  "verificationCodes": {
+    "title": "Códigos de verificación",
+    "description": "Copia los códigos de los correos y avisos de mensajes nuevos con un clic.",
+    "copy": "Copiar código",
+    "copyLabel": "Copiar el código de verificación {{code}}",
+    "copied": "Copiado al portapapeles",
+    "copyFailed": "No se pudo copiar. Selecciona el código y cópialo manualmente.",
+    "autoCopy": "Copiar códigos automáticamente",
+    "autoCopyDescription": "Solo para esta cuenta en este dispositivo. Con MailFlow activo y desbloqueado, un único código claro de un mensaje nuevo recibido en los últimos 10 minutos sustituye el portapapeles. Desactivado por defecto.",
+    "autoCopied": "Código de verificación copiado automáticamente"
+  },
   "common": {
     "cancel": "Cancelar",
     "save": "Guardar",

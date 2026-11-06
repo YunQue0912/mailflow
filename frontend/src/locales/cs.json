@@ -1,4 +1,15 @@
 {
+  "verificationCodes": {
+    "title": "Ověřovací kódy",
+    "description": "Zkopírujte kódy z e-mailů a oznámení o nové poště jedním kliknutím.",
+    "copy": "Kopírovat",
+    "copyLabel": "Kopírovat ověřovací kód {{code}}",
+    "copied": "Zkopírováno",
+    "copyFailed": "Kopírování se nezdařilo. Označte kód a zkopírujte ho ručně.",
+    "autoCopy": "Automaticky kopírovat kódy",
+    "autoCopyDescription": "Pouze pro tento účet na tomto zařízení. Je-li MailFlow aktivní a odemčený, jediný jednoznačný kód z nové zprávy přijaté v posledních 10 minutách nahradí schránku. Ve výchozím stavu vypnuto.",
+    "autoCopied": "Ověřovací kód automaticky zkopírován"
+  },
   "common": {
     "cancel": "Zrušit",
     "save": "Uložit",

@@ -120,3 +120,27 @@ test('on a phone the action bars and toasts are said the same way', async () => 
   assert.deepEqual(said('alert'), ['Could not restore it']);
   assert.deepEqual([...document.querySelectorAll('[role="status"], [role="alert"]')].map(el => el.dataset.announce), ['status', 'alert']);
 });
+
+test('a new-mail notice copies its verification code without dismissing the message', async () => {
+  await mount();
+  useStore.setState({ user: { id: 'otp-notification-user' }, isLocked: false });
+  let copied = null;
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true,
+    value: { writeText: async value => { copied = value; } } });
+  await add({ type: 'new_mail', title: 'Example sign-in', body: 'Your verification code: 001234',
+    message: { id: 'otp-1', subject: 'Your verification code: 001234' } });
+  const copy = [...document.querySelectorAll('button')].find(b => b.getAttribute('aria-label')?.startsWith('verificationCodes.copyLabel'));
+  assert.ok(copy, 'the new-mail notice offers a copy button');
+  await React.act(async () => { copy.click(); });
+  assert.equal(copied, '001234');
+  assert.equal(useStore.getState().notifications.length, 1, 'copy leaves the notification available');
+});
+
+test('a locked new-mail notice does not expose a verification code control', async () => {
+  await mount();
+  useStore.setState({ user: { id: 'otp-notification-user' }, isLocked: true });
+  await add({ type: 'new_mail', title: 'Example sign-in', body: 'A new message',
+    message: { id: 'otp-2', subject: 'Your verification code: 001234' } });
+  assert.equal(document.querySelectorAll('[aria-label^="verificationCodes.copyLabel"]').length, 0);
+  useStore.setState({ isLocked: false });
+});

@@ -24,6 +24,7 @@ import { BUILTIN_SUMMARIZE } from '../aiActions.js';
 import { openReplyFromMessage, openForwardFromMessage, openForwardAsAttachmentFromMessage, rowOwnMessage } from '../utils/composeFromMessage.js';
 import { aiReplyAvailable } from '../utils/aiReply.js';
 import MessageBodyView from './MessageBodyView.jsx';
+import VerificationCodeNotice from './VerificationCodeNotice.jsx';
 import { copyToClipboard } from '../utils/clipboard.js';
 import { saveSenderCategory } from '../utils/senderCategory.js';
 import { buildMovePickerSections, movePickerSectionHeading, movePickerFoldersEmpty, runMovePickerAction } from '../utils/folderDisplay.js';
@@ -1757,6 +1758,8 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
           </div>
 
         </div>
+
+        <VerificationCodeNotice message={{ ...message, subject: resolvedSubject || message.subject }} body={body} />
 
         {/* Attachments */}
         {attachments.length > 0 && (
