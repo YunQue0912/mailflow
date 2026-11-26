@@ -3,13 +3,15 @@ import { useTranslation } from 'react-i18next';
 import { REPAIR_FLAG, signInResultNotice, trustedWrongAccount } from '../utils/accountErrors.js';
 import InboxReplyDraftObserver from './InboxReplyDraftObserver.js';
 import { useStore } from '../store/index.js';
-import { api } from '../utils/api.js';
-import { useWebSocket } from '../hooks/useWebSocket.js';
+import { api, setPageClosing } from '../utils/api.js';
+import { flushUndoables } from '../utils/undoableAction.js';
+import { useWebSocket, PUSH_RECEIVED_EVENT } from '../hooks/useWebSocket.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { LAYOUTS } from '../layouts.js';
 import { closeOpenMessage } from '../utils/closeMessage.js';
 import { updateFaviconBadge } from '../themes.js';
-import { installResumeRefresh } from '../utils/resumeRefresh.js';
+import { installResumeRefresh, RESUME_RETRY_EVENT } from '../utils/resumeRefresh.js';
+import { refreshListAndWait } from '../utils/listRefreshClaims.js';
 import { shortcutBus } from '../utils/shortcutBus.js';
 import { dispatchHoveredGtdShortcut } from '../utils/gtdHoveredRow.js';
 import { runMailboxShortcut, canRunMailboxShortcut, browserShortcutFallback } from '../utils/visibleMailboxes.js';
@@ -29,6 +31,8 @@ import { scheduledFeed } from '../utils/scheduledFeed.js';
 import { noticeToast, scheduledLinkId } from '../utils/scheduledView.js';
 import { openScheduledView } from '../utils/scheduledCompose.js';
 import { openSentMessage } from '../utils/openSentMessage.js';
+import { descaleCss } from '../utils/uiScaleCss.js';
+import { prefetchedOr } from '../utils/bootPrefetch.js';
 
 // Opens the Scheduled view at one message, highlighted (a notification link or a toast's Open).
 function openScheduledMessage(id) {
@@ -48,6 +52,10 @@ const lazyFallback = (
   </div>
 );
 
+// Waits before each new try of a failed account load: quick for a server that is restarting,
+// then once a minute.
+const ACCOUNTS_RETRY_MS = [2000, 5000, 15000, 30000, 60000];
+
 export default function MailApp() {
   const { t } = useTranslation();
   const {
@@ -62,9 +70,31 @@ export default function MailApp() {
     accounts, rightSidebarWidth, setRightSidebarWidth, isRightSidebarResizing, setIsRightSidebarResizing,
     rightSidebarHidden, toggleRightSidebarHidden,
   } = useStore();
+  // Contacts loads when it is first opened, not with every launch; once open it stays mounted,
+  // keeping its place.
+  const [contactsOpened, setContactsOpened] = useState(showContacts);
+  if (showContacts && !contactsOpened) setContactsOpened(true);
   const syncInterval = useStore(s => s.syncInterval);
   const autoLockMinutes = useStore(s => s.autoLockMinutes);
   const lockScreen = useStore(s => s.lockScreen);
+
+  // An archive, move or other action still in its undo window goes to the server when the tab
+  // closes or reloads (keepalive, so the request outlives the page), and before the screen locks,
+  // rather than never. pageshow undoes the flag for a page restored from the back-forward cache.
+  useEffect(() => {
+    // A page kept in the back-forward cache comes back with the Undo toasts of the actions just
+    // sent; their Undo refuses (releaseUndoable says they are no longer pending).
+    const onHide = () => { setPageClosing(true); flushUndoables(); };
+    const onShow = () => setPageClosing(false);
+    window.addEventListener('pagehide', onHide);
+    window.addEventListener('pageshow', onShow);
+    window.addEventListener('mailflow:will-lock', flushUndoables);
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      window.removeEventListener('pageshow', onShow);
+      window.removeEventListener('mailflow:will-lock', flushUndoables);
+    };
+  }, []);
 
   // Auto-lock after inactivity (#235). MailApp only mounts while unlocked, so this
   // timer runs only when unlocked; hitting the timeout locks and unmounts this tree.
@@ -384,6 +414,7 @@ export default function MailApp() {
     if ('serviceWorker' in navigator) {
       onSwMessage = (event) => {
         if (event.data && event.data.type === 'mailflow_deeplink') consumePendingDeepLink();
+        if (event.data && event.data.type === 'mailflow_push') window.dispatchEvent(new CustomEvent(PUSH_RECEIVED_EVENT));
       };
       navigator.serviceWorker.addEventListener('message', onSwMessage);
     }
@@ -427,16 +458,29 @@ export default function MailApp() {
   }, [openCompose]);
 
   useEffect(() => {
-    // Load accounts
-    api.getAccounts()
-      .then(accounts => {
-        setAccounts(accounts); // also sets accountsReady:true in the store
-      })
-      .catch(err => {
-        console.error(err);
-        // Even on error, mark accounts as ready so MessageList doesn't hang
-        useStore.setState({ accountsReady: true });
-      });
+    // Load accounts. A failed load (the server restarting, a dropped connection) used to leave
+    // the app with no accounts until a reload: it is tried again, sooner at first, and on a resume.
+    let accountsLoaded = false;
+    let accountsRetry = null;
+    let accountsAttempt = 0;
+    const loadAccounts = () => {
+      clearTimeout(accountsRetry);
+      // The first load takes the launch's answer, asked alongside the session (bootPrefetch.js).
+      return prefetchedOr('accounts', () => api.getAccounts())
+        .then(accounts => {
+          accountsLoaded = true;
+          setAccounts(accounts); // also sets accountsReady:true in the store
+        })
+        .catch(err => {
+          console.error(err);
+          // Even on error, mark accounts as ready so MessageList doesn't hang
+          useStore.setState({ accountsReady: true });
+          if (err?.status === 401) return; // signed out: the session handler takes over
+          const delay = ACCOUNTS_RETRY_MS[Math.min(accountsAttempt++, ACCOUNTS_RETRY_MS.length - 1)];
+          accountsRetry = setTimeout(loadAccounts, delay);
+        });
+    };
+    loadAccounts();
 
     // Sync Todoist connection state — localStorage alone isn't enough across devices/sessions
     api.todoist.status().then(({ connected }) => setTodoistConnected(connected)).catch(() => {});
@@ -472,20 +516,28 @@ export default function MailApp() {
     const stopResume = installResumeRefresh({
       doc: document, win: window,
       shouldSkip: () => useStore.getState().isLocked,
-      // The counts request stands for the whole resync: the list reload and the folder requests
-      // fail on their own without saying so, and when the network is not back yet, all of them
-      // do. Its failure has installResumeRefresh run the resync again.
+      // Done once the list on screen has reloaded and the counts are in (#748): the counts alone
+      // can be current while the list still shows mail from before the phone slept. Either
+      // failing has installResumeRefresh run the resync again. The folder requests fail on their
+      // own without saying so; when the network is not back yet, the list and counts fail too.
       onResync: () => {
+        if (!accountsLoaded) loadAccounts();
         refreshFolders();
-        window.dispatchEvent(new CustomEvent('mailflow:refresh'));
-        return api.getUnreadCounts().then(setUnreadCounts);
+        return Promise.all([refreshListAndWait(), api.getUnreadCounts().then(setUnreadCounts)]);
       },
+      // Said in the list (ResumeStatus.jsx), and back to nothing when the session ends.
+      onState: state => useStore.getState().setResumeSync(state),
     });
+    const retryResume = () => stopResume.retryNow();
+    window.addEventListener(RESUME_RETRY_EVENT, retryResume);
 
     window.addEventListener('mailflow:counts_refresh', refreshCounts);
     return () => {
       clearInterval(interval);
+      clearTimeout(accountsRetry);
       stopResume();
+      useStore.getState().setResumeSync('idle');
+      window.removeEventListener(RESUME_RETRY_EVENT, retryResume);
       window.removeEventListener('mailflow:counts_refresh', refreshCounts);
     };
   }, [setAccounts, setUnreadCounts, setTodoistConnected]);
@@ -803,7 +855,7 @@ export default function MailApp() {
       width: '100vw', height: 'var(--app-height, 100svh)',
       overflow: 'hidden', background: 'var(--bg-primary)',
     }}>
-    <div style={{
+    <div data-ui-scale-root="" style={{
       display: 'flex',
       // Sized in CSS from the 100dvh parent: an innerHeight read on resize is stale during
       // a rotation in an iOS home-screen app, and the sidebar's bottom fell off screen.
@@ -812,6 +864,7 @@ export default function MailApp() {
       ...(scale !== 1 && {
         transform: `scale(${scale})`,
         transformOrigin: 'top left',
+        '--ui-scale': scale,
       }),
       overflow: 'hidden',
       background: 'var(--bg-primary)',
@@ -853,9 +906,9 @@ export default function MailApp() {
           >
             <Sidebar />
           </div>
-          {/* Keep all three mounted so scroll/state survive navigation. */}
+          {/* Kept mounted so scroll/state survive navigation (Contacts from its first opening). */}
           <div style={{ flex: 1, overflow: 'hidden', height: '100%', display: showContacts ? 'flex' : 'none' }}>
-            <Suspense fallback={lazyFallback}><ContactsPage /></Suspense>
+            {contactsOpened && <Suspense fallback={lazyFallback}><ContactsPage /></Suspense>}
           </div>
           <div style={{ flex: 1, display: !showContacts && !selectedMessageId ? 'flex' : 'none', overflow: 'hidden', height: '100%' }}>
             <MessageList />
@@ -887,9 +940,9 @@ export default function MailApp() {
             // A standalone PWA draws under the status bar; the sidebar header already clears it.
             paddingTop: 'var(--sat)',
           }}>
-            {/* Keep all three mounted so scroll/state survive navigation. */}
+            {/* Kept mounted so scroll/state survive navigation (Contacts from its first opening). */}
             <div style={{ display: showContacts ? 'flex' : 'none', flex: 1, minWidth: 0, overflow: 'hidden', height: '100%' }}>
-              <Suspense fallback={lazyFallback}><ContactsPage /></Suspense>
+              {contactsOpened && <Suspense fallback={lazyFallback}><ContactsPage /></Suspense>}
             </div>
             <div style={{ display: showContacts ? 'none' : 'flex', flex: 1, minWidth: 0, overflow: 'hidden', height: '100%', flexDirection: currentLayout.direction }}>
               {listFirst ? (
@@ -1062,7 +1115,7 @@ function ShortcutHelpOverlay({ shortcuts, onClose }) {
           borderRadius: 14,
           boxShadow: 'var(--shadow-modal)',
           width: '100%', maxWidth: 680,
-          maxHeight: '80vh', overflow: 'auto',
+          maxHeight: descaleCss('80vh'), overflow: 'auto',
           padding: '24px 28px',
           animation: 'modal-enter var(--motion-normal) var(--ease-emphasized) backwards',
         }}

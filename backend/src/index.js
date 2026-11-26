@@ -5,11 +5,11 @@ import cors from 'cors';
 import { corsExceptDav } from './middleware/corsExceptDav.js';
 import { createServer } from 'http';
 import { readFileSync } from 'fs';
-import RedisStore from 'connect-redis';
 import 'dotenv/config';
-import { redisClient } from './services/redis.js';
+import { PgSessionStore } from './services/sessionStore.js';
+import { startExpirySweep, stopExpirySweep } from './services/kvStore.js';
 import { parseTrustProxyHops } from './utils/trustProxy.js';
-import { buildSessionOptions } from './utils/sessionConfig.js';
+import { buildSessionOptions, parseSessionIdleDays, MAX_SESSION_IDLE_DAYS } from './utils/sessionConfig.js';
 import { mountApiAuth } from './middleware/apiChain.js';
 
 import sendRoutes from './routes/send.js';
@@ -30,6 +30,7 @@ import contactsRoutes from './routes/contacts.js';
 import todoistRoutes from './routes/todoist.js';
 import aiRoutes from './routes/ai.js';
 import categoriesRoutes from './routes/categories.js';
+import tagsRoutes from './routes/tags.js';
 import { pluginRegistry } from './plugins/registry.js';
 import { loadBundledPlugins } from './plugins/loadPlugins.js';
 import { setMailEngine } from './plugins/mailEngine.js';
@@ -38,6 +39,7 @@ import senderFaviconsRoutes from './routes/senderFavicons.js';
 import diagnosticsRoutes from './routes/diagnostics.js';
 import backupRoutes from './routes/backup.js';
 import apiTokenRoutes from './routes/apiTokens.js';
+import webhookRoutes from './routes/webhooks.js';
 import spamRoutes, { accountSpamRouter } from './routes/spam.js';
 import carddavRouter from './routes/carddav.js';
 import carddavAccountRouter from './routes/carddavAccount.js';
@@ -45,6 +47,7 @@ import { startCardavScheduler } from './services/carddavSync.js';
 import { start as startSpamScheduler } from './services/spamScheduler.js';
 import { encryptExistingCredentials, query } from './services/db.js';
 import { runMigrations } from './services/migrations.js';
+import { closeRegistrationBeforeFirstUser } from './services/firstUserRegistration.js';
 import { parseVCard } from './utils/vcard.js';
 import { reloadAuthSettings } from './services/authLimiter.js';
 import { closeWebSocketClients, createWebSocketServer, setupWebSocket } from './services/websocket.js';
@@ -53,6 +56,7 @@ import { getUpdateStatus } from './services/updateCheck.js';
 import { recordHttp } from './services/performanceMetrics.js';
 import { shutDown } from './services/sendShutdown.js';
 import { startScheduledSender } from './services/scheduledSend.js';
+import { backfillMessageSearch } from './services/messageSearchBackfill.js';
 
 const packageMeta = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
 let buildMeta = {};
@@ -64,29 +68,26 @@ try {
 export const APP_VERSION = (process.env.APP_VERSION || buildMeta.version || packageMeta.version).replace(/^v[.]?/, '');
 
 const app = express();
-// Trust the nginx reverse proxy so req.secure reflects HTTPS correctly.
-// Without this, express-session sees HTTP (from nginx) and refuses to set
+// Trust the frontend's reverse proxy so req.secure reflects HTTPS correctly.
+// Without this, express-session sees HTTP (from the proxy) and refuses to set
 // the Secure cookie, meaning the session cookie is never sent to the browser.
 // The hop count also decides req.ip, which keys the login rate limit.
 const trustProxyHops = parseTrustProxyHops(process.env.TRUST_PROXY_HOPS);
 if (trustProxyHops === null) {
-  console.error(`FATAL: TRUST_PROXY_HOPS must be a whole number of at least 1 (the reverse proxies in front of the backend, counting nginx), got "${process.env.TRUST_PROXY_HOPS}". Exiting.`);
+  console.error(`FATAL: TRUST_PROXY_HOPS must be a whole number of at least 1 (the reverse proxies in front of the backend, counting MailFlow's frontend), got "${process.env.TRUST_PROXY_HOPS}". Exiting.`);
   process.exit(1);
 }
 app.set('trust proxy', trustProxyHops);
 const httpServer = createServer(app);
 const wss = createWebSocketServer(httpServer);
 
-// Redis — connect the shared client before any route or session middleware uses it.
-await redisClient.connect();
-
 // Fail fast if required secrets are missing
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
   console.error('FATAL: SESSION_SECRET must be set and at least 32 characters. Exiting.');
   process.exit(1);
 }
-if (!process.env.DB_PASSWORD) {
-  console.error('FATAL: DB_PASSWORD must be set. Exiting.');
+if (!process.env.DATABASE_URL && !process.env.DB_PASSWORD) {
+  console.error('FATAL: DATABASE_URL or DB_PASSWORD must be set. Exiting.');
   process.exit(1);
 }
 if (!process.env.ENCRYPTION_KEY || process.env.ENCRYPTION_KEY.length !== 64) {
@@ -101,9 +102,14 @@ if (process.env.NODE_ENV === 'production' && !process.env.APP_URL) {
   process.exit(1);
 }
 
+if (parseSessionIdleDays(process.env.SESSION_IDLE_DAYS) === null) {
+  console.error(`FATAL: SESSION_IDLE_DAYS must be a whole number of days from 1 to ${MAX_SESSION_IDLE_DAYS} (how long a session lasts without use; unset means 7), got "${process.env.SESSION_IDLE_DAYS}". Exiting.`);
+  process.exit(1);
+}
+
 // Session — options live in utils/sessionConfig.js so they can be exercised by tests.
 const sessionMiddleware = session(
-  buildSessionOptions(new RedisStore({ client: redisClient }), process.env.SESSION_SECRET)
+  buildSessionOptions(new PgSessionStore(), process.env.SESSION_SECRET)
 );
 
 // Not for /carddav, whose own OPTIONS answer tells contact apps it serves address books.
@@ -167,6 +173,7 @@ app.use('/api/admin/backup', backupRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/totp', totpRoutes);
 app.use('/api/api-tokens', apiTokenRoutes);
+app.use('/api/webhooks', webhookRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/block-list', blockListRoutes);
 app.use('/api/contacts', contactsRoutes);
@@ -174,6 +181,7 @@ app.use('/api/todoist', todoistRoutes);
 app.use('/api/carddav', carddavAccountRouter);
 app.use('/api', aiRoutes);
 app.use('/api', categoriesRoutes);
+app.use('/api/tags', tagsRoutes);
 // Tier-1 plugin routers, mounted via the plugin registry (see src/plugins/). Registered
 // here — before the unauthenticated /api/health and /api/version probes below — so a
 // plugin's router-level auth can't intercept them. GTD is the first such plugin; its
@@ -216,6 +224,7 @@ setupWebSocket(wss, sessionMiddleware, imapManager);
 
 // Run pending schema migrations then start
 await runMigrations();
+startExpirySweep();
 
 // One-time backfill: populate photo_data from existing vcard column for contacts
 // that were synced before CardDAV PUT started persisting photo_data.
@@ -245,12 +254,21 @@ await encryptExistingCredentials();
 // Load OAuth integration configs from DB into process.env
 await loadIntegrationConfigs();
 
+// FIRST_USER_REGISTRATION=false: no first-user admin, so registration starts closed
+if (await closeRegistrationBeforeFirstUser()) console.log('Registration closed: FIRST_USER_REGISTRATION is false');
+
 // Start background snooze watcher — polls every 60 seconds to restore snoozed messages
 imapManager.startSnoozeWatcher();
 
 // Send scheduled messages as they fall due (#543). Its first tick recovers sends a previous
 // process left unfinished, before it claims anything.
 startScheduledSender();
+
+// Make the whole body of HTML-only mail stored before migration 0080 searchable (D#320). In the
+// background and throttled: search keeps working meanwhile and finds those bodies as they fill.
+backfillMessageSearch()
+  .then(({ filled, skipped }) => { if (!skipped) console.log(`Search: indexed the text of ${filled} HTML-only message(s)`); })
+  .catch(err => console.warn('Search backfill stopped; it starts again at the next restart:', err.message));
 
 // Schedule periodic CardDAV contact sync for any connected accounts.
 startCardavScheduler();
@@ -293,7 +311,7 @@ function exitAfterClose(code, { wsCode = 1001, wsReason = 'Shutting down' } = {}
     code,
     httpServer,
     closeClients: () => closeWebSocketClients(wss, wsCode, wsReason),
-    quit: () => redisClient.quit(),
+    quit: () => stopExpirySweep(),
     exit: c => process.exit(c),
   });
 }

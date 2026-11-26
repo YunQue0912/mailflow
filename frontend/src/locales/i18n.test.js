@@ -119,6 +119,16 @@ const SAME_VALUE_ALLOWED = {
   'admin.about.updates.cancel': [['es', 'ptBR']],
   'admin.about.updates.install': [['es', 'ptBR']],
   'admin.about.updates.installAndroid': [['es', 'ptBR']],
+  // Spanish and Portuguese share the word.
+  'admin.ai.headerValue': [['es', 'ptBR']],
+  'admin.ai.headerValueFor': [['es', 'ptBR']],
+  'templates.name': [['en', 'de'], ['it', 'ptBR']],
+  'templates.variables.date': [['en', 'fr'], ['it', 'ptBR', 'pl'], ['de', 'cs']],
+  'templates.variables.groups.date': [['en', 'fr'], ['it', 'ptBR', 'pl'], ['de', 'cs']],
+  'templates.variables.groups.contact': [['en', 'fr'], ['de', 'cs', 'pl']],
+  'templates.variables.fullName': [['it', 'ptBR']],
+  'templates.variables.givenName': [['it', 'ptBR']],
+
   // ── List sort menu (#528) ───────────────────────────────────────────────────
   'messageList.sortSummary':                'any', // "{{sort}}, {{dir}}": only the placeholders and a comma
   'messageList.sortDate':                   [['en', 'fr'], ['it', 'ptBR', 'pl'], ['cs', 'de']], // Date / Data / Datum
@@ -245,6 +255,11 @@ const SAME_VALUE_ALLOWED = {
   // "Mono" — typography abbreviation, same in de, en, es, fr, it
   'admin.appearance.typographyMono': [['de', 'en', 'es', 'fr', 'it', 'pl', 'ptBR']],
 
+  // Time format (#758): Spanish and Portuguese share "Automático", "12 horas", "24 horas"
+  'admin.appearance.timeFormatAuto': [['es', 'ptBR']],
+  'admin.appearance.timeFormat12':   [['es', 'ptBR']],
+  'admin.appearance.timeFormat24':   [['es', 'ptBR']],
+
   // "Archive" — same spelling in en and fr
   'admin.folderMappings.archive': [['en', 'fr'], ['cs', 'de']],
 
@@ -313,6 +328,13 @@ const SAME_VALUE_ALLOWED = {
 
   // "Tema" — "Theme" translates identically in es and it
   'admin.tabs.theme': [['es', 'it', 'ptBR']],
+
+  // ── Tags ───────────────────────────────────────────────────────────────────
+  // "Tags" — the same loanword in de, en, fr and ptBR
+  'tags.title': [['de', 'en', 'fr', 'ptBR']],
+  // "Name" / "Color" — plain cognates
+  'tags.settings.name':  [['de', 'en'], ['it', 'ptBR']],
+  'tags.settings.color': [['en', 'es']],
 
   // "Administration" — same spelling in de, en, fr
   'admin.tabs.groupAdmin': [['de', 'en', 'fr']],
@@ -606,6 +628,8 @@ const SAME_VALUE_ALLOWED = {
 // to carry unused keys. Existing locale files may also define their own forms.
 const LOCALE_SPECIFIC_KEYS_BY_LOCALE = {
   cs: new Set([
+    'admin.session.days_few', 'admin.session.days_many',
+    'admin.session.default_few', 'admin.session.default_many',
     'message.attachment_few', 'message.attachment_many',
     'messageList.bulkDeleted.title_few', 'messageList.bulkDeleted.title_many',
     'messageList.bulkDeleted.failBody_few', 'messageList.bulkDeleted.failBody_many',
@@ -618,7 +642,13 @@ const LOCALE_SPECIFIC_KEYS_BY_LOCALE = {
     'admin.messageList.markReadDelaySeconds_few',
     'admin.messageList.markReadDelaySeconds_many',
   ]),
+  ru: new Set([
+    'admin.session.days_few', 'admin.session.days_many',
+    'admin.session.default_few', 'admin.session.default_many',
+  ]),
   pl: new Set([
+    'admin.session.days_few', 'admin.session.days_many',
+    'admin.session.default_few', 'admin.session.default_many',
     'message.attachment_few', 'message.attachment_many',
     'messageList.bulkDeleted.title_few', 'messageList.bulkDeleted.title_many',
     'messageList.bulkDeleted.failBody_few', 'messageList.bulkDeleted.failBody_many',

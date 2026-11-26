@@ -5,13 +5,13 @@
 本说明只适用于当前 `/opt/mailflow` 生产 Compose。仓库通用 `docker-compose.yml`、GHCR 快速安装
 Compose 和 Caddy 部署保持通用，不得直接覆盖服务器专用文件。
 
-## 当前状态
+## 生产部署结构
 
-2026-08-30 已完成稳定态切换和清理：
+2026-08-30 完成 Edge 切换，2026-11-06 的 4.3.0-custom.2 部署使用基础 Compose 和公开页面 override：
 
 - `mailflow-frontend` 运行时只连接 `mailflow_internal` 与 `edge_mailflow`；
 - frontend 不发布宿主机端口，公网访问只经过独立 Edge Gateway；
-- 服务器发布只使用 `/opt/mailflow/docker-compose.yml`，不再需要额外 Compose 文件；
+- `/opt/mailflow/docker-compose.yml` 定义服务，`docker-compose.override.yml` 挂载 `/about/`、`/privacy/` 和 `/terms/` 的静态页面；
 - `/usr/local/sbin/mailflow-update` 已安装稳定态网络契约检查；
 - ProjectFlow 内部网络、旧入口容器和迁移配置均不再作为 MailFlow 回退路径。
 
@@ -21,7 +21,7 @@ Compose 和 Caddy 部署保持通用，不得直接覆盖服务器专用文件�
 - frontend 不映射宿主机端口。
 - `mailflow` 对应 `mailflow_internal`。
 - `edge_mailflow` 是 external 网络，frontend 的网络别名是 `mailflow-ingress`。
-- backend 在 `mailflow_internal` 中的固定地址、PostgreSQL、Redis 和现有卷保持不变。
+- backend 在 `mailflow_internal` 中使用现有固定地址和 PostgreSQL 卷。4.4 起移除 Redis 服务，首次升级见 [4.5.1 生产迁移](UPSTREAM_SYNC_4.5.1_DEPLOYMENT.md)。
 - MailFlow 不加入 ProjectFlow 的内部网络。
 
 ## 稳定态配置
@@ -47,8 +47,8 @@ networks:
     external: true
 ```
 
-保留 `mailflow` 网络的原有 subnet、backend 固定地址、卷、镜像和环境变量。服务器发布始终只使用
-base `docker-compose.yml`；不要叠加其他 Compose 文件，也不要用仓库通用 Compose 覆盖生产文件。
+保留 `mailflow` 网络的原有 subnet、backend 固定地址、PostgreSQL 卷、精确版本镜像和现有密钥。
+使用生产基础文件及公开页面 override。仓库通用 Compose 供独立安装使用。
 
 ## 配置验证
 
@@ -57,12 +57,14 @@ sudo /usr/bin/docker compose \
   --project-directory /opt/mailflow \
   --env-file /opt/mailflow/.env \
   -f /opt/mailflow/docker-compose.yml \
+  -f /opt/mailflow/docker-compose.override.yml \
   config --quiet
 
 sudo /usr/bin/docker compose \
   --project-directory /opt/mailflow \
   --env-file /opt/mailflow/.env \
   -f /opt/mailflow/docker-compose.yml \
+  -f /opt/mailflow/docker-compose.override.yml \
   config --format json
 ```
 
@@ -74,16 +76,18 @@ sudo /usr/bin/docker compose \
   --project-directory /opt/mailflow \
   --env-file /opt/mailflow/.env \
   -f /opt/mailflow/docker-compose.yml \
+  -f /opt/mailflow/docker-compose.override.yml \
   up -d --no-deps frontend
 ```
 
 ## 更新脚本约束
 
-`mailflow-update` 只操作 base `docker-compose.yml`。脚本在更新镜像和备份数据库前会检查：
+`mailflow-update` 渲染并备份基础文件及已加载的 override。脚本在更新镜像和备份数据库前会检查：
 
 - Compose 已声明 `edge_mailflow`；
-- frontend 存在 `mailflow-ingress` 别名；
+- frontend 存在 `mailflow-ingress` 别名且没有发布宿主机端口；
 - 渲染配置中没有 ProjectFlow 内部网络引用。
+- 目标为 4.4 或更高版本时，检查遗留服务、HTTP-only 模式和公开页面挂载路径。
 
 检查失败时先修复服务器 production Compose，不要绕过检查。
 

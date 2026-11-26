@@ -1,6 +1,8 @@
+import { notifyMessageRowsDeleted } from './messageRowsDeleted.js';
 import { FolderStatusMonitor, checkpointFolderStatus } from './folderStatus.js';
 import { extractImapError } from './imapError.js';
 import { recordUnfetchable, suppressedUids, clearUnfetchable, hasRealGap } from './unfetchableUids.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { ImapFlow } from 'imapflow';
 import { query } from './db.js';
 import { parseMessage, parseMailboxList, snippetFromBody, detectBulkFromParsedHeaders, ALIAS_FORWARDER_HEADERS, parseHeadersInput, headersToRawString, decodeMimeWords, enrichParsedMetadata, renderCalendarInvite, MAX_HEADER_FIELD } from './messageParser.js';
@@ -15,19 +17,22 @@ import { settleCids } from '../utils/cidRefs.js';
 import { logger } from './logger.js';
 import { recordBroadcast, recordWarning, recordSyncSignal } from './diagnosticsRing.js';
 import { decrypt } from './encryption.js';
-import { sendPushToUser } from './pushNotifications.js';
+import { notifyNewMail } from './notifyNewMail.js';
 import { redactEmail } from '../utils/redact.js';
 import { adjustFolderCounts, resolveSpamFolder } from '../utils/mailUtils.js';
 import { getAccountAddresses } from './mailAccess.js';
 import { resolveForConnection, createPinnedLookup } from './hostValidation.js';
 import { getConnectionPolicy } from './connectionPolicy.js';
 import { applyInboxRules, applyBlockList, newMailAlerts } from './inboxRules.js';
+import { carryUpdate, hasCarries, rememberDroppedRows, takeCarry } from './movedRowCarry.js';
 import { classifyAndTagMessage } from './spamPipeline.js';
 import { generateVCard } from '../utils/vcard.js';
 import { mimeToExtension, standardImageType, rasterImageTypeOfName, sniffImageType } from '../utils/inlineImages.js';
 import { truncateFilename } from '../utils/contentDisposition.js';
 import { BLOCK, WARN } from './attachmentExtensions.js';
 import { randomBytes, randomUUID } from 'crypto';
+import { PROVIDERS, providerProfile } from './providers.js';
+export { PROVIDERS, providerProfile };
 
 
 // Shorthand for log lines — keeps domain visible while masking the local part.
@@ -267,6 +272,17 @@ export function isConnectionRefusal(detail) {
   return /\[LIMIT\]|connection not available|too many|maximum number|number of connections|rate.?limit|temporarily|try again|connection limit|over quota|throttl|connect timeout/i.test(String(detail || ''));
 }
 
+// A FETCH failure that is the server limiting us or having trouble, not the message the FETCH
+// named: throttling, a rate or connection limit, a quota, a rejected login, a temporary failure
+// ([UNAVAILABLE], RFC 5530). A dropped connection is not one: the
+// backfill logs in again before each retry, so a FETCH of one UID that keeps dropping a fresh,
+// working connection is that message (Dovecot's default for a corrupt one, imap_fetch_failure
+// disconnect-immediately, closes the connection without a tagged NO).
+export function isServerLimitFailure(detail) {
+  return isAuthFailure(detail)
+    || /\[LIMIT\]|\[UNAVAILABLE\]|throttl|rate.?limit|too many|maximum number|number of connections|connection limit|over ?quota|bandwidth|temporar|try again/i.test(String(detail || ''));
+}
+
 // Stamp an account's last successful sync. Shared by both exits of syncMessages so they cannot
 // drift: a folder that turned out to be empty is still a SUCCESSFUL sync and must be stamped.
 // Without this a brand-new account that has never received mail keeps last_sync = NULL forever,
@@ -417,6 +433,72 @@ export function planIntegrityFlagScan({ condstore, storedModseq, serverModseq, e
 // Body parts that cover ~99% of real-world email structures (used for full body caching)
 const BODY_PREFETCH_PARTS = ['1', '1.1', '1.2', '2', '2.1', '2.2', '1.1.1', '1.2.1'];
 
+// The part numbers a message's BODYSTRUCTURE lists. imapflow numbers a multipart's children
+// "1", "2", "1.1" and so on; a single-part message carries no number in the tree, and its
+// body is part 1.
+export function structureParts(structure) {
+  const parts = new Set();
+  const walk = (node) => {
+    if (!node) return;
+    if (node.part) parts.add(node.part);
+    for (const child of node.childNodes || []) walk(child);
+  };
+  walk(structure);
+  if (!parts.size) parts.add('1');
+  return parts;
+}
+
+// The server answered the command with NO or BAD: it refused it, and the connection is fine.
+const isServerRejection = (err) => err?.responseStatus === 'NO' || err?.responseStatus === 'BAD';
+
+// Fetches one snippet-indexer batch, handing each message to onMessage.
+//
+// The one-round-trip form asks every message for the same guessed parts. Servers return
+// nothing for a part a message lacks, except Proton Mail Bridge, which fails the whole FETCH
+// with "no such parts exists" (#768), so the same batch was retried forever. On that refusal,
+// and from the start when structureFirst is set, this reads each message's structure and asks
+// only for the parts it has, one FETCH per distinct set of parts. Anything the server still
+// refuses is skipped: those messages get no snippet and are marked attempted like any other,
+// so a batch can never repeat. A broken connection still throws.
+//
+// Returns true when the guessed form was refused, so the caller can skip it from then on.
+export async function fetchSnippetBatch(client, uids, onMessage, { structureFirst = false } = {}) {
+  const items = { uid: true, envelope: true, bodyStructure: true };
+  if (!structureFirst) {
+    try {
+      for await (const msg of client.fetch(uids.join(','), { ...items, bodyParts: BODY_PREFETCH_PARTS }, { uid: true })) {
+        await onMessage(msg);
+      }
+      return false;
+    } catch (err) {
+      if (!isServerRejection(err)) throw err;
+    }
+  }
+  const groups = new Map();
+  try {
+    for await (const msg of client.fetch(uids.join(','), { uid: true, bodyStructure: true }, { uid: true })) {
+      const have = structureParts(msg.bodyStructure);
+      const parts = BODY_PREFETCH_PARTS.filter((part) => have.has(part));
+      const key = parts.join(' ');
+      if (!groups.has(key)) groups.set(key, { parts, uids: [] });
+      groups.get(key).uids.push(msg.uid);
+    }
+  } catch (err) {
+    if (!isServerRejection(err)) throw err;
+    return !structureFirst;
+  }
+  for (const { parts, uids: group } of groups.values()) {
+    try {
+      for await (const msg of client.fetch(group.join(','), { ...items, bodyParts: parts }, { uid: true })) {
+        await onMessage(msg);
+      }
+    } catch (err) {
+      if (!isServerRejection(err)) throw err;
+    }
+  }
+  return !structureFirst;
+}
+
 // Every cid: reference receives a full copy of its image, so a small message pointing at one
 // inline part thousands of times would build a body of hundreds of MB. The first reference to
 // each image is always embedded; repeats share this many characters of data: URI per message,
@@ -444,17 +526,53 @@ const FLAG_SCAN_TIMED_OUT = Symbol('flagScanTimedOut');
 // account on that host, or stops a single account syncing, until the process restarts.
 // _syncTick and withFreshLogin already did this; the rest of the file now matches.
 
-// Upper bound on how far back the delta flag scan looks. iCloud advertises CONDSTORE (so we take
-// the delta path) but IGNORES the changedSince fetch modifier — it returns EVERY message in the
-// requested range. Since the scan only pulls uid+flags (cheap), this window mainly caps that
-// worst case so a huge mailbox doesn't fetch tens of thousands of records per tick. Recent
-// messages are the ones whose flags change, and the reactive IDLE flag path (_syncFlagsForRange)
-// already covers live read/star events, so the window is a generous backstop. A flag change on a
-// message older than this window won't be caught by the periodic scan, but that gap already
-// exists (the IDLE path only looks at the last 200) and matters only for cross-device changes to
-// very old mail. Servers that honor changedSince (PurelyMail, Gmail) return only what changed
-// regardless of the window.
+// The flag scans ask for messages changed since a modseq (CHANGEDSINCE). A server that honors
+// it answers with only those, so the scan covers the whole mailbox: a read or star set on another
+// device on a months-old message is pulled like any other. Scanning only recent UIDs (as before)
+// skipped those changes while the watermark moved past them, so they were never applied, and the
+// unread count left behind kept the integrity pass re-running every cycle.
+//
+// iCloud advertises CONDSTORE but IGNORES changedSince and returns every message in the range, so
+// for it the scans keep a recent UID window: with uid+flags that is a cheap fetch (~a second) per
+// tick instead of the whole mailbox, at the cost of the old-mail gap there. Another server caught
+// doing the same is windowed too, until the process restarts: a full-range scan that answers with
+// nearly every message of a large mailbox, or runs past its budget, is a strike, and two in a row
+// make the call. One alone may be a real mass change (mark all read elsewhere) or throttling, and
+// an ordinary answer from a large folder in between clears it.
 const DELTA_SCAN_UID_WINDOW = 5000;
+const changedSinceIgnoredAccounts = new Set();
+const changedSinceStrikes = new Map();
+
+// The lowest UID a flag scan asks for, given the highest UID it needs to cover.
+export function flagScanLowUid(account, topUid) {
+  const windowed = providerProfile(account).ignoresChangedSince || changedSinceIgnoredAccounts.has(account.id);
+  return windowed && topUid > DELTA_SCAN_UID_WINDOW ? topUid - DELTA_SCAN_UID_WINDOW + 1 : 1;
+}
+
+// Called after a full-range (lowUid 1) CHANGEDSINCE scan: `returned` records out of `exists`, or
+// timedOut. A server that honors changedSince returns what changed, rarely most of a large
+// mailbox; one that ignores it returns all of it, or is still fetching when the budget ends.
+export function noteChangedSinceScan(account, { lowUid, returned = 0, exists = 0, timedOut = false }) {
+  if (lowUid !== 1 || changedSinceIgnoredAccounts.has(account.id)) return;
+  const answeredEverything = returned > DELTA_SCAN_UID_WINDOW && returned >= exists * 0.9;
+  if (!answeredEverything && !(timedOut && exists > DELTA_SCAN_UID_WINDOW)) {
+    // Only a large folder's ordinary answer clears a strike: a small folder's says nothing,
+    // since a server that ignores changedSince answers it in full within the window anyway.
+    if (!timedOut && exists > DELTA_SCAN_UID_WINDOW) changedSinceStrikes.delete(account.id);
+    return;
+  }
+  const strikes = (changedSinceStrikes.get(account.id) || 0) + 1;
+  if (strikes < 2) { changedSinceStrikes.set(account.id, strikes); return; }
+  changedSinceStrikes.delete(account.id);
+  changedSinceIgnoredAccounts.add(account.id);
+  console.warn(`Flag scans for ${logAccount(account)} now cover the last ${DELTA_SCAN_UID_WINDOW} UIDs: the server ${timedOut ? 'did not finish a changedSince scan in time' : `answered changedSince with ${returned} of ${exists} messages`}, twice in a row`);
+}
+
+// For tests.
+export function clearChangedSinceIgnored() {
+  changedSinceIgnoredAccounts.clear();
+  changedSinceStrikes.clear();
+}
 
 // How long (ms) user must be idle before background IMAP jobs (snippet indexer, folder
 // body prefetch) resume after a live body fetch. Keeps click-time fetches snappy by
@@ -1363,167 +1481,6 @@ function safeDate(d) {
   return new Date();
 }
 
-// Per-provider capability flags and rate-limit tuning.
-//
-// fetchBody:           store body_html/body_text during backfill/sync.
-//                      Disabled for providers that throttle BODY[] fetches at scale.
-// usesIdle:            keep the persistent sync connection in IMAP IDLE for push events.
-// maxSyncIntervalMs:   CEILING on the tick value — Math.min, so it can only make the tick
-//                      FASTER. Intended for providers whose IDLE is unreliable and therefore
-//                      must not be left on a slow tick. NB: it cannot express "poll slowly
-//                      because IDLE handles delivery" — that needs a floor (Math.max), which
-//                      does not exist yet. PurelyMail's 120000 was added meaning the latter
-//                      (see #299) and so has never had any effect: every value the settings UI
-//                      offers is <= 120000, making Math.min a no-op for all of them.
-// pushesFlags:         server pushes flag changes via IDLE; false = poll every sync tick.
-// flagPollEveryTicks:  for non-push flag providers, poll flags every N successful sync ticks.
-// snippetIndex:        run the background snippet indexer after backfill.
-//                      Disabled for providers that throttle body fetches too aggressively.
-// skipFolderPatterns:  folder path substrings to skip during backfill (label-view dedup).
-// skipFolderNames:     exact folder paths to skip (non-selectable namespace containers).
-// batchSize/Delay/errorDelay/batchesPerConn: backfill rate-limit tuning.
-// connectStaggerMs:     base gap between successive account connects at startup, to keep the
-//                       initial burst under a provider's per-IP connection rate limit.
-//                       Omitted → 200ms default. See connectStaggerFor(). (#218)
-export const PROVIDERS = {
-  google: {
-    // Gmail folders are label memberships; matching Message-IDs are not proof of a move.
-    labelStore: true,
-    // Large batches, short delay: Gmail only throttles BODY[] not envelope/flags/uid.
-    // Backfills 30k+ messages in ~2 min instead of 12+ hours.
-    batchSize: 500, batchDelay: 2000, errorDelay: 30000, batchesPerConn: 10,
-    fetchBody: false,
-    pushesFlags: false,
-    snippetIndex: false,
-    speculativeFetch: false,
-    skipFolderPatterns: ['all mail', '[gmail]/starred', '[gmail]/important'],
-    // [Gmail] is a namespace container — not a selectable mailbox. It must be
-    // matched exactly so that real subfolders like [Gmail]/Drafts are not skipped.
-    skipFolderNames: ['[gmail]'],
-  },
-  yahoo: {
-    batchSize: 100, batchDelay: 2000, errorDelay: 30000, batchesPerConn: 10,
-    fetchBody: false,
-    pushesFlags: true,
-    snippetIndex: true,
-    speculativeFetch: false,
-    skipFolderPatterns: [],
-    skipFolderNames: [],
-    // Yahoo enforces a small per-account session ceiling rather than a rate limit: a fresh
-    // account with a fresh app password had its FIRST secondary login refused with
-    // [UNAVAILABLE] while the primary session worked fine (#474, reporter's isolated
-    // instance). Thunderbird hit the same wall (Mozilla bug 1727971, "didn't like more
-    // than 3 connections" while TB opened 5) and fixed it by opening fewer. So: one body
-    // connection instead of four, and no startup pre-warm, whose only job is to open a
-    // connection early, which is exactly what this provider punishes.
-    poolSize: 1,
-    poolPrewarm: false,
-    // Yahoo also rate-limits the AUTHENTICATE command itself ("[LIMIT] AUTHENTICATE Rate
-    // limit hit.", #474 round 5): once the periodic tasks were each opening their own
-    // fresh login, the refusals never converged (measured at 26/hr steady-state with the
-    // tab closed — staleness probe, folder status, reconcile via pool grow). So the fix is
-    // not pacing fresh logins better, it is not opening them: folder status and the
-    // staleness probe run over the shared body pool (one session here), the way flag
-    // writes already ride the persistent IDLE session. One accepted login establishes the
-    // pooled session and every periodic task after that reuses it, which also keeps it
-    // warm — the same emergent property as Thunderbird's cached-connection model.
-    secondaryOverPool: true,
-  },
-  apple: {
-    // iCloud is permissive — large batches, short delay.
-    batchSize: 200, batchDelay: 1000, errorDelay: 10000, batchesPerConn: 20,
-    fetchBody: false,
-    pushesFlags: true,
-    snippetIndex: true,
-    speculativeFetch: true,
-    skipFolderPatterns: [],
-    skipFolderNames: [],
-  },
-  microsoft: {
-    batchSize: 100, batchDelay: 1500, errorDelay: 15000, batchesPerConn: 15,
-    fetchBody: false,
-    pushesFlags: true,
-    snippetIndex: true,
-    speculativeFetch: true,
-    skipFolderPatterns: [],
-    skipFolderNames: [],
-  },
-  purelymail: {
-    // PurelyMail (Dovecot-based) is connection-sensitive, but it runs IMAP IDLE reliably —
-    // the same way Apple Mail and Thunderbird do on these accounts — provided the IDLE
-    // connection is kept alive. The earlier "IDLE goes deaf / EXISTS never arrives" symptoms
-    // were a too-infrequent re-IDLE (25 min) letting the socket half-open, not a server limit;
-    // the previous workaround (usesIdle:false + a fresh login every 10s) is what saturated the
-    // per-IP connection limit and produced the socket-timeout churn. So: one long-lived IDLE
-    // connection for instant push, re-issued on a short idleKeepaliveMs so it never goes deaf,
-    // plus a light periodic backstop poll on that same connection.
-    //   snippetIndex:false      — disables BOTH the background snippet indexer AND the
-    //                             on-view folder body prefetch (both gate on this flag), the
-    //                             bulk of the BODY[] load on a 50k-message uncached mailbox.
-    //   speculativeFetch:false  — PurelyMail returns malformed 0-byte literals for batched
-    //                             multi-part BODY[] fetches; two-step (structure then parts)
-    //                             is reliable.
-    //   preferFreshBodyFetch    — user/new-mail body fetches use a brand-new login instead of
-    //                             the shared pool, so they neither contend with flag writes on
-    //                             the size-2 pool nor inherit a frozen pooled session view.
-    //   usesIdle + idleKeepaliveMs — one IDLE connection pushes new mail; re-issued every 4 min
-    //                             so the socket stays alive. maxSyncIntervalMs is now a backstop.
-    batchSize: 100, batchDelay: 1500, errorDelay: 15000, batchesPerConn: 15,
-    connectStaggerMs: 1200, // connection-sensitive — space initial connects wide (#218)
-    fetchBody: false,
-    usesIdle: true,
-    idleKeepaliveMs: 4 * 60 * 1000, // re-issue IDLE every 4 min (Apple Mail-style) so the connection never goes deaf
-    pushesFlags: false,             // IDLE 'flags' handles most changes; keep the periodic flag poll as a backstop
-    snippetIndex: false,
-    speculativeFetch: false,
-    preferFreshBodyFetch: true,
-    freshInboxSync: false,          // IDLE push + backstop poll on the persistent connection replaces fresh-login-per-tick
-    autoBackfillExistingOnConnect: false,
-    // INERT — see the maxSyncIntervalMs note above. This was added to make the tick a light
-    // ~2-min backstop now that IDLE pushes mail, but the field is a Math.min ceiling, so on a
-    // 15s user interval it resolves to 15s and the backstop never happened. Left in place
-    // rather than silently changed: making it a floor would also stretch the flag poll
-    // (flagPollEveryTicks: 6) from 90s to 12 minutes, which is a product decision, not a bugfix.
-    maxSyncIntervalMs: 120000,
-    flagPollEveryTicks: 6,
-    prefetchNewBodies: true,
-    prefetchNewBodiesLimit: 1, // warm only the newest arrival; avoids BODY[] bursts while
-                               // making notification-click opens use the DB cache.
-    skipFolderPatterns: [],
-    skipFolderNames: [],
-  },
-  strato: {
-    // Identical to `generic` except for the ENABLE opt-out. Strato's server ENABLEs
-    // IMAP4rev2 despite not advertising it in CAPABILITY, then half-implements it:
-    // `UID SEARCH ALL` answers with an EMPTY ESEARCH response while EXISTS is nonzero
-    // (#472, verified by the reporter's raw traces with and without the ENABLE line —
-    // without it, classic SEARCH returns every UID). An always-empty SEARCH poisons
-    // everything membership-based: reconcile skips every folder ("has 0 entries but the
-    // server reports N"), the integrity pass fails once a minute, and backfill sees
-    // "0 on server". imapflow's disableIMAP4rev2 exists precisely for servers with
-    // broken IMAP4rev2 implementations; see makeClientCfg.
-    batchSize: 100, batchDelay: 1500, errorDelay: 15000, batchesPerConn: 15,
-    connectStaggerMs: 500,
-    fetchBody: false,
-    pushesFlags: true,
-    snippetIndex: true,
-    speculativeFetch: true,
-    skipFolderPatterns: [],
-    skipFolderNames: [],
-    disableIMAP4rev2: true,
-  },
-  generic: {
-    batchSize: 100, batchDelay: 1500, errorDelay: 15000, batchesPerConn: 15,
-    connectStaggerMs: 500, // unknown provider — moderate connect spacing (#218)
-    fetchBody: false,
-    pushesFlags: true,
-    snippetIndex: true,
-    speculativeFetch: true,
-    skipFolderPatterns: [],
-    skipFolderNames: [],
-  },
-};
-
 // Builds the move-detector relocate guard from a set of relocate-exempt "label" folders,
 // shared by the sync and backfill relocate UPDATEs so their exemption logic stays identical.
 // A labeled message intentionally lives in multiple folders as sibling rows; relocating in
@@ -1592,19 +1549,88 @@ export async function insertCopiedSibling(accountId, uid, fromFolder, toFolder, 
   return row ? row.id : null;
 }
 
+// An empty sibling insert succeeds only if the destination row is already cached in the COPYUID
+// epoch, as when the destination sync wins the race. Sync records the folder's epoch before it
+// caches rows. If the source row vanished first, nothing is cached and the caller must compensate.
+async function requireCachedCopy(accountId, toFolder, newUid, uidValidity) {
+  const { rows } = await query(
+    `SELECT 1 FROM messages m JOIN folders f ON f.account_id = m.account_id AND f.path = m.folder
+     WHERE m.account_id = $1 AND m.folder = $2 AND m.uid = $3 AND f.uid_validity::text = $4`,
+    [accountId, toFolder, newUid, String(uidValidity ?? '')]
+  );
+  if (!rows.length) throw new Error('Copied message has no cached destination row in its UID epoch');
+}
+
+export async function rollbackCopiedMessageOnInsertFailure(
+  manager, account, toFolder, newUid, insertError, uidValidity,
+) {
+  try {
+    if (uidValidity == null || !(await manager.permanentDeleteMessage(
+      account, newUid, toFolder, { expectUidValidity: uidValidity },
+    ))) throw new Error('Cannot safely roll back copy: destination UID validity is unknown or changed');
+  } catch (rollbackError) {
+    console.error(`Copy rollback failed: account=${account.id} folder=${JSON.stringify(toFolder)} copiedUid=${newUid}: ${extractImapError(rollbackError)}`);
+  }
+  throw insertError;
+}
+
+async function recountFolderRows(accountId, folder) {
+  await query(
+    `UPDATE folders f
+     SET total_count  = (SELECT COUNT(*) FROM messages m WHERE m.account_id = $1 AND m.folder = $2 AND m.is_deleted = false),
+         unread_count = (SELECT COUNT(*) FILTER (WHERE m.is_read = false)
+                         FROM messages m WHERE m.account_id = $1 AND m.folder = $2 AND m.is_deleted = false)
+     WHERE f.account_id = $1 AND f.path = $2`,
+    [accountId, folder]
+  );
+}
+
+async function purgeFolderMessageRows(account, folder) {
+  const deleted = await query(
+    'DELETE FROM messages WHERE account_id = $1 AND folder = $2 RETURNING thread_key',
+    [account.id, folder]
+  );
+  try {
+    await recountFolderRows(account.id, folder);
+  } finally {
+    notifyMessageRowsDeleted(account, deleted.rows, folder);
+  }
+  return deleted;
+}
+
+// Delete the rows identified by reconcileDeletes' IMAP snapshot and report their thread keys to
+// plugins. RETURNING makes the hook reflect only rows that survived the cutoff re-check, not every
+// candidate from the earlier SELECT.
+async function deleteReconciledMessageRows(account, folder, orphanUids, reconcileStartedAt) {
+  const deleted = await query(
+    `DELETE FROM messages
+     WHERE account_id = $1 AND folder = $2 AND uid = ANY($3::bigint[])
+       AND (synced_at IS NULL OR synced_at < $4)
+     RETURNING thread_key`,
+    [account.id, folder, orphanUids, reconcileStartedAt]
+  );
+  try {
+    await recountFolderRows(account.id, folder);
+  } finally {
+    notifyMessageRowsDeleted(account, deleted.rows, folder);
+  }
+  return deleted.rowCount ?? deleted.rows.length;
+}
+
 // DB half of removeMessageCopy: delete exactly one folder's copy of a message. Scoped
 // to (account_id, uid, folder) — the messages unique key — so sibling rows in other
 // folders are never touched. Decrements that folder's counts off the removed row's
 // read state. Returns the number of rows removed (0 if it was already gone).
-export async function deleteMessageCopyRow(accountId, uid, folder) {
+export async function deleteMessageCopyRow(accountId, uid, folder, account = { id: accountId }) {
   const res = await query(
-    'DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3 RETURNING is_read',
+    'DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3 RETURNING is_read, thread_key',
     [accountId, uid, folder]
   );
   const row = res.rows[0];
   if (row) {
-    adjustFolderCounts(accountId, folder, -1, row.is_read ? 0 : -1);
+    await adjustFolderCounts(accountId, folder, -1, row.is_read ? 0 : -1);
   }
+  notifyMessageRowsDeleted(account, res.rows, folder);
   return row ? 1 : 0;
 }
 
@@ -1625,17 +1651,6 @@ export async function deleteMessageCopyRow(accountId, uid, folder) {
 export async function emitSectionsChanged(mgr, account, changedCount) {
   if (!(changedCount > 0)) return;
   await pluginRegistry.runHook('sectionsChanged', { mgr, account, changedCount });
-}
-
-export function providerProfile(account) {
-  const host = (account.imap_host || '').toLowerCase();
-  if (host.includes('.gmail.com') || host.includes('.googlemail.com')) return PROVIDERS.google;
-  if (host.includes('.yahoo.com') || host.includes('.ymail.com')) return PROVIDERS.yahoo;
-  if (host.includes('.icloud.com') || host.includes('.apple.com') || host.includes('.me.com')) return PROVIDERS.apple;
-  if (host.includes('.outlook.com') || host.includes('office365.com') || host.includes('.hotmail.com') || host.includes('.live.com') || (account.oauth_provider === 'microsoft')) return PROVIDERS.microsoft;
-  if (host.includes('purelymail.com')) return PROVIDERS.purelymail;
-  if (host.includes('.strato.')) return PROVIDERS.strato;
-  return PROVIDERS.generic;
 }
 
 // The probe has already FETCHed these candidates, excluding phantom SEARCH results.
@@ -1999,7 +2014,10 @@ export async function ensureFreshToken(account) {
   if (expiry - now < 5 * 60 * 1000) {
     console.log(`Refreshing ${account.oauth_provider} token for ${logAccount(account)}`);
     try {
-      account = await refresh(account);
+      // Into the caller's object as well: an interval or IDLE listener keeps it, and with the
+      // old expiry every later caller would refresh again, with a refresh token Microsoft has
+      // since rotated away.
+      account = Object.assign(account, await refresh(account));
       clearRefreshFailure(account.id);
       noteFreshToken(account.id);
     } catch (err) {
@@ -2322,13 +2340,34 @@ function guardPoolLease(client) {
   return lease;
 }
 
+// The accounts whose pooled session the current async work holds (see withFreshClient).
+const pooledHolds = new AsyncLocalStorage();
+
+// No pooled session of the account is free and none can be added.
+function poolIsFull(account) {
+  const pool = connectionPools.get(account.id);
+  if (!pool || hasIdlePooledClient(connectionPools, account.id)) return false;
+  return pool.clients.length + (pool.pending || 0) >= Math.min(POOL_SIZE, providerProfile(account).poolSize ?? POOL_SIZE);
+}
+
 // Exported for imapPoolStall.test.js. stallTimeout: false keeps the lease on the normal
 // timeout, for an operation the stall timer cannot judge (appendToFolder).
 export async function withFreshClient(account, fn, { stallTimeout = true, background = false } = {}) {
+  // Work that already holds this account's pooled session and asks for another while the pool
+  // is full would wait for itself: the session is released only when that work finishes. With
+  // a pool of one (Yahoo, Zoho) this is certain. The folder integrity pass holds the pooled
+  // session (secondaryOverPool), and new INBOX mail it takes in runs the inbox rules, whose
+  // move then waited out ACQUIRE_TIMEOUT_MS and failed as busy, leaving the mail unfiled.
+  // Such a nested request gets a one-off login instead, closed when it is done.
+  if (pooledHolds.getStore()?.has(account.id) && poolIsFull(account)) {
+    return withFreshLogin(account, fn);
+  }
   const client = await acquirePooledClient(account, { background });
   const lease = stallTimeout ? guardPoolLease(client) : { stalled: false, end() {} };
   try {
-    return await fn(client);
+    const held = new Set(pooledHolds.getStore() || []);
+    held.add(account.id);
+    return await pooledHolds.run(held, () => fn(client));
   } catch (err) {
     // On error, evict this client from pool so next call gets a fresh one.
     // Do not logout here — releasePooledClient in finally detects the client is
@@ -2426,11 +2465,25 @@ export async function ensureMailbox(client, path, { resolvePath = false } = {}) 
     if (!alreadyExists) {
       throw err;
     }
-    // A plain-NO already-exists carries no server path, so the casing lookup can only match
-    // from the bare requested name — enough for a flat case-insensitive server, but a prefixed
-    // server's real path (INBOX.Todo) won't match and falls back to the input.
-    return { path: resolvePath ? await resolveServerFolderCasing(client, requested) : requested, created: false };
+    // A plain-NO already-exists carries no server path. The path is the one the CREATE asked
+    // for, as imapflow spelled it (createdPathFor): returning the bare requested name gave
+    // 'Reading/Later' for a server whose folder is 'Reading.Later', and a COPY into that path
+    // failed on every run after the folder was created (D#751).
+    const known = createdPathFor(client, requested);
+    return { path: resolvePath ? await resolveServerFolderCasing(client, known) : known, created: false };
   }
+}
+
+// The path imapflow's CREATE used for `requested`, by its normalizePath (lib/tools.js): the
+// '/'-separated segments joined with the namespace delimiter, under the namespace prefix, INBOX
+// as itself. A client whose namespace is not known (a bare test client) keeps the name as given.
+export function createdPathFor(client, requested) {
+  const namespace = client?.namespace;
+  if (!namespace) return requested;
+  const path = requested.split('/').join(namespace.delimiter || '');
+  if (path.toUpperCase() === 'INBOX') return 'INBOX';
+  if (namespace.prefix && !path.startsWith(namespace.prefix)) return namespace.prefix + path;
+  return path;
 }
 
 // Resolve the server's REAL casing for a mailbox that already exists, by case-insensitive
@@ -2817,7 +2870,7 @@ export class ImapManager {
     this._syncErrorState = new Map();
     this._accountErrorStreak = new Map(); // accountId -> consecutive recoverable failures not yet surfaced
     this._errorForgets = new Map(); // accountId -> times forgetAccountError ran (see there)
-    this.onDemandSyncing = new Set(); // `${accountId}:${folder}` — prevent duplicate on-demand syncs
+    this.onDemandSyncing = new Map(); // awaitable folder sync claims
     // Bounded engine facade handed to plugin hooks instead of `this` — plugins get only the reviewed
     // sync/label primitives (see mailEngineFacade), never the raw engine, its connections, or locks.
     this.pluginFacade = createPluginMailFacade(this);
@@ -2831,6 +2884,7 @@ export class ImapManager {
     this._pollOnlyAccounts = new Set(); // accountId — demoted to poll-only (no persistent IDLE) by the per-host connection budget (#379)
     this._idleMissStreak = new Map(); // accountId -> consecutive health checks seen NOT idling despite IDLE being enabled
     this.snippetIndexerRunning = new Set(); // accountId — prevent duplicate snippet-index runs
+    this.snippetStructureFirst = new Set(); // accountId: the server refuses guessed body parts (Proton Mail Bridge, #768)
     this.snippetBackoff = new Map();        // imap_host -> { failures, until } circuit breaker (host-level: a per-host connection limit hits every account on that host, so back them all off together)
     this.lastUserActivity = new Map();      // accountId -> ms timestamp of last live body fetch
     this.syncTickCount = new Map(); // accountId -> successful sync ticks (for reconcile scheduling)
@@ -2839,6 +2893,12 @@ export class ImapManager {
     this._expungeDebounceTimers = new Map(); // accountId -> debounce timer for expunge reconciles
     this._pendingFlagSync = new Set(); // accountId — flag sync was skipped because a full sync was running; drain after sync
     this._pendingNewMail = new Set(); // accountId — new mail (EXISTS) arrived while a sync was running; sync again after it
+    // accountId -> how many times it was disconnected; a connect in flight stops when it changes.
+    this._disconnectGeneration = new Map();
+    // `${accountId}\n${folder}` -> how many mark-all-reads of it are still writing to the server.
+    this._markingAllRead = new Map();
+    // Pauses before each retry of a mark-all-read whose \Seen write failed (tests shorten them).
+    this._markAllReadRetryMs = [5000, 30000];
     // accountId -> Map<`${messageId}:${flag}`, { messageId, flag, attempts }>: local read/star
     // changes whose IMAP push failed and must be retried until the server confirms them.
     this._pendingFlagPush = new Map();
@@ -3373,6 +3433,11 @@ export class ImapManager {
     // Previously this only ran when a connection existed, which left orphaned
     // intervals running whenever the connection died between reconnect attempts.
     await this.disconnectAccount(account.id);
+    // A disconnect from here on (the account disabled or deleted while this connects, which can
+    // take a minute) bumps the generation, and this connect then stops instead of setting up an
+    // IDLE connection and a sync timer for an account nobody wants synced.
+    const generation = this._disconnectGeneration.get(account.id) || 0;
+    const superseded = () => (this._disconnectGeneration.get(account.id) || 0) !== generation;
 
     // Per-host persistent-connection budget (#379 Phase 2). When an operator has set a finite cap
     // for this (connection-limited) host and this account is beyond it, run poll-only instead of
@@ -3383,6 +3448,7 @@ export class ImapManager {
     if (Number.isFinite(persistentCap)) {
       const eligible = await this._isPersistentEligible(account, persistentCap).catch(() => true);
       if (!eligible) {
+        if (superseded()) { this.connectingAccounts.delete(account.id); return false; }
         try { this._startPollOnly(account); }
         finally { this.connectingAccounts.delete(account.id); }
         return true;
@@ -3406,6 +3472,11 @@ export class ImapManager {
       client = await connectImapClient(account, resolved,
         { enableIdle: providerProfile(account).usesIdle !== false, policy, idleKeepaliveMs: providerProfile(account).idleKeepaliveMs },
         30000, 'IMAP connect');
+      if (superseded()) {
+        try { client.close(); } catch { /* already closed */ }
+        console.log(`Connect of ${logAccount(account)} abandoned: disconnected meanwhile`);
+        return false;
+      }
 
       // Remove from active connections the moment the server closes the socket.
       // Without this, a cleanly-closed connection lingers in this.connections and
@@ -3454,6 +3525,14 @@ export class ImapManager {
         this._connectCooldown.delete(account.id);
       } catch (syncErr) {
         console.warn(`Initial sync skipped for ${logAccount(account)}: ${extractImapError(syncErr)}`);
+      }
+
+      // Disconnected during the initial sync: no backfill, pool or sync timer for it.
+      if (superseded()) {
+        if (this.connections.get(account.id) === client) this.connections.delete(account.id);
+        try { client.close(); } catch { /* already closed */ }
+        console.log(`Connect of ${logAccount(account)} abandoned: disconnected meanwhile`);
+        return false;
       }
 
       // Pre-warm one pool connection immediately so the first email click doesn't
@@ -3519,6 +3598,7 @@ export class ImapManager {
   }
 
   async disconnectAccount(accountId) {
+    this._disconnectGeneration.set(accountId, (this._disconnectGeneration.get(accountId) || 0) + 1);
     const timer = this.syncIntervals.get(accountId);
     // clearTimeout works for both setTimeout and setInterval Timeout objects in Node.js
     if (timer) { clearTimeout(timer); this.syncIntervals.delete(accountId); }
@@ -3606,7 +3686,10 @@ export class ImapManager {
     const host = (account.imap_host || '').toLowerCase();
     let client = null;
     let slotHeld = false;
+    let disconnectAfter = false;
     try {
+      // Settings and tokens as they are now, as on a persistent connection's tick.
+      if (!(await this._refreshLiveAccount(account))) { disconnectAfter = true; return; }
       await this._bgConnSem.acquire(host);
       slotHeld = true;
       const fresh = await raceTimeout(ensureFreshToken(account), 15000, 'Poll-only token refresh');
@@ -3656,6 +3739,10 @@ export class ImapManager {
       if (client) { try { client.close(); } catch { /* already closed */ } }
       if (slotHeld) this._bgConnSem.release(host);
       this.syncingAccounts.delete(account.id);
+      if (disconnectAfter) {
+        console.log(`Disconnecting ${logAccount(account)}: the account was removed or disabled`);
+        await this.disconnectAccount(account.id);
+      }
     }
   }
 
@@ -3876,12 +3963,12 @@ export class ImapManager {
     this.syncStartedAt.set(account.id, Date.now());
     let activeClient = null;
     let usedFreshSyncClient = false;
+    let disconnectAfter = false;
     let syncResult;
     try {
       activeClient = this.connections.get(account.id);
-      // syncAccount tracks the freshest account data available — updated to freshAccount
-      // on reconnect so that IDLE listeners, provider detection, and flag syncs all use
-      // current credentials and config rather than the stale closure-captured object.
+      // The account this tick syncs with: the object the interval and the IDLE listeners share,
+      // kept current by _refreshLiveAccount below and by a reconnect writing into it.
       let syncAccount = account;
       if (!activeClient) {
         // Respect the connection-refusal cooldown — the 60s sync interval must NOT hammer a
@@ -3919,9 +4006,10 @@ export class ImapManager {
           pendingClient = await connectImapClient(setup.freshAccount, setup.resolved,
             { enableIdle: providerProfile(setup.freshAccount).usesIdle !== false, policy: setup.policy, idleKeepaliveMs: providerProfile(setup.freshAccount).idleKeepaliveMs },
             30000, 'Reconnect');
-          const reconnected = { client: pendingClient, account: setup.freshAccount };
-          activeClient = reconnected.client;
-          syncAccount = reconnected.account;
+          activeClient = pendingClient;
+          // Into the object this interval holds, so later ticks and the IDLE listeners below
+          // share the reconnect's account data (see _refreshLiveAccount).
+          syncAccount = Object.assign(account, setup.freshAccount);
           activeClient.on('close', () => {
             if (this.connections.get(account.id) === activeClient) {
               this.connections.delete(account.id);
@@ -3951,6 +4039,11 @@ export class ImapManager {
         } finally {
           this.connectingAccounts.delete(account.id);
         }
+      } else if (!(await this._refreshLiveAccount(account))) {
+        // Deleted or disabled while connected, or connected by a connect that finished after
+        // the disconnect did: nothing else tears this connection and its timer down.
+        disconnectAfter = true;
+        return;
       }
       // Honor the connection-refusal cooldown on the sync path itself, not just on reconnect.
       // freshInboxSync providers (PurelyMail) keep the persistent connection open and sync via
@@ -4074,7 +4167,12 @@ export class ImapManager {
     } finally {
       this.syncingAccounts.delete(account.id);
       this.syncStartedAt.delete(account.id);
-      this._syncAgainIfMailArrived(account);
+      if (disconnectAfter) {
+        console.log(`Disconnecting ${logAccount(account)}: the account was removed or disabled`);
+        await this.disconnectAccount(account.id);
+      } else {
+        this._syncAgainIfMailArrived(account);
+      }
     }
   }
 
@@ -4195,6 +4293,24 @@ export class ImapManager {
     } catch (err) {
       console.warn(`Flag range sync error for ${logAccount(account)}:`, err.message);
     }
+  }
+
+  // The account object a connection was given holds its settings and tokens, and the sync
+  // interval and the IDLE listeners keep it for as long as the connection lives: a settings change
+  // reconnects only for credentials and hosts. Each tick re-reads the row into it, so a change to
+  // spam filtering or categorization applies on the next tick, and a pool connection grown from a
+  // tick refreshes an OAuth token with the current refresh token, not a rotated-away one. Resolves
+  // false when the account is gone or disabled. A failed read keeps what it has.
+  async _refreshLiveAccount(account) {
+    let row;
+    try {
+      ({ rows: [row] } = await query('SELECT * FROM email_accounts WHERE id = $1', [account.id]));
+    } catch {
+      return true;
+    }
+    if (!row || !row.enabled) return false;
+    Object.assign(account, row);
+    return true;
   }
 
   _startSyncInterval(account, ms) {
@@ -4479,22 +4595,13 @@ export class ImapManager {
               if (fetched.size !== client.mailbox.exists) throw new Error('Incomplete folder flag snapshot');
             }
           } else if (plan === 'changedsince') {
-            // Same sub-budget as the full scan. CHANGEDSINCE is only cheap if the server
-            // honors it, and advertising CONDSTORE is not a promise that it will: iCloud
-            // advertises CONDSTORE and returns the entire mailbox regardless of the modseq
-            // asked for (measured: all 22,904 messages for a 5-modseq window). It happens to
-            // be fast enough that this does not bite there, but a server that both ignores
-            // CHANGEDSINCE and is slow would re-enter the unbounded fetch this pass exists
-            // to avoid. Never leave a fetch unbounded inside a budgeted operation.
-            // Windowed the same way the sync delta scan is, and for the same documented
-            // reason: iCloud advertises CONDSTORE but ignores changedSince and returns the
-            // whole requested range. A sub-budget alone bounds the wait, not the work; the
-            // window bounds the work. Recent UIDs are the ones whose flags change, and the
-            // reactive IDLE path covers live events, so this is a backstop rather than the
-            // primary flag mechanism. Servers that honor changedSince return only what
-            // changed regardless of the window.
+            // Same sub-budget as the full scan: CHANGEDSINCE is only cheap if the server honors
+            // it, and advertising CONDSTORE is not a promise that it will (iCloud returns the
+            // entire mailbox, measured 22,904 messages for a 5-modseq window). It covers the
+            // whole mailbox, or a recent UID window on a server that ignores changedSince (see
+            // flagScanLowUid): a sub-budget alone bounds the wait, not the work.
             const uidNext = Number(client.mailbox?.uidNext) || 0;
-            const deltaLow = uidNext > DELTA_SCAN_UID_WINDOW ? uidNext - DELTA_SCAN_UID_WINDOW : 1;
+            const deltaLow = flagScanLowUid(account, uidNext - 1);
             const delta = (async () => {
               for await (const m of client.fetch(`${deltaLow}:*`, { uid: true, flags: true }, { uid: true, changedSince: BigInt(storedFlagModseq) })) {
                 flags.push({ uid: m.uid, isRead: m.flags.has('\\Seen'), isStarred: m.flags.has('\\Flagged') });
@@ -4505,10 +4612,14 @@ export class ImapManager {
               delta,
               new Promise(res => setTimeout(() => res(FLAG_SCAN_TIMED_OUT), FLAG_SCAN_TIMEOUT_MS)),
             ]);
+            const deltaExists = Number(client.mailbox?.exists) || 0;
             if (deltaOutcome === FLAG_SCAN_TIMED_OUT) {
+              noteChangedSinceScan(account, { lowUid: deltaLow, exists: deltaExists, timedOut: true });
               flags.length = 0;
               fullScanDeferred = true;
               console.warn(`Integrity delta flag scan deferred for ${logAccount(account)}/${path}: over ${FLAG_SCAN_TIMEOUT_MS}ms`);
+            } else {
+              noteChangedSinceScan(account, { lowUid: deltaLow, returned: flags.length, exists: deltaExists });
             }
           }
 
@@ -4557,9 +4668,42 @@ export class ImapManager {
             throw new Error('Folder membership changed during integrity sync');
           }
           if (expired) throw new Error('Folder integrity sync expired');
-          const changed = await this._applyFlagUpdates(account, path, flags);
-          const { rows } = await query('SELECT uid, synced_at FROM messages WHERE account_id=$1 AND folder=$2', [account.id, path]);
+          let changed = await this._applyFlagUpdates(account, path, flags);
+          const { rows } = await query('SELECT uid, synced_at, is_read, is_deleted FROM messages WHERE account_id=$1 AND folder=$2', [account.id, path]);
           const local = new Set(rows.map(r => Number(r.uid)));
+          // Read state the flag scans never pulled (a change elsewhere that their range or
+          // watermark skipped) shows up as an unread count that differs from the server's, and
+          // nothing above repairs it. One UNSEEN search does, cheaply and server-side: rows the
+          // server lists whose read state disagrees with it are set to the server's, except a
+          // change made here in the last 30 s (still being pushed) or a uid a move is using.
+          // Only uids in the membership snapshot are touched, so mail arriving after it is not.
+          const localUnread = rows.reduce((n, r) => n + (!r.is_read && !r.is_deleted && server.has(Number(r.uid)) ? 1 : 0), 0);
+          // Not while a mark-all-read is still writing \Seen to the server in chunks: the rows
+          // not reached yet would be set back to unread once its 30 s window lapsed.
+          if (Number.isSafeInteger(observed.unseen) && observed.unseen !== localUnread
+              && !this._markingAllRead?.has(`${account.id}\n${path}`)) {
+            if (expired) throw new Error('Folder integrity sync expired');
+            const unseen = await client.search({ seen: false }, { uid: true });
+            if (Array.isArray(unseen)) {
+              const unseenSet = new Set(unseen);
+              const disagree = rows.filter(r => server.has(Number(r.uid)) && !r.is_deleted
+                && Boolean(r.is_read) === unseenSet.has(Number(r.uid))
+                && !this._isMoveUidGuarded(account.id, path, Number(r.uid))).map(r => Number(r.uid));
+              if (disagree.length) {
+                const healed = await query(
+                  `UPDATE messages SET is_read = NOT (uid = ANY($3::bigint[]))
+                   WHERE account_id=$1 AND folder=$2 AND uid = ANY($4::bigint[])
+                     AND is_read = (uid = ANY($3::bigint[]))
+                     AND (read_changed_at IS NULL OR NOW() - read_changed_at >= interval '30 seconds')`,
+                  [account.id, path, unseen, disagree]
+                );
+                if (healed.rowCount) {
+                  changed += healed.rowCount;
+                  console.log(`Integrity pass for ${logAccount(account)}/${path}: read state of ${healed.rowCount} message(s) set to the server's (unread ${localUnread} here, ${observed.unseen} on the server)`);
+                }
+              }
+            }
+          }
           // UIDs the server lists but has repeatedly refused to hand over do not count as a
           // gap. Without this the pair (integrity check, backfill) loops forever on them:
           // the check finds them missing, the backfill asks and gets nothing, and the next
@@ -4578,7 +4722,12 @@ export class ImapManager {
             : [];
           if (expired) throw new Error('Folder integrity sync expired');
           if (gone.length) {
-            await query('DELETE FROM messages WHERE account_id=$1 AND folder=$2 AND uid=ANY($3::bigint[]) AND (synced_at IS NULL OR synced_at < $4) AND EXISTS (SELECT 1 FROM folders WHERE account_id=$1 AND path=$2 AND uid_validity=$5)', [account.id, path, gone, cutoff, String(observed.uidValidity)]);
+            const deleted = await query('DELETE FROM messages WHERE account_id=$1 AND folder=$2 AND uid=ANY($3::bigint[]) AND (synced_at IS NULL OR synced_at < $4) AND EXISTS (SELECT 1 FROM folders WHERE account_id=$1 AND path=$2 AND uid_validity=$5) RETURNING thread_key', [account.id, path, gone, cutoff, String(observed.uidValidity)]);
+            try {
+              await recountFolderRows(account.id, path);
+            } finally {
+              notifyMessageRowsDeleted(account, deleted.rows, path);
+            }
           }
           if (changed || gone.length) {
             this.broadcast({ type: 'flags_synced', accountId: account.id }, account.user_id);
@@ -4653,9 +4802,10 @@ export class ImapManager {
         if (pruned.rows.length) {
           const paths = pruned.rows.map(r => r.path);
           const dropped = await query(
-            'DELETE FROM messages WHERE account_id = $1 AND folder = ANY($2)',
+            'DELETE FROM messages WHERE account_id = $1 AND folder = ANY($2) RETURNING folder, thread_key',
             [account.id, paths]
           );
+          notifyMessageRowsDeleted(account, dropped.rows);
           console.log(`Folder sync for ${logAccount(account)}: dropped ${paths.length} folder(s) no longer on the server (${paths.join(', ')}) and ${dropped.rowCount} cached message(s)`);
         }
       }
@@ -4720,7 +4870,7 @@ export class ImapManager {
           }
         },
         // With this account's full row, which the pool needs to log in.
-        syncFolderOnDemand: (_acct, folder) => this.syncFolderOnDemand(account, folder),
+        syncFolderOnDemand: (_acct, folder, options) => this.syncFolderOnDemand(account, folder, options),
         broadcast: (...args) => this.broadcast(...args),
         _guardMoveUid: (...args) => this._guardMoveUid(...args),
         _unguardMoveUid: (...args) => this._unguardMoveUid(...args),
@@ -4767,7 +4917,7 @@ export class ImapManager {
             uidValidityChanged = true;
             recordSyncSignal('uidvalidity_change', { accountId: account.id });
             console.warn(`UIDVALIDITY changed for ${logAccount(account)}/${folder}: ${storedValidity} → ${currentValidity}. Purging stale messages and re-backfilling.`);
-            const purged = await query('DELETE FROM messages WHERE account_id = $1 AND folder = $2', [account.id, folder]);
+            const purged = await purgeFolderMessageRows(account, folder);
             // The stored modseq belongs to the OLD UIDVALIDITY epoch and is no longer
             // comparable — clear it so the next sync re-seeds cleanly from the new epoch.
             await query('UPDATE folders SET highest_modseq = NULL WHERE account_id = $1 AND path = $2', [account.id, folder]);
@@ -4999,7 +5149,18 @@ export class ImapManager {
               sanitizeStr(parsed.forwardedFromName), sanitizeStr(parsed.forwardedFromEmail), sanitizeStr(parsed.forwardedVia),
               providerProfile(account).labelStore ? parsed.providerMsgid || null : null,
             ]);
-            if (result.rows[0]?.is_new) {
+            // A message a move dropped the row of, filed again here: it gets back what MailFlow
+            // knew about it and is not new mail, as a move with a known uid is not
+            // (services/movedRowCarry.js).
+            const carried = result.rows[0]?.is_new && hasCarries()
+              ? takeCarry(account.id, folder, msgId, parsed.date) : null;
+            if (carried) {
+              insertedCount++;
+              const update = carryUpdate(result.rows[0].id, carried);
+              if (update) await query(update.text, update.params);
+              // A row moved before its spam check finished still gets one.
+              if (carried.spam_analyzed_at == null) this.maybeClassifyNewMessage(account, result.rows[0].id, parsed);
+            } else if (result.rows[0]?.is_new) {
               insertedCount++;
               // Inbox-ingest candidate: any newly-inserted INBOX row, read OR unread (read state
               // is not a gate here — the plugin decides). The unread-only push below still drives
@@ -5081,13 +5242,12 @@ export class ImapManager {
         let flagScanComplete = true;
         if (plan === 'delta') {
           // Flag-only scan. The only thing that changes on an EXISTING message is its flags
-          // (read/star) — new mail is the UID phase's job — so fetch just uid+flags over a recent
-          // UID window and bulk-apply. Deliberately lightweight: iCloud advertises CONDSTORE (so
-          // we land here) but IGNORES changedSince and returns the WHOLE window; with uid+flags
-          // that is a cheap fetch + one bulk UPDATE (~a second) instead of thousands of full-
-          // envelope fetches and upserts. changedSince still trims the set on servers that honor
-          // it (PurelyMail, Gmail). A tiny mailbox clamps to 1:* anyway.
-          const deltaLow = Math.max(1, maxKnownUid - DELTA_SCAN_UID_WINDOW + 1);
+          // (read/star) — new mail is the UID phase's job — so fetch just uid+flags and
+          // bulk-apply. changedSince keeps it to what changed, over the whole mailbox; on a
+          // server that ignores changedSince (iCloud) it covers a recent UID window instead,
+          // which with uid+flags is one cheap fetch + one bulk UPDATE. See flagScanLowUid.
+          const deltaLow = flagScanLowUid(account, maxKnownUid);
+          const scanExists = Number(client.mailbox?.exists) || 0;
           const deltaStartedAt = Date.now();
           const flagsToUpdate = [];
           try {
@@ -5105,6 +5265,7 @@ export class ImapManager {
               new Promise(res => setTimeout(() => res(FLAG_SCAN_TIMED_OUT), FLAG_SCAN_TIMEOUT_MS)),
             ]);
             if (outcome === FLAG_SCAN_TIMED_OUT) {
+              noteChangedSinceScan(account, { lowUid: deltaLow, exists: scanExists, timedOut: true });
               flagScanComplete = false;
               console.warn(`Delta flag scan deferred for ${logAccount(account)}/${folder}: over ${FLAG_SCAN_TIMEOUT_MS}ms (provider throttling) — retrying next tick`);
             }
@@ -5119,6 +5280,7 @@ export class ImapManager {
           // so the next tick redoes it. A flag change has no new_messages event of its own, so a
           // flags_synced nudge lets a read-elsewhere reflect live instead of staying stale.
           if (flagScanComplete) {
+            noteChangedSinceScan(account, { lowUid: deltaLow, returned: flagsToUpdate.length, exists: scanExists });
             const changed = await this._applyFlagUpdates(account, folder, flagsToUpdate);
             logger.debug(`Delta flag scan OK for ${logAccount(account)}/${folder}: ${flagsToUpdate.length} fetched, ${changed} changed in ${Date.now() - deltaStartedAt}ms (uid>=${deltaLow}), modseq ${storedModseq}->${serverModseq}`);
             if (changed > 0) {
@@ -5280,39 +5442,12 @@ export class ImapManager {
             alertMessages: alertMessages.slice(-5), alertCount,
           }, account.user_id);
           if (newMessages.length > 0) broadcastedNewMessages = true;
-          // Web Push — INBOX only, alert-eligible messages only. Non-inbox folder syncs
+          // Notifications — INBOX only, alert-eligible messages only. Non-inbox folder syncs
           // (Archive, Spam, on-demand) can surface old or filtered messages; sending push
           // for them or for mark_read-silenced messages would be misleading.
           // Fire-and-forget: push errors are non-fatal.
           if (folder === 'INBOX' && alertMessages.length > 0) {
-            const latest = alertMessages[alertMessages.length - 1];
-            const basePayload = {
-              title: latest.fromName || latest.fromEmail || 'New mail',
-              body: alertCount === 1
-                ? (latest.subject || '(no subject)')
-                : `${alertCount} new messages`,
-              icon: '/icon-512.png',
-              badge: '/badge-96.png',
-              // Deep-link the notification to the latest message (the notification's
-              // tag collapses arrivals into one card representing `latest`). Guarded:
-              // fall back to the inbox if the id is somehow absent.
-              url: latest.id ? `/?m=${latest.id}` : '/',
-            };
-            // Try to include the total unread count for the home screen badge.
-            // If the query fails for any reason, send the push without it so
-            // notifications are never silently dropped.
-            query(
-              `SELECT COUNT(*)::int AS total FROM messages m
-               JOIN email_accounts a ON a.id = m.account_id
-               WHERE a.user_id = $1 AND a.enabled = true AND m.folder = 'INBOX' AND m.is_read = false AND m.is_deleted = false`,
-              [account.user_id]
-            ).then(r => {
-              sendPushToUser(account.user_id, { ...basePayload, unreadCount: r.rows[0]?.total ?? 0 })
-                .catch(err => console.warn('Push notification error:', err.message));
-            }).catch(() => {
-              sendPushToUser(account.user_id, basePayload)
-                .catch(err => console.warn('Push notification error:', err.message));
-            });
+            notifyNewMail({ userId: account.user_id, accountName: account.name, alertMessages, alertCount });
           }
           // Pre-warm the body cache for newly arrived messages so clicking one
           // immediately after receipt doesn't require a live IMAP fetch.
@@ -5476,7 +5611,7 @@ export class ImapManager {
             const storedValidity = foldRow.rows[0]?.uid_validity ? Number(foldRow.rows[0].uid_validity) : null;
             if (storedValidity !== null && storedValidity !== currentValidity) {
               console.warn(`Backfill: UIDVALIDITY changed for ${logAccount(account)}/${folder}: ${storedValidity} → ${currentValidity}. Purging stale messages.`);
-              const purged = await query('DELETE FROM messages WHERE account_id = $1 AND folder = $2', [account.id, folder]);
+              const purged = await purgeFolderMessageRows(account, folder);
               // Same GTD section-data staleness gap as the syncMessages purge path.
               await emitSectionsChanged(this.pluginFacade, account, purged.rowCount);
             }
@@ -5542,13 +5677,7 @@ export class ImapManager {
       if (missingUids.length === 0) {
         console.log(`Backfill ${logAccount(account)}: no missing UIDs (${dbCount} in DB vs ${serverTotal} on server — within tolerance)`);
         // Still reconcile folder counts — they may be stale if a previous backfill was interrupted.
-        await query(
-          `UPDATE folders
-           SET total_count  = (SELECT COUNT(*)                                FROM messages m WHERE m.account_id = $1 AND m.folder = $2),
-               unread_count = (SELECT COUNT(*) FILTER (WHERE is_read = false)  FROM messages m WHERE m.account_id = $1 AND m.folder = $2)
-           WHERE account_id = $1 AND path = $2`,
-          [account.id, folder]
-        ).catch(() => {});
+        await recountFolderRows(account.id, folder).catch(() => {});
         return;
       }
 
@@ -5566,6 +5695,9 @@ export class ImapManager {
       const bodyParts = cfg.fetchBody ? BODY_PREFETCH_PARTS : [];
       let consecutiveErrors = 0;
       let reconnectFailures = 0;
+      // Single UIDs given up on in a row (see the batch error handling below).
+      let skippedInRow = 0;
+      const fullBatchSize = cfg.batchSize;
       let i = 0;
       // Count rows this backfill actually wrote (UID upserts) so GTD section data can be
       // refreshed once at completion when the account is gtd_enabled — the tick's fingerprint
@@ -5793,6 +5925,10 @@ export class ImapManager {
           i += batch.length;
           batchesOnConn++;
           consecutiveErrors = 0;
+          skippedInRow = 0;
+          // Back toward full size after a streak of failures shrank it: a passing problem
+          // (throttling, a dropped connection) must not leave the rest of the run crawling.
+          if (cfg.batchSize < fullBatchSize) cfg.batchSize = Math.min(fullBatchSize, cfg.batchSize * 2);
 
           // Log progress every 10 batches to avoid log spam
           if (batchesOnConn % 10 === 1 || i >= missingUids.length) {
@@ -5812,11 +5948,34 @@ export class ImapManager {
           if (bfClient) { try { bfClient.close(); } catch { /* already disconnected */ } bfClient = null; }
           batchesOnConn = cfg.batchesPerConn; // force reconnect
 
-          if (consecutiveErrors >= 3) {
-            // Persistent failures — halve the batch size to reduce load on the server
-            // rather than skipping messages entirely (which would leave permanent gaps).
+          if (consecutiveErrors >= 3 && cfg.batchSize === 1 && isServerLimitFailure(detail)) {
+            // Down to one message and still failing, but because the server is limiting us
+            // (throttled, a quota, a refused login): not a reason to write it off. The run ends
+            // and the folder check finds the gap again later.
+            throw new Error(`backfill stopped: ${detail}`, { cause: err });
+          } else if (consecutiveErrors >= 3 && cfg.batchSize === 1) {
+            // One message the server will not hand over: a FETCH that names it fails as a whole
+            // (Gmail's "Some messages could not be FETCHed", Dovecot's SERVERBUG on a corrupt
+            // one). Retrying the batch would loop forever, a login every half minute, holding
+            // this folder and a background slot for the host. It counts toward the write-off
+            // like a UID the server silently left out, and the run moves past it at full size.
+            // Three in a row is the server refusing everything: the run ends, and the folder
+            // check finds the gap again later.
+            const [uid] = batch;
+            try { await recordUnfetchable(account.id, folder, [Number(uid)], bfUidValidity); }
+            catch (uErr) { console.warn(`Unfetchable bookkeeping failed for ${logAccount(account)}:`, uErr.message); }
+            console.warn(`Backfill skipping UID ${uid} in ${logAccount(account)}/${folder}: the server refused it 3 times (${detail})`);
+            if (++skippedInRow >= 3) throw new Error(`the server refused ${skippedInRow} messages in a row (${detail})`, { cause: err });
+            i += 1;
+            cfg.batchSize = fullBatchSize;
+            consecutiveErrors = 0;
+            await new Promise(r => setTimeout(r, cfg.batchDelay));
+          } else if (consecutiveErrors >= 3) {
+            // Persistent failures: halve the batch, down to the one message a failing FETCH
+            // may be about, rather than skipping a whole batch (which would leave gaps). A
+            // success grows it back (above).
             const oldSize = cfg.batchSize;
-            cfg.batchSize = Math.max(10, Math.floor(cfg.batchSize / 2));
+            cfg.batchSize = Math.max(1, Math.floor(cfg.batchSize / 2));
             console.warn(`Backfill reducing batch size for ${logAccount(account)}: ${oldSize} → ${cfg.batchSize} after 3 failures (${detail})`);
             consecutiveErrors = 0;
             await new Promise(r => setTimeout(r, cfg.batchDelay));
@@ -5832,13 +5991,7 @@ export class ImapManager {
       console.log(`Backfill complete for ${logAccount(account)}/${folder}`);
       // Backfill inserts rows directly without going through adjustFolderCounts,
       // so folder counters would stay at 0 without this reconciliation step.
-      await query(
-        `UPDATE folders
-         SET total_count  = (SELECT COUNT(*)                                FROM messages m WHERE m.account_id = $1 AND m.folder = $2),
-             unread_count = (SELECT COUNT(*) FILTER (WHERE is_read = false)  FROM messages m WHERE m.account_id = $1 AND m.folder = $2)
-         WHERE account_id = $1 AND path = $2`,
-        [account.id, folder]
-      ).catch(err => console.error(`Folder count update after backfill failed for ${logAccount(account)}/${folder}:`, err.message));
+      await recountFolderRows(account.id, folder).catch(err => console.error(`Folder count update after backfill failed for ${logAccount(account)}/${folder}:`, err.message));
       this.broadcast({ type: 'backfill_complete', accountId: account.id }, account.user_id);
       // Backfill wrote rows the GTD tick's fingerprint can't detect (before==after); if this
       // folder is a designated GTD folder and any row changed, nudge GTD section clients. One emit per
@@ -6001,9 +6154,12 @@ export class ImapManager {
       // INBOX first — highest priority, existing behaviour
       await this.backfillMessages(account, 'INBOX');
 
-      // Then all other known folders (discovered at connect time by syncFolders)
+      // Then all other known folders (discovered at connect time by syncFolders). Not one the
+      // server lists as \Noselect (a parent that exists only to hold folders, as a nested label's
+      // does on GreenMail): selecting it fails, which cost a login and a 'Backfill failed' line on
+      // every pass.
       const folderResult = await query(
-        "SELECT path FROM folders WHERE account_id = $1 AND path != 'INBOX' ORDER BY path",
+        "SELECT path FROM folders WHERE account_id = $1 AND path != 'INBOX' AND NOT no_select ORDER BY path",
         [account.id]
       );
 
@@ -6148,10 +6304,7 @@ export class ImapManager {
           try {
             const lock = await siClient.getMailboxLock(folder);
             try {
-              for await (const msg of siClient.fetch(uids.join(','), {
-                uid: true, envelope: true, bodyStructure: true,
-                bodyParts: BODY_PREFETCH_PARTS,
-              }, { uid: true })) {
+              const refused = await fetchSnippetBatch(siClient, uids, async (msg) => {
                 try {
                   const parsed = await parseMessage(msg);
                   if (parsed.snippet) {
@@ -6163,6 +6316,10 @@ export class ImapManager {
                     );
                   }
                 } catch { /* skip snippet on parse/update failure */ }
+              }, { structureFirst: this.snippetStructureFirst.has(account.id) });
+              if (refused) {
+                this.snippetStructureFirst.add(account.id);
+                console.log(`Snippet indexer: ${logAccount(account)} refuses guessed body parts; reading each message's structure first from now on`);
               }
             } finally {
               lock.release();
@@ -6611,26 +6768,63 @@ export class ImapManager {
   // Syncs the most recent messages in a specific folder on demand.
   // Called when the user navigates to a folder that has no local messages yet.
   // Uses a pooled connection — does NOT touch the main sync connection.
-  async syncFolderOnDemand(account, folder) {
+  async syncFolderOnDemand(account, folder, { freshAfterActive = false } = {}, waitDeadline = Date.now() + 30000) {
     const key = `${account.id}:${folder}`;
-    if (this.onDemandSyncing.has(key)) {
-      console.log(`syncFolderOnDemand skipped (already running): ${logAccount(account)}/${folder}`);
-      return;
+    const active = this.onDemandSyncing.get(key);
+    if (active) {
+      console.log(`syncFolderOnDemand waiting (already running): ${logAccount(account)}/${folder}`);
+      try {
+        await raceTimeout(active.promise, Math.max(0, waitDeadline - Date.now()), 'Active folder sync');
+      } catch (err) {
+        // A timed-out owner may still be writing. Leave its claim intact rather than start a
+        // competing sync; callers can proceed, but freshness can resume only after this claim releases.
+        console.warn(`Active folder sync wait failed for ${logAccount(account)}/${folder}: ${err.message}`);
+        throw err;
+      }
+      if (!freshAfterActive) return;
+      // A sync that started before a non-UIDPLUS COPY may not have observed the new destination
+      // row. Once that older owner settles, take a new claim and perform one post-copy pass.
+      if (this.onDemandSyncing.get(key) === active) this.onDemandSyncing.delete(key);
+      return this.syncFolderOnDemand(account, folder, {}, waitDeadline);
     }
-    this.onDemandSyncing.add(key);
-    console.log(`syncFolderOnDemand start: ${logAccount(account)}/${folder}`);
+
+    const task = (async () => {
+      console.log(`syncFolderOnDemand start: ${logAccount(account)}/${folder}`);
+      try {
+        await this.syncFolderViaPool(account, folder);
+        console.log(`syncFolderOnDemand done: ${logAccount(account)}/${folder}`);
+        // sync_complete fires mailflow:refresh in the frontend, reloading the message list
+        this.broadcast({ type: 'sync_complete', accountId: account.id }, account.user_id);
+      } catch (err) {
+        console.error(`On-demand sync error ${logAccount(account)}/${folder}:`, err.message);
+        throw err;
+      }
+    })();
+    const entry = { promise: task, release: null };
+    this.onDemandSyncing.set(key, entry);
     try {
-      await withFreshClient(account, async (client) => {
-        await this.syncMessages(account, client, folder, 100, false, true);
-      });
-      console.log(`syncFolderOnDemand done: ${logAccount(account)}/${folder}`);
-      // sync_complete fires mailflow:refresh in the frontend, reloading the message list
-      this.broadcast({ type: 'sync_complete', accountId: account.id }, account.user_id);
-    } catch (err) {
-      console.error(`On-demand sync error ${logAccount(account)}/${folder}:`, err.message);
+      return await task;
     } finally {
-      this.onDemandSyncing.delete(key);
+      if (this.onDemandSyncing.get(key) === entry) this.onDemandSyncing.delete(key);
     }
+  }
+
+  _tryClaimFolderSync(accountId, folder) {
+    const key = `${accountId}:${folder}`;
+    if (this.onDemandSyncing.has(key)) return false;
+    let release;
+    const promise = new Promise(resolve => { release = resolve; });
+    this.onDemandSyncing.set(key, { promise, release });
+    return true;
+  }
+
+  _releaseFolderSync(accountId, folder) {
+    const key = `${accountId}:${folder}`;
+    const entry = this.onDemandSyncing.get(key);
+    // Core-owned work releases its own entry in finally; the facade cannot cancel it.
+    if (!entry?.release) return;
+    entry.release();
+    if (this.onDemandSyncing.get(key) === entry) this.onDemandSyncing.delete(key);
   }
 
   // Periodically pull new mail into the special-use spam/Junk folder. Server-side spam filtering
@@ -6656,9 +6850,7 @@ export class ImapManager {
       spamPath = await resolveSpamFolder(account.id, account.folder_mappings);
     } catch { return; }
     if (!spamPath) return;
-    const key = `${account.id}:${spamPath}`;
-    if (this.onDemandSyncing.has(key)) return;
-    this.onDemandSyncing.add(key);
+    if (!this._tryClaimFolderSync(account.id, spamPath)) return;
     const host = (account.imap_host || '').toLowerCase();
     try {
       await this._bgConnSem.acquire(host);
@@ -6673,7 +6865,7 @@ export class ImapManager {
     } catch (err) {
       console.warn(`Periodic spam sync failed for ${logAccount(account)}/${spamPath}:`, err.message);
     } finally {
-      this.onDemandSyncing.delete(key);
+      this._releaseFolderSync(account.id, spamPath);
     }
   }
 
@@ -7517,8 +7709,9 @@ export class ImapManager {
   // the messages; `apply(client, range)` runs the IMAP command for a UID range and returns
   // imapflow's truthy/false result. Returns the count processed; throws (with progress) if a
   // chunk cannot be confirmed.
-  async _chunkedFolderOp(client, folder, searchQuery, apply, { label = 'operation', chunkSize = 500, retryBackoffMs = 500 } = {}) {
-    const uids = await client.search(searchQuery, { uid: true });
+  async _chunkedFolderOp(client, folder, searchQuery, apply, { label = 'operation', chunkSize = 500, retryBackoffMs = 500, skipUids } = {}) {
+    let uids = await client.search(searchQuery, { uid: true });
+    if (uids && skipUids?.size) uids = uids.filter(uid => !skipUids.has(uid));
     if (!uids || uids.length === 0) return 0;
     let done = 0;
     for (let i = 0; i < uids.length; i += chunkSize) {
@@ -7555,31 +7748,57 @@ export class ImapManager {
 
   // Add \Seen to every unread message in the locked folder, chunked (see _chunkedFolderOp).
   // Searching UNSEEN only touches what needs changing (idempotent, and a no-op on an
-  // already-read folder).
-  async _markSeenInFolder(client, folder, opts = {}) {
+  // already-read folder). `uidCeiling` leaves out mail that arrived after the user asked.
+  async _markSeenInFolder(client, folder, { uidCeiling, ...opts } = {}) {
     return this._chunkedFolderOp(
-      client, folder, { seen: false },
+      client, folder, uidCeiling ? { seen: false, uid: `1:${uidCeiling}` } : { seen: false },
       (c, range) => c.messageFlagsAdd(range, ['\\Seen'], { uid: true }),
       { label: 'messageFlagsAdd', ...opts },
     );
   }
 
-  async markAllReadImap(account, folder) {
-    return withFreshClient(account, async (client) => {
-      const lock = await client.getMailboxLock(folder);
-      try {
-        if (!client.mailbox || client.mailbox.exists === 0) return;
-        // Chunked so a single STORE +FLAGS \Seen over a large folder can't get throttled
-        // into a whole-operation failure (which would leave the DB read but the server
-        // unread, and the next flag-sync would flip those rows back to unread).
-        await this._markSeenInFolder(client, folder);
-      } catch (err) {
-        console.warn(`markAllRead IMAP warning for ${folder}:`, err.message);
-        // Non-fatal — DB is already updated; the next sync reconciles any residual unread.
-      } finally {
-        lock.release();
+  // `uidCeiling` is the highest uid the user's Mark all read covered (the route's DB update):
+  // mail that arrives while this runs, or before a retry, stays unread.
+  async markAllReadImap(account, folder, { uidCeiling } = {}) {
+    // While this runs, the integrity pass leaves the folder's read state alone (see its repair).
+    // That includes the retries: a write given up on leaves the server unread, and the repair
+    // then takes the folder back to unread, which is the server's state.
+    const marking = `${account.id}\n${folder}`;
+    this._markingAllRead.set(marking, (this._markingAllRead.get(marking) || 0) + 1);
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await withFreshClient(account, async (client) => {
+            const lock = await client.getMailboxLock(folder);
+            try {
+              if (!client.mailbox || client.mailbox.exists === 0) return;
+              // The route marked every row read, so a row unread now was marked unread since, or is
+              // new mail: leave it unread on the server too. Read at each attempt, since a retry
+              // comes up to 35 s later.
+              const unread = await query(
+                'SELECT uid FROM messages WHERE account_id = $1 AND folder = $2 AND is_read = false',
+                [account.id, folder]);
+              const skipUids = new Set((unread?.rows || []).map(r => Number(r.uid)));
+              // Chunked so a single STORE +FLAGS \Seen over a large folder can't get throttled
+              // into a whole-operation failure.
+              await this._markSeenInFolder(client, folder, { uidCeiling, skipUids });
+            } finally {
+              lock.release();
+            }
+          });
+        } catch (err) {
+          const wait = this._markAllReadRetryMs[attempt];
+          // A dropped connection or a throttled STORE used to be the end of it: the DB said read,
+          // the server unread, and the next pass put the folder back to unread.
+          if (wait === undefined) throw err;
+          console.warn(`markAllRead IMAP warning for ${folder}, retrying:`, err.message);
+          await new Promise(resolve => setTimeout(resolve, wait));
+        }
       }
-    });
+    } finally {
+      const left = (this._markingAllRead.get(marking) || 1) - 1;
+      if (left > 0) this._markingAllRead.set(marking, left); else this._markingAllRead.delete(marking);
+    }
   }
 
   async moveMessage(account, uid, fromFolder, toFolder) {
@@ -7598,11 +7817,12 @@ export class ImapManager {
   // so one read from a stale row, or looked up in the wrong account, would otherwise expunge
   // whatever sits there. Resolves false, having deleted nothing, when it does not match, and true
   // when nothing holds the uid any more, which is where a delete would have left it.
-  async permanentDeleteMessage(account, uid, folder, { expectMessageId, expectRow } = {}) {
+  async permanentDeleteMessage(account, uid, folder, { expectMessageId, expectRow, expectUidValidity } = {}) {
     const expected = expectRow ?? (expectMessageId === undefined ? undefined : { message_id: expectMessageId });
     return withFreshClient(account, async (client) => {
       const lock = await client.getMailboxLock(folder);
       try {
+        if (expectUidValidity != null && String(client.mailbox?.uidValidity) !== String(expectUidValidity)) return false;
         if (expected) {
           let copy = null;
           // An unsolicited FETCH (a flag change) carries no envelope and must not stand in for the copy.
@@ -7639,12 +7859,14 @@ export class ImapManager {
     if (!account) throw new Error(`copyMessage: account ${accountId} not found`);
 
     let newUid = null;
+    let copyUidValidity = null;
     try {
       await withFreshClient(account, async (client) => {
         const lock = await client.getMailboxLock(fromFolder);
         try {
           const result = await client.messageCopy(String(uid), toFolder, { uid: true });
           if (result === false) throw new Error('messageCopy returned false — server did not confirm copy');
+          copyUidValidity = result?.uidValidity;
           if (result?.uidMap) newUid = result.uidMap.get(Number(uid)) || null;
         } finally {
           lock.release();
@@ -7655,24 +7877,21 @@ export class ImapManager {
       throw err;
     }
 
-    // Hand off to label plugins (GTD broadcasts its section-refresh and, on the deferred path,
-    // reconciles once the sibling lands — see plugins/gtd/hooks.js afterLabelCopy). Fired before
-    // the sibling INSERT to preserve the historical emit-then-insert order; `newUid` tells the
-    // plugin whether the sibling is available now (UIDPLUS) or deferred to a destination sync
-    // (null). The hook swallows per-plugin errors and the plugin's deferred work is fire-and-
-    // forget, so this never blocks or breaks the copy.
-    await pluginRegistry.runHook('afterLabelCopy', { mgr: this.pluginFacade, account, toFolder, fromFolder, srcUid: uid, newUid });
-
-    if (newUid == null) {
-      // Servers without UIDPLUS confirm COPY but cannot name its destination UID.
-      // Pull the target so ordinary folders (which have no label plugin hook)
-      // gain their local sibling row without waiting for the next backfill.
-      this.syncFolderOnDemand(account, toFolder)
-        .catch(err => console.warn(`Post-copy folder sync failed: ${err.message}`));
-      return null;
+    // Other sessions refetch on this hook without the initiating request's later refresh.
+    // Persist a known sibling first so those sessions can already see the copy. Without
+    // COPYUID, core starts one deferred reconciliation for the hook to observe.
+    if (newUid != null) {
+      await insertCopiedSibling(accountId, uid, fromFolder, toFolder, newUid)
+        .then(id => id ?? requireCachedCopy(accountId, toFolder, newUid, copyUidValidity))
+        .catch(error => rollbackCopiedMessageOnInsertFailure(this, account, toFolder, newUid, error, copyUidValidity));
     }
+    // One post-copy pass serves core and any plugin observing the deferred sibling.
+    const destinationSync = newUid == null
+      ? this.syncFolderOnDemand(account, toFolder, { freshAfterActive: true })
+      : null;
+    destinationSync?.catch(err => console.warn(`Post-copy folder sync failed: ${err.message}`));
+    await pluginRegistry.runHook('afterLabelCopy', { mgr: this.pluginFacade, account, toFolder, fromFolder, srcUid: uid, newUid, destinationSync });
 
-    await insertCopiedSibling(accountId, uid, fromFolder, toFolder, newUid);
     return newUid;
   }
 
@@ -7686,31 +7905,73 @@ export class ImapManager {
   // The uid is expunged only while its server copy is still the row's message (isRowsMessage): a
   // row left on a stale uid, by a move without UIDPLUS before #665 or a sync behind the server,
   // would otherwise remove whatever message holds that uid now. A uid with no row has nothing to
-  // check against and is left alone. A refused row is dropped and its folder pulled, as a refused
-  // Delete forever is, since sync never corrects it, and the call throws an error marked
-  // `copyChanged`.
+  // check against and is left alone. When the folder holds the refused row's message once under
+  // another uid, that copy is removed instead (expungeMovedCopy). Otherwise the row is dropped and
+  // its folder pulled, as a refused Delete forever is, since sync never corrects it, and the call
+  // throws an error marked `copyChanged`.
   async removeMessageCopy(accountId, uid, folder) {
     const accountResult = await query('SELECT * FROM email_accounts WHERE id = $1', [accountId]);
     const account = accountResult.rows[0];
     if (!account) throw new Error(`removeMessageCopy: account ${accountId} not found`);
 
     const { rows: [row] } = await query(
-      'SELECT message_id, date, subject, from_email FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3',
+      'SELECT message_id, date, subject, from_email, thread_key FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3',
       [accountId, uid, folder]
     );
     if (!row) return 0;
     if ((await this.permanentDeleteMessage(account, uid, folder, { expectRow: row })) === false) {
-      await deleteMessageCopyRow(accountId, uid, folder);
+      // The folder may still hold the row's message under another uid. Removing that copy is
+      // what was asked; otherwise the sync below files it again and the label comes back.
+      let movedUid = null;
+      try {
+        movedUid = await this.expungeMovedCopy(account, folder, row, uid);
+      } catch (err) {
+        console.warn(`removeMessageCopy: looking up the ${folder} copy by Message-ID failed: ${err.message}`);
+      }
+      await deleteMessageCopyRow(accountId, uid, folder, account);
+      if (movedUid != null) {
+        // A sync may have filed the copy at its real uid meanwhile.
+        await deleteMessageCopyRow(accountId, movedUid, folder, account);
+        await pluginRegistry.runHook('afterLabelRemove', { mgr: this.pluginFacade, account, folder, uid: movedUid, threadKey: row.thread_key });
+        return 1;
+      }
       this.syncFolderOnDemand(account, folder)
         .catch(err => console.warn(`removeMessageCopy: sync of ${folder} failed: ${err.message}`));
       const err = new Error(`removeMessageCopy: uid ${uid} in ${folder} holds another message, so nothing was removed`);
       err.copyChanged = true;
       throw err;
     }
-    const result = await deleteMessageCopyRow(accountId, uid, folder);
+    const result = await deleteMessageCopyRow(accountId, uid, folder, account);
     // Removing a label copy changes label-feed data — let plugins broadcast their refresh.
-    await pluginRegistry.runHook('afterLabelRemove', { mgr: this.pluginFacade, account, folder, uid });
+    await pluginRegistry.runHook('afterLabelRemove', { mgr: this.pluginFacade, account, folder, uid, threadKey: row.thread_key });
     return result;
+  }
+
+  // A row whose uid holds another message (a sync behind the server, or a move without UIDPLUS
+  // before #665) can still have its message in the folder under another uid. With exactly one
+  // such copy, found by Message-ID and checked as permanentDeleteMessage checks one, it is
+  // expunged under the same lock and its uid returned. Anything else deletes nothing and
+  // returns null: no Message-ID, no copy, or two that could each be it.
+  async expungeMovedCopy(account, folder, row, staleUid) {
+    const mid = bareMessageId(row?.message_id);
+    if (!mid) return null;
+    return withFreshClient(account, async (client) => {
+      const lock = await client.getMailboxLock(folder);
+      try {
+        // A header SEARCH matches substrings, so each hit is checked against the row.
+        const found = await client.search({ header: { 'Message-ID': mid } }, { uid: true });
+        if (!Array.isArray(found) || !found.length) return null;
+        const matches = [];
+        for await (const copy of client.fetch(found.join(','), { uid: true, envelope: true, internalDate: true }, { uid: true })) {
+          if (copy.envelope && copy.uid !== Number(staleUid) && isRowsMessage(row, copy)) matches.push(copy.uid);
+        }
+        if (matches.length !== 1) return null;
+        if (!(await expungeUids(client, String(matches[0])))) return null;
+        return matches[0];
+      } finally {
+        lock.release();
+      }
+    });
   }
 
   // Move a batch of UIDs from one folder to another in a single IMAP command.
@@ -7978,7 +8239,10 @@ export class ImapManager {
           usedFreshSyncClient = true;
           await this._syncInboxWithFreshLogin(account);
         } else {
-          await this.syncMessages(account, client, 'INBOX', 20, false, true);
+          // The interval tick's wall-clock bound: imapflow has no per-command timeout and waits
+          // up to 5 minutes on a half-open socket, holding the account's sync lock (no interval
+          // sync either) for all of it. On the timeout the catch below closes the client.
+          await raceTimeout(this.syncMessages(account, client, 'INBOX', 20, false, true), 55000, 'Manual sync');
         }
         console.log(`syncNow complete: ${logAccount(account)}`);
       } catch (err) {
@@ -8094,64 +8358,140 @@ export class ImapManager {
       if (!accountResult.rows.length) return false;
       const account = accountResult.rows[0];
 
+      // The folder it was snoozed from can be gone since (deleted here or in another client, or a
+      // Gmail label removed): the move would fail on every sweep, and Unsnooze with it, leaving
+      // the message in Snoozed for good. It comes back to the Inbox instead.
+      if (row.original_folder !== 'INBOX') {
+        // A \Noselect folder (a deleted parent some servers keep for its children) cannot take it either.
+        const { rows: [folder] } = await query('SELECT 1 FROM folders WHERE account_id = $1 AND path = $2 AND NOT no_select', [row.account_id, row.original_folder]);
+        if (!folder) {
+          console.log(`Snooze wakeup: ${row.original_folder} no longer exists, bringing ${row.message_id_header} back to INBOX`);
+          row = { ...row, original_folder: 'INBOX' };
+        }
+      }
+
       // Guard source UID before the IMAP move so reconcileDeletes cannot delete
       // the DB row if an EXPUNGE arrives from the Snoozed folder while the move
       // is in flight.
       this._guardMoveUid(row.account_id, row.snoozed_folder, row.uid);
       let newUid;
+      const removedRows = [];
+      // Whether the destination's sync filed the message before this wake repointed its row.
+      let filedBySync = false;
       try {
-        // Move back to original folder
-        newUid = await this.moveMessageGetNewUid(
-          account, row.uid, row.snoozed_folder, row.original_folder
-        );
+        // The move announces the message to the destination folder, whose sync can file it under
+        // its new uid before the row below is repointed. Kept for that sync (see movedRowCarry):
+        // it then takes this row's state (spam decision, category, annotations) and does not
+        // treat the message as new mail: no rules, alerts or spam check for a snoozed message.
+        const { rows: [snoozedRow] } = await query(
+          'SELECT * FROM messages WHERE account_id = $1 AND folder = $2 AND uid = $3 AND message_id = $4',
+          [row.account_id, row.snoozed_folder, row.uid, row.message_id_header]);
+        if (snoozedRow) rememberDroppedRows(row.original_folder, [snoozedRow]);
 
-        // Mark as unread so the user notices it (not when the reader asked for it back).
-        if (markUnread && newUid) {
-          await this.setFlag(account, newUid, row.original_folder, '\\Seen', false);
-        } else if (markUnread && row.message_id_header) {
-          // The move named no new uid. Search the destination folder by Message-ID to locate and
-          // unflag \Seen, but only when that finds one message: a Message-ID is not unique.
-          try {
-            await withFreshClient(account, async (client) => {
-              const lock = await client.getMailboxLock(row.original_folder);
-              try {
-                const uids = await client.search({ header: { 'Message-ID': row.message_id_header } }, { uid: true });
-                if (uids.length === 1) {
-                  const r = await client.messageFlagsRemove(String(uids[0]), ['\\Seen'], { uid: true });
-                  if (r === false) console.warn(`Snooze wakeup: messageFlagsRemove returned false for ${row.original_folder}`);
-                } else if (uids.length) {
-                  console.warn(`Snooze wakeup: ${uids.length} messages in ${row.original_folder} carry Message-ID ${row.message_id_header}, leaving them as they are`);
-                } else {
-                  console.warn(`Snooze wakeup: could not find message in ${row.original_folder} to mark unread (Message-ID: ${row.message_id_header})`);
-                }
-              } finally {
-                lock.release();
-              }
-            });
-          } catch (err) {
-            console.warn(`Snooze wakeup: could not mark message unread on server (no UIDPLUS): ${err.message}`);
-          }
+        // Move back to original folder
+        try {
+          newUid = await this.moveMessageGetNewUid(
+            account, row.uid, row.snoozed_folder, row.original_folder
+          );
+        } catch (err) {
+          // Not moved: nothing for the sync to file, and a later copy must not pick this up.
+          if (snoozedRow) takeCarry(row.account_id, row.original_folder, row.message_id_header, snoozedRow.date);
+          throw err;
         }
 
-        // Update DB: change folder (and mark unread, on its own wake-up), and update UID if the move returned one.
         if (newUid != null) {
-          await query(
-            `UPDATE messages SET folder = $1, uid = $4${markUnread ? ', is_read = false, read_changed_at = NOW()' : ''} WHERE account_id = $2 AND message_id = $3 AND folder = $5 AND uid = $6`,
-            [row.original_folder, row.account_id, row.message_id_header, newUid, row.snoozed_folder, row.uid]
-          );
+          try {
+            // Repoint the row, unless the sync already filed the message under newUid: then that
+            // row is the message (it took this one's state) and this one goes. Unread on its own
+            // wake-up either way, in the database first, so the server's \Seen read by a sync in
+            // between cannot leave it read.
+            const unread = markUnread ? ', is_read = false, read_changed_at = NOW()' : '';
+            let repointed = 0;
+            try {
+              ({ rowCount: repointed } = await query(
+                `UPDATE messages SET folder = $1, uid = $4${unread} WHERE account_id = $2 AND message_id = $3 AND folder = $5 AND uid = $6
+                   AND NOT EXISTS (SELECT 1 FROM messages d WHERE d.account_id = $2 AND d.folder = $1 AND d.uid = $4)`,
+                [row.original_folder, row.account_id, row.message_id_header, newUid, row.snoozed_folder, row.uid]
+              ));
+            } catch (err) {
+              if (err?.code !== '23505') throw err; // the sync's insert landed in between
+            }
+            // Whose row the message now is. Not inferred from a repoint that changed nothing: that
+            // can also be the Snoozed row having gone (moved by another path) under this wake.
+            const { rows: [destRow] } = await query(
+              'SELECT id FROM messages WHERE account_id = $1 AND folder = $2 AND uid = $3',
+              [row.account_id, row.original_folder, newUid]);
+            if (!repointed && destRow) {
+              filedBySync = true;
+              const deletedRows = await query('DELETE FROM messages WHERE account_id = $1 AND message_id = $2 AND folder = $3 AND uid = $4 RETURNING thread_key',
+                [row.account_id, row.message_id_header, row.snoozed_folder, row.uid]);
+              removedRows.push(...deletedRows.rows);
+              if (markUnread) {
+                await query(`UPDATE messages SET is_read = false, read_changed_at = NOW() WHERE account_id = $1 AND folder = $2 AND uid = $3`,
+                  [row.account_id, row.original_folder, newUid]);
+              }
+            }
+            // Mark as unread on the server so the user notices it (not when the reader asked for it
+            // back). The message is already back, so a refused flag is not a failed wake: it goes to
+            // the flag push queue, which retries it and keeps the local state from being read back
+            // over it meanwhile.
+            if (markUnread) {
+              try {
+                await this.setFlag(account, newUid, row.original_folder, '\\Seen', false);
+              } catch (err) {
+                console.warn(`Snooze wakeup: could not mark message unread on server, queued for retry: ${err.message}`);
+                if (destRow) this._enqueueFlagPush(row.account_id, destRow.id, '\\Seen', false);
+              }
+            }
+          } finally {
+            // The move named its uid. Unless the destination's sync filed the message, which takes
+            // what was kept (it may not have yet: it inserts, then takes), nothing needs it any more,
+            // and a later copy of the message must not pick it up.
+            if (snoozedRow && !filedBySync) takeCarry(row.account_id, row.original_folder, row.message_id_header, snoozedRow.date);
+          }
         } else {
+          if (markUnread && row.message_id_header) {
+            // The move named no new uid. Search the destination folder by Message-ID to locate and
+            // unflag \Seen, but only when that finds one message: a Message-ID is not unique.
+            try {
+              await withFreshClient(account, async (client) => {
+                const lock = await client.getMailboxLock(row.original_folder);
+                try {
+                  const uids = await client.search({ header: { 'Message-ID': row.message_id_header } }, { uid: true });
+                  if (uids.length === 1) {
+                    const r = await client.messageFlagsRemove(String(uids[0]), ['\\Seen'], { uid: true });
+                    if (r === false) console.warn(`Snooze wakeup: messageFlagsRemove returned false for ${row.original_folder}`);
+                  } else if (uids.length) {
+                    console.warn(`Snooze wakeup: ${uids.length} messages in ${row.original_folder} carry Message-ID ${row.message_id_header}, leaving them as they are`);
+                  } else {
+                    console.warn(`Snooze wakeup: could not find message in ${row.original_folder} to mark unread (Message-ID: ${row.message_id_header})`);
+                  }
+                } finally {
+                  lock.release();
+                }
+              });
+            } catch (err) {
+              console.warn(`Snooze wakeup: could not mark message unread on server (no UIDPLUS): ${err.message}`);
+            }
+          }
           // The new uid is not known, and the source uid can belong to another message in the
           // original folder (#665). Drop the row rather than keep it on that uid, and let a sync
           // of the folder file the message under its real one. Only this row: another message in
           // Snoozed may carry the same Message-ID, and a sync would not add its row back.
-          await query(
-            'DELETE FROM messages WHERE account_id = $1 AND message_id = $2 AND folder = $3 AND uid = $4',
+          // Its state was kept for that sync before the move.
+          const deletedRows = await query(
+            'DELETE FROM messages WHERE account_id = $1 AND message_id = $2 AND folder = $3 AND uid = $4 RETURNING thread_key',
             [row.account_id, row.message_id_header, row.snoozed_folder, row.uid]
           );
+          removedRows.push(...deletedRows.rows);
           this.syncFolderOnDemand(account, row.original_folder)
             .catch(err => console.warn(`Snooze wakeup: sync of ${row.original_folder} failed: ${err.message}`));
         }
       } finally {
+        if (removedRows.length) {
+          await adjustFolderCounts(row.account_id, row.snoozed_folder, -1, row.is_read ? 0 : -1);
+          notifyMessageRowsDeleted(account, removedRows, row.snoozed_folder);
+        }
         this._unguardMoveUid(row.account_id, row.snoozed_folder, row.uid);
       }
 
@@ -8160,8 +8500,9 @@ export class ImapManager {
 
       // Update folder counts: message leaves Snoozed and re-enters original_folder (unread on its own wake-up).
       // row.is_read reflects the read state in the Snoozed folder before the move.
-      adjustFolderCounts(row.account_id, row.snoozed_folder, -1, row.is_read ? 0 : -1);
-      if (newUid != null) adjustFolderCounts(row.account_id, row.original_folder, 1, markUnread || !row.is_read ? 1 : 0);
+      if (!removedRows.length) await adjustFolderCounts(row.account_id, row.snoozed_folder, -1, row.is_read ? 0 : -1);
+      // A message the sync filed was counted by that sync.
+      if (newUid != null && !filedBySync) adjustFolderCounts(row.account_id, row.original_folder, 1, markUnread || !row.is_read ? 1 : 0);
 
       // Notify the user's open clients so the message reappears
       this.broadcast({ type: 'snooze_wakeup', accountId: row.account_id }, row.user_id);
@@ -8220,7 +8561,7 @@ export class ImapManager {
   // A socket is authenticated once, at upgrade, so ending its session does not stop the
   // broadcasts above reaching it. The userId guard matters: a socket still authenticating
   // has no userId either, and would match a missing one. The close waits a turn: an upgrade
-  // whose session lookup was answered in the same read from Redis as the write that ended
+  // whose session lookup was answered in the same read from the store as the write that ended
   // the session authenticates a microtask after that write's callback, and would be missed.
   closeSockets(userId, { sessionId = null, exceptSessionId = null, reason = 'Unauthorized' } = {}) {
     if (!userId) return;
@@ -8357,21 +8698,8 @@ export class ImapManager {
       console.log(`Reconcile: removing ${orphanUids.length} server-deleted message(s) from ${logAccount(account)}/${folder}`);
       // Re-assert the cutoff in the DELETE: a row updated to a fresh synced_at between
       // the SELECT above and here (e.g. a concurrent bulk-move reinsert) is spared.
-      await query(
-        'DELETE FROM messages WHERE account_id = $1 AND folder = $2 AND uid = ANY($3::bigint[]) AND (synced_at IS NULL OR synced_at < $4)',
-        [account.id, folder, orphanUids, reconcileStartedAt]
-      );
-      // Resync cached folder counts from actual row data — reconcile deletes rows
-      // without going through adjustFolderCounts, so counts would otherwise drift.
-      await query(
-        `UPDATE folders f
-         SET total_count  = (SELECT COUNT(*)              FROM messages m WHERE m.account_id = $1 AND m.folder = $2),
-             unread_count = (SELECT COUNT(*) FILTER (WHERE m.is_read = false)
-                                             FROM messages m WHERE m.account_id = $1 AND m.folder = $2)
-         WHERE f.account_id = $1 AND f.path = $2`,
-        [account.id, folder]
-      );
-      deletedCount += orphanUids.length;
+      const deletedHere = await deleteReconciledMessageRows(account, folder, orphanUids, reconcileStartedAt);
+      deletedCount += deletedHere;
     }
 
     if (deletedCount > 0) {

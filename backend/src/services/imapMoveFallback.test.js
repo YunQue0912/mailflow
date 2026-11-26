@@ -32,6 +32,7 @@ vi.mock('./mailAccess.js', () => ({ getAccountAddresses: vi.fn(async () => []) }
 
 import { ImapManager, evictPool } from './imapManager.js';
 import { ImapFlow } from 'imapflow';
+import { pluginRegistry } from '../plugins/registry.js';
 import { query } from './db.js';
 import { resolveForConnection } from './hostValidation.js';
 import { getConnectionPolicy } from './connectionPolicy.js';
@@ -139,6 +140,8 @@ function connectionTo(server) {
       // undefined when no mailbox is selected, false when the SEARCH fails.
       if ('searchResult' in f) return f.searchResult;
       if (q.deleted) return f.uids.filter(u => f.deleted.has(u));
+      // A header SEARCH matches substrings, as servers do.
+      if (q.header?.['Message-ID']) return f.uids.filter(u => contentOf(server, this.mailbox.path, u).messageId.includes(q.header['Message-ID']));
       return uidSet(q.uid, f.uids);
     },
     // imapflow's store.js: a NO resolves false rather than throwing.
@@ -517,7 +520,7 @@ describe('removeMessageCopy', () => {
     for (const k of Object.keys(rowAt)) delete rowAt[k];
     query.mockImplementation(async (sql, params) => {
       if (sql.startsWith('SELECT * FROM email_accounts')) return { rows: [acct] };
-      if (sql.startsWith('SELECT message_id, date, subject, from_email FROM messages')) {
+      if (sql.startsWith('SELECT message_id, date, subject, from_email, thread_key FROM messages')) {
         const row = rowAt[`${params[2]}:${params[1]}`];
         return { rows: row ? [row] : [] };
       }
@@ -525,16 +528,19 @@ describe('removeMessageCopy', () => {
         const key = `${params[2]}:${params[1]}`;
         const had = rowAt[key];
         delete rowAt[key];
-        return { rows: had ? [{ is_read: true }] : [] };
+        return { rows: had && /RETURNING[\s\S]*thread_key/.test(sql) ? [{ ...had, is_read: true }] : [] };
       }
       return { rows: [] };
     });
   });
 
   it("expunges a copy that is still its row's message", async () => {
-    rowAt['Trash:7'] = { message_id: '<trash-7@example.com>' };
+    rowAt['Trash:7'] = { message_id: '<trash-7@example.com>', thread_key: 'removed-thread' };
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
     await expect(mgr.removeMessageCopy(acct.id, 7, 'Trash')).resolves.toBe(1);
     expect(server.folders.Trash.uids).toEqual([8]);
+    expect(hook).toHaveBeenCalledWith('messageRowsDeleted', { account: acct, folder: 'Trash', threadKeys: ['removed-thread'] });
+    expect(hook).toHaveBeenCalledWith('afterLabelRemove', expect.objectContaining({ threadKey: 'removed-thread' }));
   });
 
   it('leaves the message at a stale uid alone, drops the row and pulls the folder', async () => {
@@ -543,6 +549,25 @@ describe('removeMessageCopy', () => {
     expect(server.folders.Trash.uids).toEqual([7, 8]);
     expect(server.commands.filter(([c]) => c === 'EXPUNGE')).toEqual([]);
     expect(rowAt['Trash:7']).toBeUndefined();
+    expect(mgr.syncFolderOnDemand).toHaveBeenCalledWith(acct, 'Trash');
+  });
+
+  // The row's message is still in the folder under another uid: that copy is the one removed, and
+  // nothing is left for a sync to file again (the GTD Done flicker).
+  it('removes the copy where the folder holds it now, past a lookalike Message-ID', async () => {
+    deliver(server, 'Trash', { messageId: '<x-trash-8@example.com>', subject: 'Lookalike' });
+    rowAt['Trash:7'] = { message_id: '<trash-8@example.com>' };
+    await expect(mgr.removeMessageCopy(acct.id, 7, 'Trash')).resolves.toBe(1);
+    expect(server.folders.Trash.uids).toEqual([7, 9]);
+    expect(rowAt['Trash:7']).toBeUndefined();
+    expect(mgr.syncFolderOnDemand).not.toHaveBeenCalled();
+  });
+
+  it('removes nothing when two copies could each be the message', async () => {
+    deliver(server, 'Trash', { ...contentOf(server, 'Trash', 8) });
+    rowAt['Trash:7'] = { message_id: '<trash-8@example.com>' };
+    await expect(mgr.removeMessageCopy(acct.id, 7, 'Trash')).rejects.toMatchObject({ copyChanged: true });
+    expect(server.folders.Trash.uids).toEqual([7, 8, 9]);
     expect(mgr.syncFolderOnDemand).toHaveBeenCalledWith(acct, 'Trash');
   });
 

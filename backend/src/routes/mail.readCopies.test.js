@@ -71,8 +71,8 @@ async function database(sql, params = []) {
     if (target) Object.assign(target, { folder: params[0], uid: params[1] });
     return { rows: [], rowCount: target ? 1 : 0 };
   }
-  if (sql.startsWith('SELECT message_id, date, subject, from_email FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3')) {
-    return { rows: rows.filter(r => r.account_id === params[0] && Number(r.uid) === Number(params[1]) && r.folder === params[2]).map(r => ({ message_id: r.message_id, date: r.date, subject: r.subject, from_email: r.from_email })) };
+  if (sql.startsWith('SELECT message_id, date, subject, from_email, thread_key FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3')) {
+    return { rows: rows.filter(r => r.account_id === params[0] && Number(r.uid) === Number(params[1]) && r.folder === params[2]).map(r => ({ message_id: r.message_id, date: r.date, subject: r.subject, from_email: r.from_email, thread_key: r.thread_key })) };
   }
   if (sql.startsWith('SELECT id, uid, is_read FROM messages')) return { rows: rows.filter(r => r.folder === params[1] && r.message_id === params[2] && !r.is_deleted).map(r => ({ ...r })) };
   if (sql.includes('FROM email_accounts')) return { rows: [otherAccounts.find(a => a.id === params[0]) || account] };
@@ -87,6 +87,12 @@ async function database(sql, params = []) {
       selectionChange?.(); selectionChange = null;
     }
     return { rows: rows.filter(r => r.account_id === params[0] && r.message_id === params[1] && !r.is_deleted).slice(0, 65).map(r => ({ ...r, body_hash: r.body_text == null && r.body_html == null ? null : createHash('md5').update(JSON.stringify([r.body_text ?? null, r.body_html ?? null])).digest('hex') })) };
+  }
+  if (sql.includes('AS was_read')) {
+    const targets = rows.filter(r => r.account_id === params[0] && r.folder === params[1]);
+    const out = targets.map(r => ({ id: r.id, uid: r.uid, message_id: r.message_id, was_read: r.is_read }));
+    for (const r of targets) r.is_read = true;
+    return { rows: out };
   }
   if (sql.includes('UPDATE messages') && sql.includes('is_read = $1')) {
     const targets = sql.includes('FROM (')
@@ -172,6 +178,26 @@ describe('read-copy production routes and IMAP', () => {
     releaseOldSelection(); await settle();
     expect(wire.filter(([folder]) => folder === 'Watch')).toEqual([['Watch', '42', false]]);
     expect(rows.every(r => r.is_read === false)).toBe(true);
+  });
+  it('mark all read reads the label copy too, on the server as well', async () => {
+    imapManager._markAllReadRetryMs = [];
+    // The route takes only a UUID for the account.
+    account.id = 'd0000000-0000-4000-8000-00000000000' + (serial % 10);
+    for (const r of rows) r.account_id = account.id;
+    imapManager.connections.set(account.id, Object.assign(new Mailbox(), { mailbox: { path: 'INBOX', exists: 3 } }));
+    const ok = await fetch(url.replace(/\/messages$/, '/mark-all-read'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId: account.id, folder: 'INBOX' }) });
+    expect(ok.status).toBe(200); await settle();
+    expect(rows.find(r => r.id === B).is_read).toBe(true);
+    expect(wire).toEqual(expect.arrayContaining([['Watch', '42', true]]));
+  });
+  it('mark all read leaves the label copies alone without a plugin that keeps them', async () => {
+    gtd = false; imapManager._markAllReadRetryMs = [];
+    account.id = 'e0000000-0000-4000-8000-00000000000' + (serial % 10);
+    for (const r of rows) r.account_id = account.id;
+    const ok = await fetch(url.replace(/\/messages$/, '/mark-all-read'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId: account.id, folder: 'INBOX' }) });
+    expect(ok.status).toBe(200); await settle();
+    expect(rows.find(r => r.id === B).is_read).toBe(false);
+    expect(wire.filter(([folder]) => folder === 'Watch')).toEqual([]);
   });
   it('pushes bulk siblings once when both copies are selected', async () => {
     expect((await bulk([A, B], true)).status).toBe(200); await settle();

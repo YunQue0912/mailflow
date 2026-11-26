@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { useStore } from '../store/index.js';
 import { resolveConversationMode } from '../utils/conversationMode.js';
 import { resolveConversationSelection, shouldUseConversationPane } from '../utils/conversation.js';
@@ -26,17 +27,37 @@ export default function ReadingPane() {
 
   const replyDraft = useStore(state => state.replyDrafts[selectedMessageId]);
 
+  // The last selection and its list provenance, for a conversation whose row changed under it.
+  const shownRef = useRef(null);
+
   const mode = resolveConversationMode({ conversationMode });
-  if (!selectedMessageId) return <MessagePane />;
+  if (!selectedMessageId) {
+    shownRef.current = null;
+    return <MessagePane />;
+  }
 
   // threadMessages is consulted too, because a message opened from a deep link or a
   // notification tap is parked there and never enters the list: looking only at the list
   // meant those always fell back to the single-message pane.
-  const { selectedMessage: selected, listed, parked, refreshKey } = resolveConversationSelection({
+  const pool = [...(messages || []), ...(searchResults || [])];
+  let { selectedMessage: selected, listed, parked } = resolveConversationSelection({
     selectedMessageId,
-    pool: [...(messages || []), ...(searchResults || [])],
+    pool,
     threadMessages: threadMessages || {},
   });
+  // A conversation row stands for its newest message, so a reply that arrives gives the row a new
+  // id and the one the reader opened leaves the list: the conversation they were reading closed
+  // under them. The cached message still represents a list selection while its conversation
+  // has a row in the same account. A parked deep link keeps its own selection semantics.
+  const shown = shownRef.current;
+  if (!listed && !parked && shown?.listed && shown.message.id === selectedMessageId && shown.message.thread_id) {
+    const row = pool.find(message => message.thread_id === shown.message.thread_id && message.account_id === shown.message.account_id);
+    if (row) {
+      selected ??= shown.message;
+      listed = true;
+    }
+  }
+  shownRef.current = selected ? { message: selected, listed } : null;
 
   // A message with no thread of its own is just a message, and a search deliberately shows
   // the one matched message rather than its conversation.
@@ -44,7 +65,6 @@ export default function ReadingPane() {
 
     <ConversationPane
       threadId={selected.thread_id}
-      refreshKey={refreshKey}
       folder={selectedFolder}
       unified={!selectedAccountId}
       // The account whose copies the conversation's actions take. In a single-account view a list

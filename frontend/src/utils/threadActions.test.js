@@ -42,6 +42,7 @@ globalThis.fetch = async (url, opts = {}) => {
 
 const { useStore } = await import('../store/index.js');
 const { resolveThreadMessages, archiveThread, deleteThread, spamThread, moveThread, snoozeThread } = await import('./threadActions.js');
+const { flushUndoables } = await import('./undoableAction.js');
 
 // A thread of three: two from the correspondent, one the reader sent.
 const THREAD = [
@@ -62,7 +63,8 @@ const addNotification = n => notifications.push(n);
 
 const ids = () => useStore.getState().messages.map(m => m.id).sort();
 const tick = (ms = 0) => new Promise(r => setTimeout(r, ms));
-const UNDO_WINDOW = 4500;
+// The request goes out when the undo window has passed, a little after the toast closes.
+const UNDO_WINDOW = 4750;
 
 beforeEach(() => {
   requests = [];
@@ -111,6 +113,37 @@ describe('archiveThread', () => {
     assert.deepEqual(ids(), ['a1', 'a2', 'a3'], 'a thread that failed to archive must come back');
     const failure = notifications.find(n => n.type === 'error');
     assert.ok(failure, 'the user is told the archive failed');
+  });
+});
+
+// Closing the tab or locking runs the action at once (flushUndoables). It cannot read the
+// conversation again first: the page is gone, or the screen locked, before that answers, and the
+// archive itself would never be sent. It uses the conversation as read when the action was taken.
+describe('a conversation action flushed before its undo window ends', () => {
+  test('sends the archive at once, with the conversation read when it was taken', async () => {
+    let reads = 0;
+    // A read after the first never answers, as a request would not before the page is gone.
+    const counted = () => { reads += 1; return reads === 1 ? fetchThread() : new Promise(() => {}); };
+    archiveThread(THREAD, { t, addNotification, fetchThread: counted, anchorId: 'a3', folder: 'INBOX', accountId: 'acct' });
+    await tick(10); // the read taken with the action has answered
+    requests = [];
+    flushUndoables();
+    // Only microtasks: what a pagehide handler's page still runs before it goes.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(requests.length, 1, 'the archive went out without waiting on another read');
+    assert.match(requests[0].url, /bulk-archive/);
+    assert.deepEqual(requests[0].body.ids.sort(), ['a1', 'a3', 'a4']);
+    assert.equal(reads, 1, 'and without reading the conversation again');
+    await tick(UNDO_WINDOW + 50);
+    assert.equal(requests.length, 1, 'and not again when its timer would have fired');
+  });
+
+  test('its Undo, still on screen after the page comes back, puts nothing back', async () => {
+    archiveThread(THREAD, { t, addNotification });
+    flushUndoables();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    notifications[0].onUndo();
+    assert.deepEqual(ids(), [], 'the server has it archived, so the list does not show it again');
   });
 });
 
@@ -204,6 +237,71 @@ describe('moveThread', () => {
     assert.deepEqual(ids(), ['a1', 'a2', 'a3']);
     await tick(UNDO_WINDOW + 50);
     assert.equal(requests.filter(r => /bulk-move/.test(r.url)).length, 0);
+  });
+});
+
+// The account badge counts INBOX only (utils/inboxBadge.js): a conversation action moves it by
+// the unread INBOX messages it takes, or brings into INBOX, and puts back exactly that.
+describe('the account badge follows INBOX only', () => {
+  const seedBadge = (n) => {
+    useStore.setState({ isLocked: false, pendingCounts: {} });
+    useStore.getState().setUnreadCounts({ byAccount: { acct: n },
+      snapshots: { acct: { revision: '1', known: true, stale: false, observedAt: new Date().toISOString() } } });
+  };
+  const badge = () => useStore.getState().unreadCounts.byAccount.acct;
+  const FILED = THREAD.map(m => (m.folder === 'INBOX' ? { ...m, folder: 'Projects' } : m));
+
+  test('archiving from INBOX takes its unread INBOX message; undo puts it back', () => {
+    seedBadge(5);
+    archiveThread(THREAD, { t, addNotification, anchorId: 'a3', folder: 'INBOX', accountId: 'acct' });
+    assert.equal(badge(), 4);
+    notifications[0].onUndo();
+    assert.equal(badge(), 5);
+  });
+
+  test('archiving unread mail shown from another folder leaves the badge alone', () => {
+    seedBadge(5);
+    useStore.getState().setMessages(FILED.map(m => ({ ...m })));
+    archiveThread(FILED, { t, addNotification, anchorId: 'a1', folder: 'Projects', accountId: 'acct' });
+    assert.equal(badge(), 5);
+    notifications[0].onUndo();
+    assert.equal(badge(), 5);
+  });
+
+  test('deleting a conversation takes only its INBOX unread', () => {
+    seedBadge(5);
+    const mixed = [...THREAD, { id: 'a5', account_id: 'acct', folder: 'Archive', subject: 'Re: Hello', from_email: 'them@x.z', date: '2026-01-05T00:00:00Z', is_read: false }];
+    useStore.getState().setMessages(mixed.map(m => ({ ...m })));
+    deleteThread(mixed, { t, addNotification, anchorId: 'a3', accountId: 'acct' });
+    assert.equal(badge(), 4, 'a3 (INBOX) counts, a5 (Archive) does not');
+    notifications[0].onUndo();
+    assert.equal(badge(), 5);
+  });
+
+  test('moving unread mail into INBOX raises the badge; undo lowers it again', () => {
+    seedBadge(5);
+    useStore.getState().setMessages(FILED.map(m => ({ ...m })));
+    moveThread(FILED, 'INBOX', { t, addNotification });
+    assert.equal(badge(), 6);
+    notifications[0].onUndo();
+    assert.equal(badge(), 5);
+  });
+
+  test('moving out of INBOX lowers it, and a failed move gives it back', async () => {
+    seedBadge(5);
+    failNext = true;
+    moveThread(THREAD, 'Archive/2026', { t, addNotification });
+    assert.equal(badge(), 4);
+    await tick(UNDO_WINDOW + 50);
+    assert.equal(badge(), 5);
+  });
+
+  test('moving between two other folders leaves it alone', () => {
+    seedBadge(5);
+    useStore.getState().setMessages(FILED.map(m => ({ ...m })));
+    moveThread(FILED, 'Archive/2026', { t, addNotification });
+    assert.equal(badge(), 5);
+    assert.deepEqual(useStore.getState().pendingCounts, {}, 'and opens no window that would hold it');
   });
 });
 

@@ -68,7 +68,7 @@ export const shouldUseConversationPane = ({ mode, searchQuery, message }) =>
   && (message.message_count == null || Number(message.message_count) > 1);
 
 export const conversationRefreshKey = message => message?.thread_id
-  ? `${message.thread_id}:${message.message_count ?? 'unknown'}`
+  ? `${message.thread_id}:${message.id || ''}:${message.message_count ?? 'unknown'}`
   : null;
 
 export function resolveConversationSelection({ selectedMessageId, pool = [], threadMessages = {} }) {

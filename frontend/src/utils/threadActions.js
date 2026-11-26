@@ -4,6 +4,8 @@ import { normalizeConversation, newestConversationMessage } from './conversation
 import { conversationActionIds, conversationSpamTargets, newestSnoozeTarget, keepDraftsApart } from './conversationActions.js';
 import { setPendingDelete, setCompletedDelete, clearDeleteGuard, clearPendingDelete } from './pendingDeletes.js';
 import { archiveTargetsForFolder } from './threadedArchive.js';
+import { holdUndoable, releaseUndoable, UNDO_COMMIT_DELAY_MS } from './undoableAction.js';
+import { inboxMoveDelta, inboxShare } from './inboxBadge.js';
 
 // Which messages a thread-wide action should actually operate on.
 //
@@ -75,32 +77,40 @@ export async function resolveThreadMessages({ message, isThreadRow, cached, fetc
 // only when one did. beforeRemove runs once there is something to take, before anything leaves the
 // list: that is when the pane opens what takes the conversation's place.
 
-const UNDO_WINDOW_MS = 4500;
 
-export function runThreadAction({ messages, commit, resolve, notification, addNotification, beforeRemove, onRemove, onRestore }) {
+// `destination` is the folder a move takes the messages to; without one they leave their folders.
+export function runThreadAction({ messages, destination = null, commit, resolve, notification, addNotification, beforeRemove, onRemove, onRestore }) {
   const targets = normalizeConversation(messages);
   if (!targets.length) return false;
   beforeRemove?.();
 
-  const unread = targets.filter(message => !message.is_read);
+  // What each message does to its account's badge, which counts INBOX only (inboxBadge.js): unread
+  // INBOX mail leaves it, and a move into INBOX brings unread mail into it.
+  const badge = targets.map(message => [message.account_id, destination
+    ? inboxMoveDelta(message, destination)
+    : -inboxShare(message, message.is_read ? 0 : 1)]);
   const store = useStore.getState();
   targets.forEach(message => store.removeMessage(message.id));
-  unread.forEach(message => store.decrementUnread(message.account_id, 1, { undoable: true }));
+  badge.forEach(([accountId, delta]) => store.adjustUnread(accountId, delta, { undoable: true }));
   onRemove?.(targets);
 
   const restore = () => {
     const state = useStore.getState();
     state.restoreMessages(targets);
-    unread.forEach(message => state.incrementUnread(message.account_id));
+    badge.forEach(([accountId, delta]) => state.adjustUnread(accountId, -delta));
     onRestore?.(targets);
   };
 
+  // Read now as well, for a flush (the tab closing, the screen locking), which cannot wait on a
+  // request of its own before the action's.
+  const early = resolve ? Promise.resolve().then(() => resolve(targets)).catch(() => null) : null;
   let undone = false;
-  const timer = setTimeout(async () => {
+  const timer = holdUndoable(async ({ flushing = false } = {}) => {
     if (undone) return;
     try {
       // Resolve last, so a message that arrived during the undo window is included.
-      const live = resolve ? normalizeConversation(await resolve(targets)) : targets;
+      const resolved = resolve ? ((flushing && await early) || await resolve(targets)) : null;
+      const live = resolve ? normalizeConversation(resolved) : targets;
       await commit(live.length ? live : targets);
     } catch (err) {
       console.error('Thread action failed:', err);
@@ -111,14 +121,15 @@ export function runThreadAction({ messages, commit, resolve, notification, addNo
         body: err.message || notification.failBody,
       });
     }
-  }, UNDO_WINDOW_MS);
+  }, UNDO_COMMIT_DELAY_MS);
 
   addNotification({
     title: notification.title,
     body: notification.body,
     onUndo: () => {
+      // Already sent (a flush, as the page went into the back-forward cache): nothing to undo.
+      if (!releaseUndoable(timer)) return;
       undone = true;
-      clearTimeout(timer);
       restore();
     },
   });
@@ -226,6 +237,7 @@ export function deleteThread(messages, { t, addNotification, fetchThread, anchor
 export function moveThread(messages, folder, { t, addNotification, fetchThread, anchorId, accountId, beforeRemove }) {
   return runThreadAction({
     messages: takenCopies(messages, anchorId, accountId),
+    destination: folder,
     addNotification,
     beforeRemove,
     resolve: sparingDrafts(liveThread(fetchThread), anchorId, accountId),

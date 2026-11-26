@@ -5,12 +5,11 @@ import { useMobile } from '../hooks/useMobile.js';
 import { useListFirst } from '../hooks/useListFirst.js';
 import { closeOpenMessage } from '../utils/closeMessage.js';
 import { useStore } from '../store/index.js';
+import { inInbox } from '../utils/inboxBadge.js';
 import {
   normalizeConversation,
   initialExpandedMessageIds,
-  conversationMembershipKey,
   newestConversationMessage,
-  reconcileExpandedMessageIds,
 } from '../utils/conversation.js';
 import { archiveThread, deleteThread, spamThread, moveThread, snoozeThread, inAccount, otherAccountsDraft } from '../utils/threadActions.js';
 import { advanceSelectionAfterRemoval, adjacentRow, openAdjacentRow } from '../utils/listSelection.js';
@@ -25,7 +24,9 @@ import { ActionBtn, ArchiveIcon, MoveIcon, SnoozeIcon, SpamIcon, PrintIcon, Tras
 import { cancelScheduledMarkReadFor } from '../utils/markRead.js';
 import { reserveReadIntent, releaseReadIntent } from '../utils/readOrder.js';
 import { withoutActedSince } from '../hooks/useGtdTriage.js';
-import { clearReadGuard, setPending, settleMarkRead, failMarkRead } from '../utils/pendingReads.js';
+import { applyReadGuard, clearReadGuard, setPending, settleMarkRead, failMarkRead } from '../utils/pendingReads.js';
+import { applyDeleteGuard } from '../utils/pendingDeletes.js';
+import { PluginSlot } from '../plugins/PluginSlot.jsx';
 
 // What the reader is told when an action finds nothing to take (runAction below). In the unified
 // inbox, which has no "this account" to speak of, only Spam and Snooze can: keepDraftsApart and
@@ -57,32 +58,25 @@ const NOTHING_TO_TAKE_DRAFT = {
 // the actions and the card that opens to that account's copies; null keeps every copy.
 //
 // Design from #317 by YunQue0912.
-export default function ConversationPane({ threadId, folder, unified = false, accountId = null, selectedMessageId = null, openedFromRow = false, refreshKey = null }) {
+export default function ConversationPane({ threadId, folder, unified = false, accountId = null, selectedMessageId = null, openedFromRow = false }) {
   const { t } = useTranslation();
   const isMobile = useMobile();
   const listFirst = useListFirst();
   const withShortcut = useShortcutTitle();
   const addNotification = useStore(s => s.addNotification);
   const accounts = useStore(s => s.accounts);
+  const selectedRow = useStore(s => {
+    const pool = s.searchQuery?.trim() ? s.searchResults : s.messages;
+    return pool.find(message => message.id === selectedMessageId)
+      ?? Object.values(s.threadMessages).flat().find(message => message.id === selectedMessageId);
+  });
   const setSelectedMessage = useStore(s => s.setSelectedMessage);
   const updateMessage = useStore(s => s.updateMessage);
   const setThreadMessages = useStore(s => s.setThreadMessages);
   const cachedMessages = useStore(s => s.threadMessages[threadId]);
   const plaintextEmail = useStore(s => s.plaintextEmail);
-  const previousConversation = useRef(null);
   const currentConversation = useRef(null);
   currentConversation.current = { threadId, folder, unified, accountId };
-  // Learning a previously unknown count (a notification becoming a list row) is
-  // not a membership change. A changed known count refreshes the current cards.
-  const membership = useRef({ threadId, key: refreshKey, revision: 0 });
-  if (membership.current.threadId !== threadId) membership.current = { threadId, key: refreshKey, revision: 0 };
-  if (membership.current.key !== refreshKey) {
-    if (membership.current.key && !membership.current.key.endsWith(':unknown') && refreshKey && !refreshKey.endsWith(':unknown')) {
-      membership.current.revision += 1;
-    }
-    membership.current.key = refreshKey;
-  }
-  const membershipRevision = membership.current.revision;
   const [messages, setMessages] = useState([]);
   const [expanded, setExpanded] = useState(() => new Set());
   const [error, setError] = useState(null);
@@ -94,6 +88,9 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
   // { x, y, view, message } — the move and snooze pickers are ContextMenu's, opened straight
   // into the relevant sub-view rather than reimplemented here. message is the copy they open on.
   const [picker, setPicker] = useState(null);
+  const [openedOnNewest, setOpenedOnNewest] = useState(null);
+  // The conversation the cards on screen belong to, set when its fetch lands (the stack's key).
+  const [loadedConversation, setLoadedConversation] = useState(null);
   const [aiStatus, setAiStatus] = useState(null);
 
   useEffect(() => {
@@ -115,11 +112,10 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
       .then(data => {
         if (cancelled) return;
         const ordered = normalizeConversation(data?.messages || []).map(message => ({ ...message, thread_id: message.thread_id || threadId }));
-        const previous = previousConversation.current;
-        const sameConversation = previous?.threadId === threadId && previous?.accountId === accountId;
-        previousConversation.current = { threadId, accountId, messages: ordered };
         setMessages(ordered);
         setThreadMessages(threadId, ordered);
+        setLoadedConversation(`${accountId || ''}\n${threadId}`);
+        setOpenedOnNewest(newestConversationMessage(inAccount(ordered, accountId))?.id ?? null);
         // A picker opened on the previous conversation's cards while this one loaded (below).
         setPicker(null);
         // Opens on the newest message, the way every threaded client does: the reader
@@ -129,19 +125,50 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
         // its own (the effect below): opening the row's copy beside it would mark that read too,
         // behind a list row whose unread count does not follow.
         const picked = ordered.find(message => message.id === pickedRef.current);
-        setExpanded(current => sameConversation
-          ? reconcileExpandedMessageIds({
-            previousMessages: inAccount(previous.messages, accountId),
-            nextMessages: inAccount(ordered, accountId), expandedIds: current,
-          }).expandedIds
-          : accountId && picked && picked.account_id !== accountId
-            ? new Set()
-            : initialExpandedMessageIds(inAccount(ordered, accountId)));
+        setExpanded(accountId && picked && picked.account_id !== accountId
+          ? new Set()
+          : initialExpandedMessageIds(inAccount(ordered, accountId)));
       })
       .catch(err => { if (!cancelled) setError(err.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [threadId, folder, unified, accountId, membershipRevision, setThreadMessages]);
+  }, [threadId, folder, unified, accountId, setThreadMessages]);
+
+  // A reply that lands while the conversation is open shows up in its list row (the count and
+  // date change) but the pane fetched once, so it stayed out until the conversation was opened
+  // again. When the row changes the conversation is read again in place: the cards keep how they
+  // were opened, and the new message comes in collapsed, since opening a card marks it read.
+  const listedVersion = useStore(s => {
+    if (!threadId) return null;
+    const row = (s.searchQuery?.trim() ? s.searchResults : s.messages)
+      .find(m => (m.thread_id || m.id) === threadId && (!accountId || m.account_id === accountId));
+    return row ? `${row.message_count ?? 1}|${row.date}` : null;
+  });
+  const listedVersionRef = useRef({ threadId, version: listedVersion });
+  useEffect(() => {
+    const seen = listedVersionRef.current;
+    if (seen.threadId !== threadId || !listedVersion || !seen.version) {
+      listedVersionRef.current = { threadId, version: listedVersion };
+      return;
+    }
+    // The bulk toggle compares the cache's flags after its request settles. A refresh with
+    // its pending read guards would publish those flags before the badge and category counts.
+    if (readBusy || seen.version === listedVersion) return;
+    let cancelled = false;
+    api.getThread(threadId, folder, unified)
+      .then(data => {
+        if (cancelled || readBusyRef.current) return;
+        const current = useStore.getState().threadMessages[threadId];
+        if (!current?.length) return;
+        const received = (data?.messages || []).map(message => ({ ...message, thread_id: message.thread_id || threadId }));
+        const updated = normalizeConversation(applyReadGuard(applyDeleteGuard(received), current));
+        listedVersionRef.current = { threadId, version: listedVersion };
+        setMessages(updated);
+        setThreadMessages(threadId, updated);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [threadId, folder, unified, accountId, listedVersion, readBusy, setThreadMessages]);
 
   // The pane stays mounted from one conversation to the next, so an open picker would
   // otherwise apply its pick to a conversation it was not opened on. The previous
@@ -158,8 +185,11 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
   // person's last message beside a newer reply of the reader's in Sent, and scrolled to it (#707).
   // The newest card is then the selected one too, so the outline and the shortcuts follow it.
   const selectedHere = Boolean(selectedMessageId) && messages.some(message => message.id === selectedMessageId);
+  // The newest card when the conversation loaded, so a reply read in afterwards (above) does not
+  // become the focused card, which would open it and mark it read without the reader opening it.
   const focusedId = selectedHere && openedFromRow
-    ? newestConversationMessage(inAccount(messages, accountId))?.id ?? selectedMessageId
+    ? (openedOnNewest && messages.some(message => message.id === openedOnNewest) ? openedOnNewest : null)
+      ?? newestConversationMessage(inAccount(messages, accountId))?.id ?? selectedMessageId
     : selectedMessageId;
   useEffect(() => {
     if (!selectedHere || !focusedId) return;
@@ -295,7 +325,7 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
       }
       targets.forEach(item => {
         store.updateMessage(item.id, { is_read: read });
-        if (item.folder === 'INBOX' && (previous.get(item.id) ?? item.is_read) !== read) {
+        if (inInbox(item) && (previous.get(item.id) ?? item.is_read) !== read) {
           if (read) store.decrementUnread(item.account_id); else store.incrementUnread(item.account_id);
           if (sameView()) store.adjustCategoryCount(item.category, read ? -1 : 1);
         }
@@ -358,9 +388,14 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
   // status bar — a standalone PWA draws its content behind it — and the conversation
   // could not be left at all, since a standalone PWA has no swipe-back either. Same bar
   // the message pane shows, safe-area padding included.
-  const mobileBackBar = (isMobile || listFirst) && (
+  // The GTD states of the open message: in the back bar when there is one, else in the toolbar.
+  const headerMessage = selectedRow || messages.find(message => message.id === selectedMessageId)
+    || newestConversationMessage(inAccount(messages, accountId));
+  const headerContext = { message: headerMessage, account: accounts.find(account => account.id === headerMessage?.account_id) };
+  const hasBackBar = isMobile || listFirst;
+  const mobileBackBar = hasBackBar && (
     <div style={{
-      display: 'flex', alignItems: 'center', gap: 8,
+      display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
       paddingTop: 'calc(var(--sat) + 10px)', paddingBottom: 'calc(10px - var(--sat-trim))', paddingLeft: 14, paddingRight: 14,
       borderBottom: '1px solid var(--border-subtle)', background: 'var(--bg-secondary)', flexShrink: 0,
     }}>
@@ -378,12 +413,13 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
         {t('common.back')}
       </button>
       <div style={{
-        flex: 1, minWidth: 0,
+        flex: '1 1 120px', minWidth: 0,
         fontSize: 14, fontWeight: 500, color: 'var(--text-primary)',
         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       }}>
         {newestConversationMessage(messages)?.subject || ''}
       </div>
+      {headerMessage && <PluginSlot name="message-header-meta" ctx={headerContext} />}
     </div>
   );
 
@@ -430,6 +466,7 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
         <ActionBtn onClick={e => openPicker(e, 'snooze')} label={t('contextMenu.snooze.label')} touch={isMobile} popup expanded={picker?.view === 'snooze'}>
           <SnoozeIcon />
         </ActionBtn>
+        {!hasBackBar && headerMessage && <PluginSlot name="message-header-meta" ctx={headerContext} />}
         <div style={{ flex: 1 }} />
         <ActionBtn onClick={() => runAction('spam', spamThread)} label={t('contextMenu.markAsSpam')} touch={isMobile}>
           <SpamIcon />
@@ -469,9 +506,13 @@ export default function ConversationPane({ threadId, folder, unified = false, ac
         onPrefetch={(row) => prefetchBody(row.id)}
       >
       <div
-        // Remounts the stack when the thread's membership changes, so expansion state from a
-        // previous conversation can never be applied to this one's message ids.
-        key={conversationMembershipKey(messages)}
+        // Remounts the stack when another conversation lands, so nothing a card holds carries over
+        // to the next one. Not on a reply read in while it is open (above): a remount ran every open
+        // card's mark-read again, so a message the reader had just marked unread was read again,
+        // and the scroll position and an open dialog were lost. The cards are keyed by message id,
+        // so a new one simply joins the stack. Not on threadId either: the previous conversation's
+        // cards stay on screen until the next one lands, and a remount would mark them read again.
+        key={loadedConversation ?? ''}
         ref={stackRef}
         // flex: 1 and minWidth: 0 are load-bearing. The reading area is a flex row, so
         // without them this pane is sized shrink-to-fit by its contents: collapsed cards

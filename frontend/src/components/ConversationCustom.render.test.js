@@ -349,16 +349,38 @@ test('thread mark-read in an account view leaves another account untouched', asy
   assert.equal(useStore.getState().threadMessages.thread.find(item => item.id === copy.id).is_read, false);
 });
 
-test('a new conversation member refreshes the cards while retaining an opened message', async () => {
-  const props = { threadId: 'thread', folder: 'INBOX', accountId: ACCOUNT.id };
-  await render(ConversationPane, { ...props, refreshKey: 'thread:2' });
+test('a new conversation member refreshes the thread cache and arrives closed', async () => {
+  await render(ConversationPane, { threadId: 'thread', folder: 'INBOX', accountId: ACCOUNT.id });
   await click(container.querySelector('[data-message-id="first"] > button[aria-expanded]'));
   const arrived = message('arrived', { date: '2026-09-18T00:00:00Z' });
   api.getThread = async () => ({ messages: [...initial, arrived] });
-  await render(ConversationPane, { ...props, refreshKey: 'thread:3' });
-  for (const id of ['first', 'arrived']) {
-    assert.equal(container.querySelector(`[data-message-id="${id}"] > button[aria-expanded]`)?.getAttribute('aria-expanded'), 'true');
-  }
+  await React.act(async () => {
+    useStore.setState({ messages: [{ ...arrived, message_count: 3 }] });
+  });
+  const disclosure = id => container.querySelector(`[data-message-id="${id}"] > button[aria-expanded]`)?.getAttribute('aria-expanded');
+  assert.equal(disclosure('first'), 'true');
+  assert.equal(disclosure('arrived'), 'false');
+  assert.equal(useStore.getState().threadMessages.thread.find(item => item.id === arrived.id).is_read, false);
+});
+
+test('a conversation refresh during a whole-thread read preserves the unread count change', async t => {
+  const rows = initial.map(item => ({ ...item, category: 'primary' }));
+  const server = readServer(t, rows);
+  await openReadThread(rows);
+  useStore.setState({ categoryCounts: { primary: 2 } });
+  const response = deferred();
+  server.hold(response);
+  await click(labelled('contextMenu.markRead'));
+  assert.equal(server.requests.length, 1);
+
+  const arrived = message('arrived-during-read', { date: '2026-09-18T00:00:00Z' });
+  api.getThread = async () => ({ messages: [...rows.map(item => ({ ...item, is_read: server.flags.get(item.id) })), arrived] });
+  await React.act(async () => useStore.setState({ messages: [{ ...arrived, message_count: 3 }] }));
+  await React.act(async () => response.resolve());
+  await settle();
+
+  assert.equal(useStore.getState().categoryCounts.primary, 0);
+  assert.equal(useStore.getState().threadMessages.thread.find(item => item.id === arrived.id).is_read, false);
 });
 
 test('Android preview downloads use the native endpoint after the image bytes have loaded', async (t) => {
