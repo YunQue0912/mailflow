@@ -164,7 +164,7 @@ export const useStore = create((set, get) => ({
       // leaves: a cold load has nothing to clear, and clearing there would drop the reading
       // preferences seeded from localStorage until loadPreferences ran.
       ...(state.user && state.user.id !== user?.id ? {
-        messages: [], searchResults: [], searchQuery: '', selectedMessageId: null,
+        messages: [], searchResults: [], searchQuery: '', selectedMessageId: null, selectedMessageSource: null,
         threadMessages: {}, expandedThreadId: null,
         accounts: [], accountsReady: false, folders: {},
         notifications: [], backfillProgress: {},
@@ -173,7 +173,7 @@ export const useStore = create((set, get) => ({
         // revision need not move.
         replyDrafts: {},
         composing: false, composeData: null, prepareComposeSwitch: null, messageWindows: [],
-        enabledPlugins: [], autoLockMinutes: 0, blockRemoteImages: true,
+        enabledPlugins: [], autoLockMinutes: 0, sessionDays: 0, blockRemoteImages: true,
         imageWhitelist: { addresses: [], domains: [] }, shortcuts: {}, aiActions: null,
         hiddenFolders: {}, categorizationEnabled: false, gtdPetSlug: null,
         autoOpenReplyDrafts: false, afterRemove: 'next', darkEmailBodies: true,
@@ -230,6 +230,9 @@ export const useStore = create((set, get) => ({
   isLocked: localStorage.getItem('mailflow_locked') === '1',
   setLocked: (locked) => {
     if (locked) {
+      // The lock screen replaces the mail view, and with it an open composer: this lets the
+      // composer hand what it holds to keepComposeForLock first, so it reopens with it on unlock.
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('mailflow:will-lock'));
       const { selectedMessageId } = get();
       if (selectedMessageId) localStorage.setItem('mailflow_locked_message', selectedMessageId);
       localStorage.setItem('mailflow_locked', '1');
@@ -264,9 +267,30 @@ export const useStore = create((set, get) => ({
   // Lock now: tell the server (it then 423s the API until unlocked), then drop into
   // the lock overlay locally. Lock the UI even if the server call fails (#235).
   lockScreen: () => {
-    // Lock the UI immediately (never block on the network), then enforce server-side.
+    // Lock the UI immediately (never block on the network), then enforce server-side. The lock
+    // request waits for the next task: what locking sends first (actions still in their undo
+    // window, see flushUndoables) must reach the server before it, or it is refused.
     get().setLocked(true);
-    api.lock().catch(() => {});
+    // The next task, not a timer: auto-lock fires in a hidden tab, where timers are throttled
+    // to once a minute and the server would stay unlocked that long.
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => { channel.port1.close(); api.lock().catch(() => {}); };
+    channel.port2.postMessage(null);
+  },
+  // How long a sign-in lasts without use (D#400): 0 follows the server default, which the
+  // server reports as sessionDaysDefault. Saved at once rather than batched with other
+  // preferences, so Settings can say whether it worked.
+  sessionDays: 0,
+  sessionDaysDefault: 7,
+  setSessionDays: async (days) => {
+    const previous = get().sessionDays;
+    set({ sessionDays: days });
+    try {
+      await api.savePreferences({ sessionDays: days });
+    } catch (err) {
+      set({ sessionDays: previous });
+      throw err;
+    }
   },
   autoLockMinutes: 0,
   setAutoLockMinutes: (m) => {
@@ -476,6 +500,9 @@ export const useStore = create((set, get) => ({
   }),
   // { undoable: true } marks a change the server only hears about once its undo window closes.
   adjustUnread: (accountId, delta, { undoable = false } = {}) => {
+    // No change opens no window: an empty one would still hold the badge at its old count, and
+    // keep an arrival off it, for PENDING_COUNT_MS (utils/inboxBadge.js charges 0 often).
+    if (!Number.isFinite(delta) || delta === 0) return;
     set(state => {
       if (state.isLocked) return {};
       const displayed = displayCountSnapshot(state.serverUnreadCounts, state.pendingCounts, state.accounts);
@@ -496,6 +523,11 @@ export const useStore = create((set, get) => ({
   setFolders: (accountId, folders) => set(state => state.isLocked ? {} : ({
     folders: { ...state.folders, [accountId]: mergeFolderSnapshots(state.folders[accountId], folders) }
   })),
+
+  // Where a resync after the app resumes stands (utils/resumeRefresh.js), for the list to say so:
+  // 'idle', 'syncing', 'failed' or 'retrying' (#748).
+  resumeSync: 'idle',
+  setResumeSync: (resumeSync) => set({ resumeSync }),
 
   // UI state
   sidebarCollapsed: localStorage.getItem('mailflow_sidebar_collapsed') === 'true',
@@ -598,9 +630,15 @@ export const useStore = create((set, get) => ({
   composeSession: 0,
   prepareComposeSwitch: null,
   setPrepareComposeSwitch: prepare => set({ prepareComposeSwitch: prepare }),
-  updateComposePersistedKey: (session, persistedKey) => set(state =>
+  // The open composer's current state, kept across the lock screen (see setLocked).
+  keepComposeForLock: (session, data) => set(state =>
+    state.composing && state.composeSession === session ? { composeData: data } : {}),
+  // `draft` ({ draftUid, draftFolder, draftAccountId }): the copy the save wrote. A save that
+  // answers after the composer was put away for the lock screen (keepComposeForLock) points the
+  // composer that reopens at it, rather than at the copy it replaced.
+  updateComposePersistedKey: (session, persistedKey, draft = {}) => set(state =>
     state.composing && state.composeSession === session
-      ? { composeData: { ...state.composeData, persistedKey } } : {}),
+      ? { composeData: { ...state.composeData, persistedKey, ...draft } } : {}),
   openCompose: (data = null, { preparedSession } = {}) => {
     const initial = get();
     if (initial.composing && data?.persistedKey && data.persistedKey === initial.composeData?.persistedKey) return true;
@@ -742,6 +780,18 @@ export const useStore = create((set, get) => ({
     set({ language: lng });
     i18n.changeLanguage(lng);
     schedulePrefSave({ language: lng });
+  },
+
+  // Time format (#758): 'auto' follows the language as before, '12' / '24' force a
+  // 12- or 24-hour clock wherever formatDate.js renders a time. Read by that helper
+  // straight from localStorage, so the list and reading pane pick it up on render.
+  timeFormat: ['auto', '12', '24'].includes(localStorage.getItem('mailflow_time_format'))
+    ? localStorage.getItem('mailflow_time_format') : 'auto',
+  setTimeFormat: (val) => {
+    const v = ['auto', '12', '24'].includes(val) ? val : 'auto';
+    localStorage.setItem('mailflow_time_format', v);
+    set({ timeFormat: v });
+    schedulePrefSave({ timeFormat: v });
   },
 
   // How conversations are shown: 'off', 'list' (threads expand inline in the list) or
@@ -963,6 +1013,7 @@ export const useStore = create((set, get) => ({
   categoryTotals: {},
   setCategoryCounts: (counts, totals) => set(totals ? { categoryCounts: counts, categoryTotals: totals } : { categoryCounts: counts }),
   adjustCategoryCount: (category, delta) => set(state => {
+    if (!Number.isFinite(delta) || delta === 0) return {};
     const key = category || 'primary';
     const current = state.categoryCounts[key] || 0;
     return { categoryCounts: { ...state.categoryCounts, [key]: Math.max(0, current + delta) } };
@@ -1293,11 +1344,13 @@ export const useStore = create((set, get) => ({
 
   // Fetch server preferences and apply them — call after any successful login.
   // Sets localStorage so subsequent page loads apply the right values instantly.
-  loadPreferences: async () => {
+  // prefetched: the launch's answer from bootPrefetch.js, asked alongside the session. Should it
+  // have failed, the preferences are asked for again here, as before.
+  loadPreferences: async (prefetched = null) => {
     const userId = get().user?.id;
     const faviconEpoch = get().senderFaviconsEpoch;
     try {
-      const prefs = await api.getPreferences();
+      const prefs = await (prefetched ? prefetched.catch(() => api.getPreferences()) : api.getPreferences());
       if (get().user?.id !== userId) return;
       // Per-user plugin activation. Absent = nothing activated (new users start with GTD off);
       // existing GTD users were grandfathered into ['gtd'] by migration 0042.
@@ -1371,6 +1424,11 @@ export const useStore = create((set, get) => ({
       // blockRemoteImages: explicit false disables blocking; anything else keeps the default (true)
       if (prefs.blockRemoteImages === false) set({ blockRemoteImages: false });
       else if (prefs.blockRemoteImages === true) set({ blockRemoteImages: true });
+      if (prefs.sessionDays != null) {
+        const n = Number(prefs.sessionDays);
+        set({ sessionDays: [7, 14, 30, 60, 90].includes(n) ? n : 0 });
+      }
+      if (Number(prefs.sessionDaysDefault) > 0) set({ sessionDaysDefault: Number(prefs.sessionDaysDefault) });
       if (prefs.autoLockMinutes != null) {
         const n = Number(prefs.autoLockMinutes);
         set({ autoLockMinutes: [0, 1, 5, 15, 30].includes(n) ? n : 0 });
@@ -1418,6 +1476,10 @@ export const useStore = create((set, get) => ({
         localStorage.setItem('mailflow_language', prefs.language);
         set({ language: prefs.language });
         i18n.changeLanguage(prefs.language);
+      }
+      if (['auto', '12', '24'].includes(prefs.timeFormat)) {
+        localStorage.setItem('mailflow_time_format', prefs.timeFormat);
+        set({ timeFormat: prefs.timeFormat });
       }
       if (isConversationMode(prefs.conversationMode) || typeof prefs.threadedView === 'boolean') {
         const mode = resolveConversationMode(prefs);

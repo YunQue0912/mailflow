@@ -5,6 +5,7 @@ import { useStore } from '../store/index.js';
 import { totalBadge, unreadBadge } from '../utils/unreadBadge.js';
 import { api } from '../utils/api.js';
 import { isNativeAppEnvironment } from '../utils/nativeUpdatePolicy.js';
+import { inboxMoveDelta } from '../utils/inboxBadge.js';
 import { resolveThreadMessages } from '../utils/threadActions.js';
 import { keepDraftsApart } from '../utils/conversationActions.js';
 import { folderDisplayName, folderDisplayNameForPath, folderRole } from '../utils/folderDisplay.js';
@@ -19,6 +20,7 @@ import {
   existingHiddenPaths,
   moveHiddenPaths,
   resolveFolderOrderDrop,
+  splitMessageDrop,
 } from '../utils/sidebar.js';
 import { useMobile } from '../hooks/useMobile.js';
 import LogoMark from './LogoMark.jsx';
@@ -28,6 +30,7 @@ import { SNOOZED_FOLDER } from '../utils/snoozeActions.js';
 import { SCHEDULED_VIEW } from '../utils/scheduledCompose.js';
 import { SendLaterIcon } from './SendLater.jsx';
 import { describeAccountError, needsSignIn } from '../utils/accountErrors.js';
+import { holdUndoable, releaseUndoable, UNDO_COMMIT_DELAY_MS } from '../utils/undoableAction.js';
 
 const ICONS = {
   snoozed: (
@@ -330,7 +333,7 @@ export default function Sidebar() {
     return () => document.removeEventListener('dragend', clear);
   }, [clearFolderDrag]);
 
-  const handleMsgDrop = useCallback(async (e, targetFolder) => {
+  const handleMsgDrop = useCallback(async (e, targetAccountId, targetFolder) => {
     e.preventDefault();
     setMsgDragTarget(null);
     const raw = e.dataTransfer.getData('application/x-mailflow-message');
@@ -339,6 +342,7 @@ export default function Sidebar() {
     try { payload = JSON.parse(raw); } catch { return; }
     const state = useStore.getState();
     const pool = [...state.messages, ...state.searchResults];
+    const notifyOtherAccount = () => state.addNotification({ title: t('messageList.bulkMoved.otherAccount') });
 
     // `msgs` are the rows the list hides and puts back; `movedIds` are what the server is asked
     // to move. They are the same thing for ordinary rows and deliberately differ for a thread:
@@ -349,6 +353,10 @@ export default function Sidebar() {
     if (payload.threadId) {
       const row = pool.find(m => m.id === payload.messageId);
       if (!row) return;
+      if (row.account_id !== targetAccountId) {
+        notifyOtherAccount();
+        return;
+      }
       let threadMsgs;
       try {
         // The server decides what a thread contains, never the expansion-time cache — a thread
@@ -374,18 +382,24 @@ export default function Sidebar() {
       msgs = [row];
     } else {
       const ids = payload.messageIds ?? [payload.messageId];
-      msgs = ids
-        .map(id => pool.find(m => m.id === id))
-        .filter(m => m != null && m.folder !== targetFolder);
+      const drop = splitMessageDrop(
+        ids.map(id => pool.find(m => m.id === id)).filter(m => m != null),
+        targetAccountId,
+        targetFolder,
+      );
+      if (drop.otherAccount > 0) notifyOtherAccount();
+      msgs = drop.moving;
       movedIds = msgs.map(m => m.id);
     }
     if (!msgs.length) return;
+    // Down for unread mail leaving INBOX, up for unread mail dropped into it (inboxBadge.js).
+    const moveDelta = new Map(msgs.map(msg => [msg.id, inboxMoveDelta(msg, targetFolder)]));
     msgs.forEach(msg => {
       state.removeMessage(msg.id);
-      if (!msg.is_read) state.decrementUnread(msg.account_id, 1, { undoable: true });
+      state.adjustUnread(msg.account_id, moveDelta.get(msg.id), { undoable: true });
     });
     let undone = false;
-    const timer = setTimeout(async () => {
+    const timer = holdUndoable(async () => {
       if (undone) return;
       try {
         const result = await api.bulkMove(movedIds, targetFolder);
@@ -399,7 +413,7 @@ export default function Sidebar() {
         const s = useStore.getState();
         if (failedMsgs.length > 0) {
           s.restoreMessages(failedMsgs);
-          failedMsgs.forEach(m => { if (!m.is_read) s.incrementUnread(m.account_id); });
+          failedMsgs.forEach(m => s.adjustUnread(m.account_id, -moveDelta.get(m.id)));
           s.addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failedIds.length }) });
         } else {
           s.recordRecentFolder({ accountId: msgs[0].account_id, path: targetFolder });
@@ -407,19 +421,20 @@ export default function Sidebar() {
       } catch {
         const s = useStore.getState();
         s.restoreMessages(msgs);
-        msgs.forEach(m => { if (!m.is_read) s.incrementUnread(m.account_id); });
+        msgs.forEach(m => s.adjustUnread(m.account_id, -moveDelta.get(m.id)));
         s.addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: movedIds.length }) });
       }
-    }, 4500);
+    }, UNDO_COMMIT_DELAY_MS);
     state.addNotification({
       title: t('messageList.bulkMoved.title', { count: msgs.length }),
       body: targetFolder,
       onUndo: () => {
+        // Already sent (a flush, as the page went into the back-forward cache): nothing to undo.
+        if (!releaseUndoable(timer)) return;
         undone = true;
-        clearTimeout(timer);
         const s = useStore.getState();
         s.restoreMessages(msgs);
-        msgs.forEach(m => { if (!m.is_read) s.incrementUnread(m.account_id); });
+        msgs.forEach(m => s.adjustUnread(m.account_id, -moveDelta.get(m.id)));
       },
     });
   }, [t]);
@@ -1051,7 +1066,7 @@ export default function Sidebar() {
                     }}
                     onDrop={e => {
                       if (e.dataTransfer.types.includes('application/x-mailflow-message')) {
-                        handleMsgDrop(e, path);
+                        handleMsgDrop(e, accountId, path);
                         return;
                       }
                       e.preventDefault();
@@ -1512,7 +1527,7 @@ export default function Sidebar() {
                         }}
                         onDrop={event => {
                           if (handleFolderOrderDrop(event, folder.path)) return;
-                          handleMsgDrop(event, folder.path);
+                          handleMsgDrop(event, account.id, folder.path);
                         }}
                       >
                         {canReorder ? (

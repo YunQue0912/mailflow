@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../utils/api.js';
+import { inboxShare } from '../utils/inboxBadge.js';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { conversationPaneOwnsAutoRead } from '../utils/conversation.js';
@@ -254,10 +255,10 @@ export default function ConversationMessageCard({ message, expanded, onToggle, o
         onAction: () => {
           const { removeMessage, decrementUnread, restoreMessages, incrementUnread } = useStore.getState();
           removeMessage(message.id);
-          if (!message.is_read) decrementUnread(message.account_id);
+          if (!message.is_read) decrementUnread(message.account_id, inboxShare(message));
           api.deleteMessage(message.id).catch(() => {
             restoreMessages([message]);
-            if (!message.is_read) incrementUnread(message.account_id);
+            if (!message.is_read) incrementUnread(message.account_id, inboxShare(message));
           });
         },
       });

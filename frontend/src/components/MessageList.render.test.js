@@ -67,6 +67,8 @@ globalThis.__VITE_ENV__ = { MODE: 'test', DEV: false, PROD: true };
 // needs a real shape; everything else can be an empty object, unless a test serves a path
 // through ROUTES as [status, body].
 let SERVED = [];
+// The list's total as the server reports it: the folder counter, which can run ahead of the rows.
+let SERVED_TOTAL = null;
 let ROUTES = {};
 // Every request, with its JSON body, for tests that assert what reached the server.
 let CALLS = [];
@@ -77,7 +79,7 @@ globalThis.fetch = async (url, opts = {}) => {
   CALLS.push({ path, method: opts.method || 'GET', body: sent });
   // A route may carry response headers as a third element.
   const [status, body, headers = {}] = Object.entries(ROUTES).find(([p]) => path.endsWith(p))?.[1]
-    ?? [200, path.includes('/mail/messages?') ? { messages: SERVED, total: SERVED.length } : {}];
+    ?? [200, path.includes('/mail/messages?') ? { messages: SERVED, total: SERVED_TOTAL ?? SERVED.length } : {}];
   return { ok: status < 400, status, headers: { get: name => headers[name] ?? (/content-type/i.test(name) ? 'application/json' : null) }, json: async () => body, text: async () => JSON.stringify(body) };
 };
 
@@ -942,6 +944,20 @@ describe('MessageList — a refresh during a load runs when the load finishes (#
   });
 });
 
+// A refresh that arrives while a search is shown used to be dropped, and clearing the search did
+// not reload the folder, so it came back as it was before the search.
+describe('MessageList: a refresh during a search runs when the search is cleared', () => {
+  test('the folder shows mail that arrived while searching', async () => {
+    const M2 = { ...MESSAGE, id: 'msg-during-search', uid: 3, message_id: '<during@example.com>', subject: 'Arrived while searching' };
+    await mount({ rows: [MESSAGE], threadedView: false });
+    await React.act(async () => { useStore.setState({ searchQuery: 'invoice' }); await new Promise(r => setTimeout(r, 400)); });
+    SERVED = [M2, MESSAGE];
+    await React.act(async () => { window.dispatchEvent(new dom.window.CustomEvent('mailflow:refresh')); });
+    await React.act(async () => { useStore.setState({ searchQuery: '' }); await new Promise(r => setTimeout(r, 30)); });
+    assert.ok(container.querySelector('[data-msgid="msg-during-search"]'), 'the folder was reloaded');
+  });
+});
+
 // A read still in flight (from opening a message) and a manual read state set over it: its reply
 // or failure must not undo what the user chose, and a refresh in the meantime keeps the row as
 // the user left it.
@@ -1051,7 +1067,9 @@ describe('MessageList: a row\'s body loads while the mouse rests on it', () => {
     await mountRows([MESSAGE, row('msg-hover')]);
     await move('msg-hover');
     await settle(450);
-    assert.deepEqual(CALLS.map(c => `${c.method} ${c.path.replace(/^.*\/api/, '')}`), ['GET /mail/messages/msg-hover/body?prefetch=1']);
+    // The list's batched tag lookup for its rows is not part of the prefetch.
+    const calls = CALLS.filter(c => !c.path.includes('/api/tags/'));
+    assert.deepEqual(calls.map(c => `${c.method} ${c.path.replace(/^.*\/api/, '')}`), ['GET /mail/messages/msg-hover/body?prefetch=1']);
     assert.equal(useStore.getState().selectedMessageId, null, 'nothing opened');
     assert.equal(useStore.getState().messages.find(m => m.id === 'msg-hover').is_read, false);
   });
@@ -1353,5 +1371,352 @@ describe('MessageList — category totals (#597)', () => {
     assert.ok([...container.querySelectorAll('span[title="Cached results matching this filter"]')].length > 0);
     useStore.setState({ categorizationEnabled: false });
     ROUTES = {};
+  });
+});
+
+describe('MessageList: the next page', () => {
+  test('a page still loading when the folder changes is not added to the new folder', async () => {
+    const plain = globalThis.fetch;
+    const ARCHIVED = { ...MESSAGE, id: 'msg-arch', folder: 'Archive', subject: 'Archived subject' };
+    const LATE = { ...MESSAGE, id: 'msg-late', subject: 'Second inbox page' };
+    let releasePage;
+    globalThis.fetch = async (url, opts) => {
+      const path = String(url);
+      if (path.includes('/mail/messages?') && /offset=1(&|$)/.test(path)) {
+        await new Promise(r => { releasePage = r; });
+        return { ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({ messages: [LATE], total: 2 }), text: async () => '' };
+      }
+      if (path.includes('/mail/messages?')) {
+        const archive = path.includes('folder=Archive');
+        const body = archive ? { messages: [ARCHIVED], total: 1 } : { messages: [MESSAGE], total: 2 };
+        return { ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => body, text: async () => '' };
+      }
+      return plain(url, opts);
+    };
+    // One row per page, so the first page is full: a short page is the end of the list (#743).
+    const pageSize = useStore.getState().pageSize;
+    useStore.setState({ pageSize: 1 });
+    try {
+      await mount({ rows: [MESSAGE], threadedView: false });
+      const more = [...container.querySelectorAll('button')].find(b => b.textContent === 'messageList.loadMore');
+      assert.ok(more, 'the inbox offers a next page');
+      await React.act(async () => { more.click(); await new Promise(r => setTimeout(r, 0)); });
+      assert.ok(releasePage, 'the next page was requested');
+      await React.act(async () => {
+        useStore.setState({ selectedFolder: 'Archive' });
+        await new Promise(r => setTimeout(r, 0));
+      });
+      assert.ok(container.querySelector('[data-msgid="msg-arch"]'), 'the archive is listed');
+      await React.act(async () => { releasePage(); await new Promise(r => setTimeout(r, 0)); });
+      assert.equal(container.querySelector('[data-msgid="msg-late"]'), null, 'the inbox page stays out of the archive');
+      assert.deepEqual(useStore.getState().messages.map(m => m.id), ['msg-arch']);
+    } finally {
+      globalThis.fetch = plain;
+      useStore.setState({ pageSize });
+    }
+  });
+});
+
+describe('MessageList: a manual sync', () => {
+  // The sync runs after the request answers, and only the socket says when it is done. Without it
+  // (a phone back from the background, still reconnecting) the list stayed as it was.
+  const syncButton = () => container.querySelector('button[title="messageList.syncAccount"]');
+  const refreshesDuring = async (t, during) => {
+    let refreshes = 0;
+    const count = () => { refreshes += 1; };
+    window.addEventListener('mailflow:refresh', count);
+    try {
+      await mount({ rows: [MESSAGE], threadedView: false });
+      t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+      await React.act(async () => { syncButton().click(); });
+      await React.act(async () => { await Promise.resolve(); });
+      await during(() => refreshes);
+    } finally {
+      window.removeEventListener('mailflow:refresh', count);
+      t.mock.timers.reset();
+    }
+  };
+
+  test('reloads the list when the socket does not say the sync finished', async (t) => {
+    await refreshesDuring(t, async (refreshes) => {
+      assert.ok(syncButton().disabled, 'the sync is running');
+      await React.act(async () => { t.mock.timers.tick(5000); });
+      assert.equal(refreshes(), 1);
+      await React.act(async () => { t.mock.timers.tick(10000); });
+      assert.equal(refreshes(), 2);
+      assert.equal(syncButton().disabled, false, 'and the spinner stops');
+    });
+  });
+
+  test('leaves it to the socket when it answers', async (t) => {
+    await refreshesDuring(t, async (refreshes) => {
+      await React.act(async () => { window.dispatchEvent(new CustomEvent('mailflow:sync_done')); });
+      await React.act(async () => { t.mock.timers.tick(15000); });
+      assert.equal(refreshes(), 0);
+    });
+  });
+});
+
+describe('MessageList — the selection bar\'s More menu marks spam', () => {
+  // On a phone a long press selects instead of opening the context menu, so the selection bar
+  // is where spam has to be reachable. Selection here uses ctrl-click; the bar is the same.
+  const ACCOUNT_B = { ...ACCOUNT, id: 'acct-2', email_address: 'b@example.com', name: 'B' };
+  const M_B = { ...MESSAGE, id: 'msg-b', account_id: 'acct-2', uid: 2, message_id: '<mb@example.com>', subject: 'From B' };
+  const JUNK = { path: 'Junk', name: 'Junk', special_use: '\\Junk' };
+
+  const select = async (ids) => {
+    for (const id of ids) {
+      const row = container.querySelector(`[data-msgid="${id}"]`);
+      await React.act(async () => {
+        (row.querySelector('[draggable]') || row).dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }));
+      });
+    }
+  };
+  const openMore = async () => {
+    const more = container.querySelector('[title="message.more"]');
+    assert.ok(more, 'expected the More button on the selection bar');
+    await React.act(async () => { more.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    await React.act(async () => {});
+    return container.querySelector('[role="menuitem"]');
+  };
+
+  test('loads missing folder lists, then marks mail from two accounts as spam with each badge adjusted', async (t) => {
+    t.after(async () => {
+      // Cancel the move still waiting out its undo window rather than send it.
+      useStore.getState().notifications.find(n => typeof n.onUndo === 'function')?.onUndo();
+      await React.act(async () => { useStore.setState({ notifications: [] }); });
+    });
+    ROUTES = {
+      '/accounts/acct-1/folders': [200, [{ path: 'INBOX', name: 'INBOX' }, JUNK]],
+      '/accounts/acct-2/folders': [200, [{ path: 'INBOX', name: 'INBOX' }, { path: 'Spam', name: 'Spam' }]],
+    };
+    CALLS = [];
+    await mount({ rows: [MESSAGE, M_B], threadedView: false, accountId: null, accounts: [ACCOUNT, ACCOUNT_B] });
+    // Earlier tests can leave a pending count window open on acct-1.
+    useStore.setState({ folders: {}, pendingCounts: {}, serverUnreadCounts: { total: 0, byAccount: {}, snapshots: {} } });
+    await React.act(async () => {
+      const seen = { revision: '7500', known: true, stale: false, observedAt: new Date().toISOString() };
+      useStore.getState().setUnreadCounts({ byAccount: { 'acct-1': 3, 'acct-2': 2 }, snapshots: { 'acct-1': seen, 'acct-2': seen } });
+    });
+    await select(['msg-1', 'msg-b']);
+    const item = await openMore();
+    assert.ok(CALLS.some(c => c.path.endsWith('/accounts/acct-1/folders')), 'loads acct-1 folders');
+    assert.ok(CALLS.some(c => c.path.endsWith('/accounts/acct-2/folders')), 'loads acct-2 folders');
+    assert.equal(item.textContent.trim(), 'contextMenu.markAsSpam');
+    assert.equal(item.disabled, false);
+    await React.act(async () => { item.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    assert.deepEqual(useStore.getState().messages.map(m => m.id), [], 'both rows leave the list');
+    const { byAccount } = useStore.getState().unreadCounts;
+    assert.equal(byAccount['acct-1'], 2);
+    assert.equal(byAccount['acct-2'], 1);
+    assert.equal(container.querySelector('[title="message.more"]'), null, 'the selection is cleared');
+  });
+
+  test('in the spam folder it offers Not spam', async () => {
+    ROUTES = {};
+    const inJunk = { ...MESSAGE, folder: 'Junk' };
+    await mount({ rows: [inJunk], threadedView: false, folder: 'Junk' });
+    useStore.setState({ folders: { 'acct-1': [{ path: 'INBOX', name: 'INBOX' }, JUNK] } });
+    await select(['msg-1']);
+    const item = await openMore();
+    assert.equal(item.textContent.trim(), 'contextMenu.markAsHam');
+    assert.equal(item.disabled, false);
+  });
+
+  test('an account with no spam folder shows the item disabled', async () => {
+    ROUTES = {};
+    await mount({ rows: [MESSAGE], threadedView: false });
+    await select(['msg-1']);
+    const item = await openMore();
+    assert.equal(item.textContent.trim(), 'contextMenu.markAsSpam');
+    assert.equal(item.disabled, true);
+  });
+});
+
+describe('MessageList — a cold launch', () => {
+  test('shows the loading rows, not an empty folder, until the accounts are in', async () => {
+    await mount({ rows: [] });
+    await React.act(async () => root.unmount());
+    root = null;
+    useStore.setState({ accountsReady: false, messages: [], loadingMessages: false });
+    await React.act(async () => {
+      root = createRoot(container);
+      root.render(React.createElement(MessageList));
+    });
+    assert.ok(container.querySelector('.skeleton-line'), 'loading rows while the accounts load');
+    assert.ok(!container.textContent.includes('messageList.emptyInbox'), 'not "no messages"');
+    assert.ok(!container.textContent.includes('messageList.noAccounts'), 'not "no accounts"');
+
+    await React.act(async () => { useStore.setState({ accountsReady: true }); });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 20)); });
+    assert.ok(!container.querySelector('.skeleton-line'), 'the loading rows go once the list is in');
+  });
+});
+
+// The selection bar's select-all box (#741): it says which rows it takes (this page, or the rows
+// loaded so far), shows a mixed state when only some of them are selected, and judges both by
+// the rows on screen, since a page change keeps rows selected on another page.
+describe('MessageList — select-all box scope and mixed state (#741)', () => {
+  const M2 = { ...MESSAGE, id: 'msg-b', uid: 2, message_id: '<m2@example.com>', subject: 'Second' };
+  const M3 = { ...MESSAGE, id: 'msg-c', uid: 3, message_id: '<m3@example.com>', subject: 'Third' };
+  const box = () => container.querySelector('input[type="checkbox"][aria-label]');
+  const ctrlClick = async (msgid) => {
+    const row = container.querySelector(`[data-msgid="${msgid}"]`);
+    const target = row.querySelector('[draggable]') || row;
+    await React.act(async () => {
+      target.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }));
+    });
+  };
+  const clickBox = async () => { await React.act(async () => { box().click(); }); };
+
+  test('some rows selected shows mixed; clicking selects every loaded row, then clears', async () => {
+    await mount({ rows: [MESSAGE, M2, M3], threadedView: false });
+    await ctrlClick('msg-b');
+    assert.ok(box(), 'the selection bar shows its select-all box');
+    assert.equal(box().checked, false);
+    assert.equal(box().indeterminate, true, 'one of three selected is mixed');
+    assert.equal(box().getAttribute('aria-label'), 'messageList.selectLoaded', 'infinite scroll names the loaded rows');
+
+    await clickBox();
+    assert.equal(box().checked, true);
+    assert.equal(box().indeterminate, false);
+    assert.equal(box().getAttribute('aria-label'), 'messageList.deselectAll');
+
+    await clickBox();
+    assert.equal(box(), null, 'clearing the selection closes the bar');
+  });
+
+  test('paginated mode names the page', async (t) => {
+    useStore.setState({ scrollMode: 'paginated' });
+    t.after(() => React.act(async () => { useStore.setState({ scrollMode: 'infinite' }); }));
+    await mount({ rows: [MESSAGE, M2], threadedView: false });
+    await ctrlClick('msg-1');
+    assert.equal(box().getAttribute('aria-label'), 'messageList.selectPage');
+    assert.equal(box().indeterminate, true);
+  });
+
+  test('rows selected elsewhere do not make the rows on screen look selected', async () => {
+    await mount({ rows: [MESSAGE, M2, M3], threadedView: false });
+    await ctrlClick('msg-b');
+    await clickBox();
+    assert.equal(box().checked, true);
+    // Another page's rows, with the three still selected: the counts match, the rows do not.
+    const others = ['p2-a', 'p2-b', 'p2-c'].map((id, i) => ({ ...MESSAGE, id, uid: 20 + i, message_id: `<${id}@example.com>` }));
+    await React.act(async () => { useStore.setState({ messages: others }); });
+    assert.equal(box().checked, false, 'none of the rows on screen is selected');
+    assert.equal(box().indeterminate, false);
+    await ctrlClick('p2-a');
+    assert.equal(box().indeterminate, true, 'one of the three on screen is mixed');
+  });
+});
+
+// #743: the total is the folder counter, which can say more mail exists than can be listed. A page
+// that came back short used to leave Load more up, returning nothing every time it was pressed
+// or the list was scrolled to the bottom.
+describe('MessageList — a short page ends Load more (#743)', () => {
+  test('8 rows under a counter of 60: no Load more, the end is shown', async (t) => {
+    SERVED_TOTAL = 60;
+    t.after(() => { SERVED_TOTAL = null; });
+    const rows = Array.from({ length: 8 }, (_, i) => ({ ...MESSAGE, id: `short-${i}`, uid: 100 + i, message_id: `<short-${i}@example.com>` }));
+    await mount({ rows, threadedView: false });
+    await React.act(async () => { await new Promise(r => setTimeout(r, 20)); });
+    assert.equal(useStore.getState().hasMoreMessages, false);
+    const text = container.textContent;
+    assert.doesNotMatch(text, /messageList\.loadMore/);
+    assert.match(text, /messageList\.noMoreMessages/);
+  });
+});
+
+// #748: a resync after the app resumes waits for the list on screen to reload
+// (utils/listRefreshClaims.js), and hears when it could not.
+describe('MessageList: a resync waits for the list to reload', () => {
+  const NEW = { ...MESSAGE, id: 'msg-resumed', uid: 7, message_id: '<resumed@example.com>', subject: 'Arrived while asleep' };
+  const listFetches = () => CALLS.filter(c => c.path.includes('/mail/messages?')).length;
+
+  test('resolves once the reload has landed, with the new mail on screen', async () => {
+    const { refreshListAndWait } = await import('../utils/listRefreshClaims.js');
+    await mount({ rows: [MESSAGE], threadedView: false });
+    SERVED = [NEW, MESSAGE];
+    let listedWhenDone = null;
+    await React.act(async () => {
+      await refreshListAndWait(window).then(() => {
+        listedWhenDone = useStore.getState().messages.some(m => m.id === 'msg-resumed');
+      });
+    });
+    assert.equal(listedWhenDone, true, 'the reload is in the list when the wait ends');
+    assert.ok(container.querySelector('[data-msgid="msg-resumed"]'), 'and on screen');
+  });
+
+  test('a reload held behind a load in flight is the one it waits for', async () => {
+    const { refreshListAndWait } = await import('../utils/listRefreshClaims.js');
+    await mount({ rows: [MESSAGE], threadedView: false });
+    const realFetch = globalThis.fetch;
+    let release;
+    const held = new Promise(r => { release = r; });
+    let calls = 0;
+    globalThis.fetch = async (url, opts) => {
+      if (String(url).includes('/mail/messages?')) {
+        calls += 1;
+        if (calls === 1) { await held; SERVED = [MESSAGE]; } else SERVED = [NEW, MESSAGE];
+      }
+      return realFetch(url, opts);
+    };
+    try {
+      await React.act(async () => { useStore.setState(s => ({ messagesRefreshToken: s.messagesRefreshToken + 1 })); });
+      let settled = false;
+      let wait;
+      await React.act(async () => { wait = refreshListAndWait(window).then(() => { settled = true; }); });
+      await React.act(async () => { await new Promise(r => setTimeout(r, 20)); });
+      assert.equal(settled, false, 'not done while the load it waits behind is in flight');
+      // Released, then awaited in its own act: the held reload is started by an effect, which act
+      // would hold back until a scope that is itself waiting on it ended.
+      await React.act(async () => { release(); await new Promise(r => setTimeout(r, 50)); });
+      await React.act(async () => { await wait; });
+      assert.equal(settled, true);
+      assert.ok(container.querySelector('[data-msgid="msg-resumed"]'), 'and the held reload has landed');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('rejects when the reload fails, leaving the list as it was', async () => {
+    const { refreshListAndWait } = await import('../utils/listRefreshClaims.js');
+    await mount({ rows: [MESSAGE], threadedView: false });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      if (String(url).includes('/mail/messages?')) throw new TypeError('Failed to fetch');
+      return realFetch(url, opts);
+    };
+    try {
+      let outcome = 'pending';
+      await React.act(async () => {
+        await refreshListAndWait(window).then(() => { outcome = 'done'; }, () => { outcome = 'failed'; });
+      });
+      assert.equal(outcome, 'failed');
+      assert.ok(container.querySelector('[data-msgid="msg-1"]'), 'the rows on screen stay');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('a list showing search results has nothing to wait for', async () => {
+    const { refreshListAndWait } = await import('../utils/listRefreshClaims.js');
+    await mount({ rows: [MESSAGE], threadedView: false });
+    await React.act(async () => { useStore.setState({ searchQuery: 'invoice' }); await new Promise(r => setTimeout(r, 400)); });
+    const before = listFetches();
+    let done = false;
+    await React.act(async () => { await refreshListAndWait(window).then(() => { done = true; }); });
+    assert.equal(done, true);
+    assert.equal(listFetches(), before, 'and nothing was fetched for it');
+    await React.act(async () => { useStore.setState({ searchQuery: '' }); await new Promise(r => setTimeout(r, 30)); });
+  });
+
+  test('with no list mounted it resolves at once', async () => {
+    const { refreshListAndWait } = await import('../utils/listRefreshClaims.js');
+    await React.act(async () => { root?.unmount(); });
+    root = null;
+    let done = false;
+    await refreshListAndWait(window).then(() => { done = true; });
+    assert.equal(done, true);
   });
 });

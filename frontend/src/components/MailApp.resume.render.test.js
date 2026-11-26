@@ -25,14 +25,14 @@ const STUBS = {
   '/components/NotificationToasts.jsx': 'export default function NotificationToasts() { return null; }',
   '/components/CommandPalette.jsx': 'export default function CommandPalette() { return null; }',
   '/components/ComposeModal.jsx': 'export default function ComposeModal() { return null; }',
-  '/components/ContactsPage.jsx': 'export default function ContactsPage() { return null; }',
+  '/components/ContactsPage.jsx': 'export default function ContactsPage() { return "CONTACTS_PAGE"; }',
   '/components/WindowLayer.jsx': 'export default function WindowLayer() { return null; }',
   '/components/AdminPanel.jsx': 'export default function AdminPanel() { return null; }',
   '/components/ElectronNotificationBridge.jsx': 'export default function ElectronNotificationBridge() { return null; }',
   '/components/InboxReplyDraftObserver.js': 'export default function InboxReplyDraftObserver() { return null; }',
   '/plugins/PluginSlot.jsx': 'export const usePluginSlot = () => []; export const usePluginCollected = () => []; export function PluginSlot() { return null; } export function PluginRuntime() { return null; }',
   // An open socket, so the fallback list refresh for a socket that is down stays quiet.
-  '/hooks/useWebSocket.js': 'export const useWebSocket = () => ({ current: { readyState: 1 } });',
+  '/hooks/useWebSocket.js': 'export const useWebSocket = () => ({ current: { readyState: 1 } }); export const PUSH_RECEIVED_EVENT = "mailflow:push_received";',
 };
 
 registerHooks({
@@ -87,6 +87,7 @@ const { api } = await import('../utils/api.js');
 const { useStore } = await import('../store/index.js');
 const { RESUME_RETRY_MS } = await import('../utils/resumeRefresh.js');
 const MailApp = (await import('./MailApp.jsx')).default;
+const { startBootPrefetch, resetBootPrefetchForTests } = await import('../utils/bootPrefetch.js');
 
 const original = { ...api, todoist: api.todoist };
 let root;
@@ -118,6 +119,8 @@ afterEach(async () => {
   dom.window.removeEventListener('mailflow:refresh', countRefresh);
   await React.act(async () => root.unmount());
   Object.assign(api, original);
+  resetBootPrefetchForTests();
+  useStore.setState({ showContacts: false });
 });
 
 async function hideFor(t, ms) {
@@ -148,5 +151,95 @@ describe('MailApp: returning to the tab', () => {
     assert.equal(refreshes, 2, 'the list is asked for again');
     await React.act(async () => { t.mock.timers.tick(60_000); });
     assert.equal(refreshes, 2, 'and only until it works');
+  });
+});
+
+describe('MailApp: the account list', () => {
+  // A load that failed (the server restarting under a deploy) left the app with no accounts
+  // until the page was reloaded.
+  test('a failed load is tried again until it works', async (t) => {
+    await React.act(async () => root.unmount());
+    let calls = 0;
+    const ACCOUNT = { id: 'acct-1', email_address: 'a@example.com', name: 'A' };
+    api.getAccounts = async () => {
+      calls += 1;
+      if (calls < 3) throw Object.assign(new Error('Failed to fetch'), { status: 502 });
+      return [ACCOUNT];
+    };
+    const error = t.mock.method(console, 'error', () => {});
+    useStore.setState({ accounts: [], accountsReady: false });
+    root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(MailApp)); });
+    assert.equal(calls, 1);
+    assert.equal(useStore.getState().accountsReady, true, 'the list does not wait on it');
+    await React.act(async () => { t.mock.timers.tick(2000); });
+    assert.equal(calls, 2);
+    await React.act(async () => { t.mock.timers.tick(5000); });
+    assert.equal(calls, 3);
+    assert.deepEqual(useStore.getState().accounts.map(a => a.id), ['acct-1']);
+    await React.act(async () => { t.mock.timers.tick(120_000); });
+    assert.equal(calls, 3, 'and not again once it worked');
+    assert.ok(error.mock.callCount() >= 2);
+  });
+
+  test('a signed-out answer is not retried', async (t) => {
+    await React.act(async () => root.unmount());
+    let calls = 0;
+    api.getAccounts = async () => { calls += 1; throw Object.assign(new Error('Unauthorized'), { status: 401 }); };
+    t.mock.method(console, 'error', () => {});
+    root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(MailApp)); });
+    await React.act(async () => { t.mock.timers.tick(120_000); });
+    assert.equal(calls, 1);
+  });
+});
+
+describe('MailApp: a cold launch', () => {
+  const remount = async () => {
+    await React.act(async () => root.unmount());
+    root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(MailApp)); });
+    await React.act(async () => { await new Promise(r => queueMicrotask(r)); });
+  };
+
+  test('takes the accounts asked for alongside the session instead of asking again', async () => {
+    let calls = 0;
+    api.getAccounts = async () => { calls += 1; return [{ id: 'a1', email_address: 'a@example.invalid' }]; };
+    api.getPreferences = async () => ({});
+    resetBootPrefetchForTests();
+    startBootPrefetch();
+    assert.equal(calls, 1, 'the launch asked once');
+    await remount();
+    assert.equal(calls, 1, 'MailApp did not ask again');
+    assert.deepEqual(useStore.getState().accounts.map(a => a.id), ['a1']);
+    assert.equal(useStore.getState().accountsReady, true);
+  });
+
+  test('asks again the usual way when that early answer failed', async () => {
+    let calls = 0;
+    api.getAccounts = async () => {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error('Failed to fetch'), { status: 502 });
+      return [{ id: 'a2', email_address: 'b@example.invalid' }];
+    };
+    api.getPreferences = async () => ({});
+    resetBootPrefetchForTests();
+    startBootPrefetch();
+    await remount();
+    assert.equal(calls, 2);
+    assert.deepEqual(useStore.getState().accounts.map(a => a.id), ['a2']);
+  });
+
+  test('Contacts is loaded when first opened, not with the app, and kept after', async () => {
+    const text = () => document.getElementById('root').textContent;
+    const flush = () => React.act(async () => { for (let i = 0; i < 5; i++) await new Promise(r => queueMicrotask(r)); });
+    await flush();
+    assert.ok(!text().includes('CONTACTS_PAGE'), 'not mounted on launch');
+    await React.act(async () => { useStore.setState({ showContacts: true }); });
+    await flush();
+    assert.ok(text().includes('CONTACTS_PAGE'), 'mounted when opened');
+    await React.act(async () => { useStore.setState({ showContacts: false }); });
+    await flush();
+    assert.ok(text().includes('CONTACTS_PAGE'), 'kept, hidden, after it is closed');
   });
 });

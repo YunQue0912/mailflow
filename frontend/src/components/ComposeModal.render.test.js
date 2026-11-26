@@ -1113,6 +1113,8 @@ describe('Reply with AI', () => {
     });
   }
   async function openAiMenu() {
+    const more = document.querySelector('button[aria-label="message.more"]');
+    if (more?.getAttribute('aria-expanded') === 'false') await press(more);
     await press(document.querySelector('button[title="compose.toolbar.aiAssist"]'));
   }
   async function mount(composeData) {
@@ -1562,5 +1564,129 @@ describe('pasting into the signature and the quoted message', () => {
 
   test('and so it is from the phone layout, which has its own quoted message', async () => {
     assertNoCopiedColor(await pasteAndSend({ phone: true }));
+  });
+});
+
+// Locking swaps the mail view for the lock screen, which unmounts the composer. It reopens on
+// unlock from the store, so it has to leave its current state there, not what it was opened with.
+describe('locking the screen while composing', () => {
+  test('reopens with the text and the draft written since it was opened', async () => {
+    const accounts = useStore.getState().accounts;
+    const close = await openDraft({ plaintextEmail: false, body: GMAIL_DRAFT });
+    let editor = document.querySelector('.ProseMirror').editor;
+    await React.act(async () => { editor.commands.insertContent(' Saved part.'); });
+    await hideTab();
+    assert.equal(saved.at(-1).existingUid, 7, 'precondition: the autosave replaced the opened draft');
+    await React.act(async () => { editor.commands.insertContent(' Typed after the autosave.'); });
+
+    await React.act(async () => { useStore.getState().setLocked(true); });
+    await close();
+    const kept = useStore.getState().composeData;
+    assert.equal(useStore.getState().composing, true, 'the composer reopens after unlock');
+    assert.match(kept.body, /Typed after the autosave\./);
+    assert.equal(kept.draftUid, 8, 'it keeps saving into the draft the autosave wrote');
+    assert.equal(kept.restored, true);
+
+    // As in the browser: unlock remounts the composer at once, and the accounts (cleared by the
+    // lock) load again after it.
+    await React.act(async () => { useStore.getState().setLocked(false); });
+    assert.deepEqual(useStore.getState().accounts, [], 'precondition: no accounts when it mounts');
+    saved.length = 0;
+    const root = createRoot(document.getElementById('root'));
+    await React.act(async () => { root.render(React.createElement(ComposeModal)); });
+    await React.act(async () => {});
+    await React.act(async () => { useStore.setState({ accounts }); });
+    await React.act(async () => {});
+    editor = document.querySelector('.ProseMirror').editor;
+    assert.match(editor.getHTML(), /Typed after the autosave\./);
+    await hideTab();
+    assert.equal(saved.length, 1, 'the unsaved part is saved, rather than dropped');
+    assert.equal(saved[0].existingUid, 8, 'into the same draft, not a second one');
+    assert.equal(saved[0].accountId, 'acct', 'from the account it was written from');
+    await React.act(async () => root.unmount());
+    useStore.setState({ composing: false, composeData: null });
+  });
+
+  test('an autosave that answers after the lock points the reopened composer at its copy', async () => {
+    const close = await openDraft({ plaintextEmail: false, body: GMAIL_DRAFT });
+    const editor = document.querySelector('.ProseMirror').editor;
+    await React.act(async () => { editor.commands.insertContent(' Saving as it locks.'); });
+    let answer;
+    const realSave = api.saveDraft;
+    api.saveDraft = () => new Promise(resolve => { answer = resolve; });
+    try {
+      await hideTab(); // the autosave is out
+      assert.ok(answer, 'precondition: an autosave in flight');
+      await React.act(async () => { useStore.getState().setLocked(true); });
+      await close();
+      await React.act(async () => { answer({ uid: 9, folder: 'Drafts' }); await new Promise(r => setTimeout(r, 0)); });
+      assert.equal(useStore.getState().composeData.draftUid, 9, 'the copy the late save wrote');
+    } finally {
+      api.saveDraft = realSave;
+      useStore.getState().setLocked(false);
+      useStore.setState({ composing: false, composeData: null, accounts: [{ id: 'acct', enabled: true, email_address: 'me@example.invalid', name: 'Me', color: '#fff' }] });
+    }
+  });
+});
+
+describe('AI writing actions and the signature toggle', () => {
+  // The prompt tells the model which signature follows its text, so it does not sign off above it
+  // (utils/aiSenderNote.js). With the signature turned off (#555) handleSend sends none, so the
+  // note has to say so too, or a drafted message goes out with neither a sign-off nor a signature.
+  const Host = () => (useStore(s => s.composing) ? React.createElement(ComposeModal) : null);
+  const mouseDown = el => React.act(async () => { el.dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, cancelable: true })); });
+
+  // Opens a new message, turns the signature off when asked, runs Write a draft, and returns the
+  // system prompt the model was given.
+  async function draftSystemPrompt({ signatureOn }) {
+    const chats = [];
+    const realAi = api.ai;
+    const realParser = globalThis.DOMParser;
+    api.ai = { ...realAi, status: async () => ({ enabled: true, features: { compose: true } }), chat: async (messages) => { chats.push(messages); return 'Drafted.'; } };
+    globalThis.DOMParser = window.DOMParser; // signatureText reads the signature through it
+    useStore.setState({
+      plaintextEmail: false, notifications: [], composing: false, composeData: null, prepareComposeSwitch: null,
+      accounts: [{ id: 'acct', enabled: true, email_address: 'me@example.invalid', name: 'Work', sender_name: 'Marty Example', color: '#fff', signature: '<p>Marty Example<br>Rink manager</p>' }],
+    });
+    useStore.getState().openCompose({ accountId: 'acct', to: ['Bob <bob@example.invalid>'], cc: [], subject: 'Ice time', body: '' });
+    const root = createRoot(document.getElementById('root'));
+    try {
+      await React.act(async () => { root.render(React.createElement(Host)); });
+      await React.act(async () => {});
+      const toggle = document.querySelector('button[aria-label="compose.insertSignature"]');
+      assert.ok(toggle, 'precondition: the signature toggle is shown');
+      if (!signatureOn) {
+        await React.act(async () => { toggle.click(); });
+        assert.equal(toggle.getAttribute('aria-pressed'), 'false');
+      }
+      const more = document.querySelector('button[aria-label="message.more"]');
+      if (more?.getAttribute('aria-expanded') === 'false') await mouseDown(more);
+      const aiButton = document.querySelector('button[title="compose.toolbar.aiAssist"]');
+      assert.ok(aiButton, 'precondition: the AI actions are enabled');
+      await mouseDown(aiButton);
+      const draft = [...document.querySelectorAll('button')].find(b => b.textContent === 'compose.toolbar.aiWriteDraft');
+      assert.ok(draft, 'precondition: the AI menu opened');
+      await mouseDown(draft);
+      await React.act(async () => {});
+      assert.equal(chats.length, 1, 'one request went to the model');
+      return chats[0][0].content;
+    } finally {
+      await React.act(async () => root.unmount());
+      api.ai = realAi;
+      globalThis.DOMParser = realParser;
+    }
+  }
+
+  test('with the signature on, the model is told it follows and must not sign off', async () => {
+    const system = await draftSystemPrompt({ signatureOn: true });
+    assert.match(system, /signature is added automatically below/);
+    assert.match(system, /Marty Example\nRink manager/);
+  });
+
+  test('with the signature turned off, the model signs off as the sender instead', async () => {
+    const system = await draftSystemPrompt({ signatureOn: false });
+    assert.doesNotMatch(system, /signature is added automatically/);
+    assert.doesNotMatch(system, /Rink manager/);
+    assert.match(system, /No signature is added, so sign the email off as Marty Example\./);
   });
 });

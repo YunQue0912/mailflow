@@ -26,7 +26,9 @@ function directionKey(sort, dir) {
 }
 
 // The list header's sort button and menu (#528, #196). Each folder keeps its own order.
-export default function ListSortMenu({ accountId, folder, compact = false }) {
+// iconOnly: the desktop list header's second row is too narrow for the label (useHeaderControlsFit).
+// The label then stays rendered but invisible and out of the flow, so the header can still measure it.
+export default function ListSortMenu({ accountId, folder, compact = false, iconOnly = false }) {
   const { t } = useTranslation();
   const uiScale = useUiScale();
   const orderKey = useStore(s => JSON.stringify(listOrderFor(s.listSort, accountId, folder)));
@@ -118,7 +120,9 @@ export default function ListSortMenu({ accountId, folder, compact = false }) {
         style={{
           background: open || custom ? 'var(--accent-dim)' : 'none',
           border: `1px solid ${open || custom ? 'var(--accent)' : compact ? 'transparent' : 'var(--border)'}`,
-          borderRadius: 6, padding: compact ? '5px 7px' : '4px 8px',
+          borderRadius: 6, padding: compact ? '5px 7px' : '0 8px',
+          // The desktop list toolbar's control height (TOOLBAR_CONTROL_HEIGHT in MessageList.jsx, #766).
+          height: compact ? undefined : 24, boxSizing: 'border-box',
           color: open || custom ? 'var(--accent)' : 'var(--text-tertiary)',
           cursor: 'pointer', fontSize: 11, fontWeight: 500, fontFamily: 'inherit',
           display: 'flex', alignItems: 'center', gap: 5, maxWidth: 220,
@@ -129,7 +133,14 @@ export default function ListSortMenu({ accountId, folder, compact = false }) {
           <path d="M7 4v16M3 16l4 4 4-4"/><path d="M14 6h7M14 12h5M14 18h3"/>
         </svg>
         {!compact && (
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <span
+            data-sort-label=""
+            data-hidden={iconOnly ? '' : undefined}
+            aria-hidden={iconOnly || undefined}
+            style={iconOnly
+              ? { position: 'absolute', visibility: 'hidden', pointerEvents: 'none', whiteSpace: 'nowrap' }
+              : { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          >
             {custom ? summary : t('messageList.sort')}
           </span>
         )}

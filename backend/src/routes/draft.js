@@ -1,3 +1,4 @@
+import { notifyMessageRowsDeleted } from '../services/messageRowsDeleted.js';
 import nodemailer from 'nodemailer';
 import { randomBytes } from 'crypto';
 import { Router } from 'express';
@@ -340,7 +341,8 @@ async function buildRawDraft({ accountId, aliasId, to, cc, bcc, subject, body, b
     ...((inlineImageAttachments.length || attachments.length) ? { attachments: [...inlineImageAttachments, ...attachments] } : {}),
   };
 
-  const streamTransport = nodemailer.createTransport({ streamTransport: true, newline: 'unix' });
+  // CRLF, like the Sent copy (renderRawMessage, #365): IMAP APPEND requires it.
+  const streamTransport = nodemailer.createTransport({ streamTransport: true, newline: 'windows' });
   const streamInfo = await streamTransport.sendMail(mailOptions);
   const chunks = [];
   await new Promise((resolve, reject) => {
@@ -385,7 +387,14 @@ router.post('/draft', async (req, res) => {
     }
 
     // APPEND the new draft first so we never lose the message
-    const { uid } = await imapManager.appendToFolder(account, draftsFolder, rawMessage, ['\\Draft', '\\Seen']);
+    let { uid } = await imapManager.appendToFolder(account, draftsFolder, rawMessage, ['\\Draft', '\\Seen']);
+    // A server without UIDPLUS does not name the new uid. The composer then had nothing to replace
+    // on its next save, and every autosave left one more copy in Drafts. The Message-ID is new for
+    // every save, so a SEARCH for it finds this copy and no other.
+    if (uid == null) {
+      uid = await imapManager.findUidByMessageId(account, draftsFolder, meta.messageId)
+        .catch(err => { console.warn(`Draft: could not find the saved draft's uid: ${err.message}`); return null; });
+    }
 
     // Persist a local Drafts row immediately so the composer can reopen this draft
     // (recipient/subject/body) even if the folder re-sync is delayed or fails on a
@@ -421,10 +430,11 @@ router.post('/draft', async (req, res) => {
         if (!deleted) {
           console.error(`Draft: refusing to delete old uid=${replaced.uid} in folder ${JSON.stringify(replaced.folder)}: the server copy's Message-ID does not match its local row`);
         } else {
-          await query(
-            'DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3',
+          const deletedRows = await query(
+            'DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3 RETURNING account_id, folder, thread_key',
             [replaced.account.id, replaced.uid, replaced.folder]
           );
+          notifyMessageRowsDeleted(replaced.account, deletedRows.rows);
         }
       } catch (delErr) {
         console.error(`Draft: failed to delete old uid=${replaced.uid}: ${delErr.message}`);
@@ -482,16 +492,18 @@ router.delete('/draft/:uid', async (req, res) => {
     if (deleted === false) {
       // Sync never corrects a row whose uid holds another message: drop it and pull the folder.
       console.warn(`Draft: not deleting uid=${uid} in folder ${JSON.stringify(folder)}: the server copy there is not its row's message`);
-      await query('DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3', [account.id, uid, folder]);
+      const deletedRows = await query('DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3 RETURNING account_id, folder, thread_key', [account.id, uid, folder]);
+      notifyMessageRowsDeleted(account, deletedRows.rows);
       imapManager.syncFolderOnDemand(account, folder)
         .catch(err => console.warn('post-delete folder sync failed:', err.message));
       noteDraftsChanged(req.session.userId, account.id, folder);
       return res.status(409).json({ error: 'This draft changed on the server and was not deleted. Refresh and try again.' });
     }
-    await query(
-      'DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3',
+    const deletedRows = await query(
+      'DELETE FROM messages WHERE account_id = $1 AND uid = $2 AND folder = $3 RETURNING account_id, folder, thread_key',
       [account.id, uid, folder]
     );
+    notifyMessageRowsDeleted(account, deletedRows.rows);
     noteDraftsChanged(req.session.userId, account.id, folder);
     res.json({ ok: true });
   } catch (err) {

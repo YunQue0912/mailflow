@@ -159,7 +159,7 @@ describe('conversation pane selection', () => {
 
     assert.equal(result.selectedMessage, cachedSelected);
     assert.equal(result.conversationMessage, refreshedHead);
-    assert.equal(result.refreshKey, 'thread-1:3');
+    assert.equal(result.refreshKey, 'thread-1:new-reply:3');
   });
 
   it('tells a message parked from a notification or link apart from a row of the list', () => {
@@ -181,7 +181,7 @@ describe('conversation pane selection', () => {
     assert.deepEqual(where([], { [`__dl_${opened.id}`]: [opened], 'thread-1': [opened] }), { listed: false, parked: true }, 'a cached conversation does not unpark it');
   });
 
-  it('changes the refresh key when conversation membership changes', () => {
+  it('changes the refresh key when the grouped head changes', () => {
     assert.equal(typeof conversationModule.conversationRefreshKey, 'function');
     assert.notEqual(
       conversationModule.conversationRefreshKey({ thread_id: 'thread-1', id: 'old', message_count: 2 }),

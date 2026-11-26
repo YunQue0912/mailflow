@@ -8,12 +8,14 @@ vi.mock('../index.js', () => ({
     syncFolderOnDemand: vi.fn(async () => {}),
     fetchAttachment: vi.fn(),
     fetchRawMessage: vi.fn(),
+    findUidByMessageId: vi.fn(async () => null),
     pluginFacade: {},
   },
 }));
 vi.mock('./smtpTransport.js', () => ({ createAccountSmtpTransport: vi.fn() }));
 vi.mock('../utils/mailUtils.js', () => ({ resolveSentFolder: vi.fn() }));
 vi.mock('./draftCopies.js', () => ({ deleteSentDraft: vi.fn(async () => true) }));
+import { pluginRegistry } from '../plugins/registry.js';
 import { query } from './db.js';
 import { findOwnedAccount, findOwnedMessages } from './ownership.js';
 import { imapManager } from '../index.js';
@@ -290,6 +292,50 @@ describe('deliverAndRecord', () => {
     expect(deleteSentDraft).toHaveBeenCalledWith('u1', account, { uid: 3, folder: 'Drafts', accountId: 'a1' });
     expect(imapManager.appendToSent).toHaveBeenCalledOnce();
     expect(imapManager.appendToSent).toHaveBeenCalledWith(account, 'Sent', msg.delivery.rawMessage);
+  });
+
+  it.each([false, true])('still notifies sent-message plugins after a failed sync (auto-save=%s)', async autoSave => {
+    const msg = await message();
+    if (autoSave) msg.delivery.rawMessage = null;
+    vi.useFakeTimers();
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    imapManager.syncFolderOnDemand.mockRejectedValue(new Error('synthetic sync failure'));
+    try {
+      expect(await deliverAndRecord(msg, {})).toMatchObject({ ok: true });
+      await vi.advanceTimersByTimeAsync(autoSave ? 15000 : 1000);
+      expect(hook).toHaveBeenCalledTimes(autoSave ? 2 : 1);
+      expect(hook).toHaveBeenCalledWith('onSentMessage', {
+        imapManager: imapManager.pluginFacade, account, messageId: msg.delivery.mailOptions.messageId,
+      });
+      expect(error).toHaveBeenCalledTimes(autoSave ? 2 : 1);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('sync failed: synthetic sync failure'));
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      imapManager.syncFolderOnDemand.mockResolvedValue(undefined);
+    }
+  });
+
+  // A Sent APPEND still uploading when the 20 s wait ran out (a large attachment, a slow link) could
+  // land after the one pull of Sent that followed, and the copy stayed out of the list.
+  it('pulls Sent again a minute later when the Sent copy did not answer in time', async () => {
+    const msg = await message();
+    vi.useFakeTimers();
+    try {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      imapManager.appendToSent.mockImplementationOnce(() => new Promise(() => {}));
+      const stalled = deliverAndRecord(msg, {});
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect((await stalled).sentCopySaved).toBe(false);
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(imapManager.syncFolderOnDemand).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(52_000);
+      expect(imapManager.syncFolderOnDemand).toHaveBeenCalledTimes(2);
+      expect(imapManager.syncFolderOnDemand).toHaveBeenLastCalledWith(account, 'Sent');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('calls onDelivered once SMTP accepted, before the draft is deleted', async () => {

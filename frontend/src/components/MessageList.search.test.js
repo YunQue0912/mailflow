@@ -1,6 +1,7 @@
 // MessageList's search states (#592): a search still waiting for its response says so instead of
 // "no results", and a response that arrives after the query was cleared, or after the account
-// or folder changed, is dropped. Harness as MessageList.render.test.js.
+// or folder changed, is dropped. Then the note a folder-scoped search shows above its results.
+// Harness as MessageList.render.test.js.
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,7 +14,7 @@ registerHooks({
   load(url, context, nextLoad) {
     if (url.endsWith('react-i18next/dist/es/index.js') || url.endsWith('/react-i18next')) {
       return { format: 'module', shortCircuit: true, source: [
-        'export const useTranslation = () => ({ t: (k, d) => (typeof d === "string" ? d : d?.defaultValue ?? k), i18n: { language: "en", changeLanguage: () => {} } });',
+        'export const useTranslation = () => ({ t: (k, d) => (typeof d === "string" ? d : d?.defaultValue ?? (d && Object.keys(d).length ? k + " " + JSON.stringify(d) : k)), i18n: { language: "en", changeLanguage: () => {} } });',
         'export const initReactI18next = { type: "3rdParty", init: () => {} };',
         'export const Trans = ({ children }) => children ?? null;',
         'export const I18nextProvider = ({ children }) => children ?? null;',
@@ -303,5 +304,151 @@ describe('MessageList replacement search feedback', () => {
     assert.doesNotMatch(text(), /messageList\.pageOf|messageList\.nextPage/);
     await settle();
     await respond({ messages: [] });
+  });
+
+  // Search results have no page numbers, and paginated mode drew no Load more for them, so a
+  // search stopped at its first page with no way to the rest.
+  test('paginated mode: a full page of search results offers Load more', async () => {
+    await mount({ scrollMode: 'paginated' });
+    useStore.setState({ pageSize: 2 });
+    await search('Synthetic');
+    await settle();
+    await respond({ messages: [hit('a'), hit('b')] });
+    const more = [...container().querySelectorAll('button')].find(b => /messageList\.loadMore/.test(b.textContent));
+    assert.ok(more, 'a full page offers more');
+    await React.act(async () => { more.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+    assert.match(await respond({ messages: [hit('c')] }), /offset=2/);
+    assert.deepEqual(useStore.getState().searchResults.map(m => m.id), ['a', 'b', 'c']);
+    assert.match(text(), /messageList\.noMoreMessages/);
+    assert.doesNotMatch(text(), /messageList\.pageOf/, 'still no folder page numbers');
+  });
+});
+
+describe('MessageList search scope note', () => {
+  const note = () => text().match(/messageList\.searchScopeNote \{"folder":"([^"]*)"\}/)?.[1] ?? null;
+  const allFoldersButton = () => [...container().querySelectorAll('button')].find(b => b.textContent === 'sidebar.searchAllFolders');
+  const drain = async () => { await settle(); while (pending.length) await respond({ messages: [] }); };
+
+  test('names the open folder as the header does, and its button widens the search', async () => {
+    await mount();
+    await React.act(async () => useStore.setState({
+      selectedFolder: 'INBOX.Sent',
+      folders: { 'acct-1': [{ path: 'INBOX', name: 'INBOX' }, { path: 'INBOX.Sent', name: 'Sent', special_use: '\\Sent' }] },
+    }));
+    assert.equal(note(), null, 'no note without a query');
+    await search('Synthetic');
+    assert.equal(note(), 'Sent', 'the role folder by its display name, not its path');
+    await settle();
+    assert.match(await respond({ messages: [hit('scoped')] }), /folder=INBOX\.Sent/);
+    assert.equal(note(), 'Sent', 'the note stays above the results');
+    assert.ok(allFoldersButton(), 'a Search all folders button');
+    await React.act(async () => { allFoldersButton().click(); });
+    assert.equal(useStore.getState().searchAllFolders, true, 'the same switch as the sidebar');
+    assert.equal(note(), null, 'no note once the search spans every folder');
+    await settle();
+    assert.doesNotMatch(await respond({ messages: [hit('anywhere')] }), /folder=/);
+    await React.act(async () => useStore.getState().setSearchAllFolders(false));
+    await drain();
+  });
+
+  test('stays away when the query names its own folder, and in the unified view', async () => {
+    await mount();
+    await search('in:all Synthetic');
+    assert.equal(note(), null, 'in:all makes the server search every folder');
+    await drain();
+    await search('Synthetic in:sent');
+    assert.equal(note(), null, 'in:sent picks the folder itself');
+    await drain();
+    await search('Synthetic');
+    assert.equal(note(), 'INBOX');
+    await React.act(async () => useStore.setState({ selectedAccountId: null }));
+    assert.equal(note(), null, 'the unified view already searches every folder');
+    await drain();
+  });
+
+  test('keeps the button out of Trash, which an all-folder search leaves out', async () => {
+    await mount();
+    await React.act(async () => useStore.setState({
+      selectedFolder: 'INBOX.Trash',
+      folders: { 'acct-1': [{ path: 'INBOX', name: 'INBOX' }, { path: 'INBOX.Trash', name: 'Trash', special_use: '\\Trash' }] },
+    }));
+    await search('Synthetic');
+    assert.equal(note(), 'Trash', 'the search is still scoped, so the note stays');
+    assert.ok(!allFoldersButton(), 'no button: the server skips Trash when it searches every folder');
+    await drain();
+    // The route skips a folder by name too, flagged or not.
+    await React.act(async () => useStore.setState({
+      selectedFolder: 'Deleted Items',
+      folders: { 'acct-1': [{ path: 'INBOX', name: 'INBOX' }, { path: 'Deleted Items', name: 'Deleted Items' }] },
+    }));
+    assert.equal(note(), 'Deleted Items');
+    assert.ok(!allFoldersButton(), 'an unflagged "Deleted Items" is skipped by name');
+    await drain();
+  });
+});
+
+// #742: a replaced search's rows stay, dimmed and marked busy, until the new results arrive; a
+// failed Load more says so and offers a retry; and a replaced search's page cannot touch the
+// new search's Load more.
+describe('MessageList replaced results and Load more failures (#742)', () => {
+  const list = () => container().querySelector('[data-msgid]')?.closest('[tabindex="0"]');
+  const button = (re) => [...container().querySelectorAll('button')].find(b => re.test(b.textContent));
+  const click = (el) => React.act(async () => { el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })); });
+
+  test('dims the previous rows while the replacement runs, and only then', async () => {
+    await mount();
+    await search('Synthetic');
+    await settle();
+    await respond({ messages: [hit('previous')] });
+    assert.equal(list().style.opacity, '1');
+    assert.equal(list().getAttribute('aria-busy'), null);
+    await search('Replacement');
+    assert.equal(list().style.opacity, '0.5', 'dimmed during the debounce');
+    assert.equal(list().getAttribute('aria-busy'), 'true');
+    await settle();
+    assert.equal(list().style.opacity, '0.5', 'still dimmed while the request is pending');
+    await respond({ messages: [hit('replacement')] });
+    assert.equal(list().style.opacity, '1');
+    assert.equal(list().getAttribute('aria-busy'), null);
+  });
+
+  test('a failed Load more says so, keeps the rows, and the retry asks for the same offset', async () => {
+    await mount();
+    useStore.setState({ pageSize: 2 });
+    await search('Synthetic');
+    await settle();
+    await respond({ messages: [hit('a'), hit('b')] });
+    await click(button(/messageList\.loadMore/));
+    const failed = pending.shift();
+    assert.match(failed.path, /offset=2/);
+    await React.act(async () => { failed.reject(new Error('network down')); await new Promise(r => setTimeout(r, 0)); });
+    assert.ok(container().querySelector('[role="alert"]'), 'the failure is announced');
+    assert.match(text(), /messageList\.loadMoreFailed/);
+    assert.deepEqual(useStore.getState().searchResults.map(m => m.id), ['a', 'b'], 'the loaded rows stay');
+    const retry = button(/common\.retry/);
+    assert.ok(retry, 'the button offers a retry');
+    await click(retry);
+    assert.doesNotMatch(text(), /messageList\.loadMoreFailed/, 'the failure clears when retrying');
+    assert.match(await respond({ messages: [hit('c')] }), /offset=2/);
+    assert.deepEqual(useStore.getState().searchResults.map(m => m.id), ['a', 'b', 'c']);
+    assert.match(text(), /messageList\.noMoreMessages/);
+  });
+
+  test('a replaced search\'s Load more neither blocks nor fails the new one', async () => {
+    await mount();
+    useStore.setState({ pageSize: 2 });
+    await search('Synthetic');
+    await settle();
+    await respond({ messages: [hit('a'), hit('b')] });
+    await click(button(/messageList\.loadMore/));
+    const old = pending.shift();
+    await search('Replacement');
+    await settle();
+    await respond({ messages: [hit('x'), hit('y')] });
+    assert.ok(button(/messageList\.loadMore/), 'the new search offers Load more while the old page is pending');
+    await React.act(async () => { old.reject(new Error('late failure')); await new Promise(r => setTimeout(r, 0)); });
+    assert.doesNotMatch(text(), /messageList\.loadMoreFailed/, 'the old page\'s failure is not shown');
+    assert.ok(button(/messageList\.loadMore/), 'and Load more is still there');
+    assert.deepEqual(useStore.getState().searchResults.map(m => m.id), ['x', 'y']);
   });
 });

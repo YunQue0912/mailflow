@@ -14,9 +14,13 @@ vi.mock('./connectionPolicy.js', () => ({ getConnectionPolicy: vi.fn() }));
 vi.mock('./spamPipeline.js', () => ({ classifyAndTagMessage: vi.fn() }));
 vi.mock('./mailAccess.js', () => ({ getAccountAddresses: vi.fn(async () => []) }));
 
-import { ImapManager, PREFETCH_MAX_CONSECUTIVE_ERRORS, INLINE_IMAGE_REPEAT_BUDGET, hasIdlePooledClient, shouldPrewarmPool, acquirePooledClient, releasePooledClient, MIN_SYNC_INTERVAL_MS, AUTO_IDLE_DELAY_MS, countMissingInboxCopies, fetchBackfillBatch, providerProfile, makeClientCfg, relocateExemptGuard, insertCopiedSibling, deleteMessageCopyRow, emitSectionsChanged, ensureMailbox, createKeyedSemaphore, isConnectionRefusal, connectCooldownMs, effectiveSyncIntervalMs, folderSyncDue, planModseqSync, connectStaggerFor, walkStructure, extractBodyFromMsg, attachmentsFromStructure, contentLocationFromMimeHeader, bodyFallbackApplies, parsePersistentCap, resolvePersistentCap, persistentEligible, shouldRetryIPv4, classifyMoveBySearch, pairMovedCopies, computeThreadId, noteDraftsChanged } from './imapManager.js';
+import { ImapManager, PREFETCH_MAX_CONSECUTIVE_ERRORS, INLINE_IMAGE_REPEAT_BUDGET, hasIdlePooledClient, shouldPrewarmPool, acquirePooledClient, releasePooledClient, MIN_SYNC_INTERVAL_MS, AUTO_IDLE_DELAY_MS, countMissingInboxCopies, fetchBackfillBatch, providerProfile, makeClientCfg, relocateExemptGuard, insertCopiedSibling, rollbackCopiedMessageOnInsertFailure, deleteMessageCopyRow, emitSectionsChanged, ensureMailbox, createdPathFor, createKeyedSemaphore, isConnectionRefusal, connectCooldownMs, effectiveSyncIntervalMs, folderSyncDue, planModseqSync, connectStaggerFor, walkStructure, extractBodyFromMsg, attachmentsFromStructure, contentLocationFromMimeHeader, bodyFallbackApplies, parsePersistentCap, resolvePersistentCap, persistentEligible, shouldRetryIPv4, classifyMoveBySearch, pairMovedCopies, computeThreadId, noteDraftsChanged } from './imapManager.js';
 import { pluginRegistry } from '../plugins/registry.js';
-import { ensureFreshToken } from './imapManager.js';
+import { PROVIDERS } from './providers.js';
+import { ensureFreshToken, clearChangedSinceIgnored, isServerLimitFailure } from './imapManager.js';
+import { fetchSnippetBatch, structureParts } from './imapManager.js';
+import { withFreshClient } from './imapManager.js';
+import { clearCarries, hasCarries, rememberDroppedRows } from './movedRowCarry.js';
 import { clearRefreshFailure, noteFreshToken, noteRefreshFailure, refreshFailureFor } from './accountErrorCode.js';
 import { refreshMicrosoftToken } from '../routes/oauth.js';
 import { EventEmitter } from 'node:events';
@@ -185,8 +189,9 @@ describe('providerProfile — host detection', () => {
     expect(providerProfile(account(host)).pushesFlags).toBe(false);
     expect(providerProfile(account(host)).speculativeFetch).toBe(false);
     expect(providerProfile(account(host)).snippetIndex).toBe(false);
-    // secondaryOverPool is a session-limited-provider knob, not a global flip.
-    expect(providerProfile(account(host)).secondaryOverPool).toBeUndefined();
+    // Gmail's 15-session limit: a pool of two, and folder status and the staleness probe ride it.
+    expect(providerProfile(account(host)).poolSize).toBe(2);
+    expect(providerProfile(account(host)).secondaryOverPool).toBe(true);
   });
 
   it.each([
@@ -199,6 +204,29 @@ describe('providerProfile — host detection', () => {
     expect(providerProfile(account(host)).snippetIndex).toBe(true);
     // Round 5 (#474): periodic secondary work rides the pool instead of fresh logins.
     expect(providerProfile(account(host)).secondaryOverPool).toBe(true);
+  });
+
+  it.each([
+    ['imap.zoho.com'],
+    ['imappro.zoho.com'],
+    ['imap.zoho.eu'],
+    ['imappro.zoho.in'],
+    ['imap.zoho.com.au'],
+    ['imap.zohocloud.ca'],
+  ])('detects zoho for %s, with its session budget', host => {
+    const profile = providerProfile(account(host));
+    expect(profile).toBe(PROVIDERS.zoho);
+    // Zoho allows about three sessions at once: one pooled session the periodic work shares,
+    // no pre-warm. Everything else as generic.
+    expect(profile).toEqual({ ...PROVIDERS.generic, poolSize: 1, poolPrewarm: false, secondaryOverPool: true });
+  });
+
+  it.each([
+    ['zoho.example.org'],
+    ['mail.notzoho.com'],
+    ['imap.zoho.com.example.net'],
+  ])('does not take %s for zoho', host => {
+    expect(providerProfile(account(host))).toBe(PROVIDERS.generic);
   });
 
   it.each([
@@ -544,6 +572,36 @@ describe('insertCopiedSibling', () => {
   });
 });
 
+describe('rollbackCopiedMessageOnInsertFailure', () => {
+  it('removes the confirmed server copy before rethrowing the insert failure', async () => {
+    const manager = { permanentDeleteMessage: vi.fn().mockResolvedValue(true) };
+    const account = { id: 'acct-1' };
+    const insertError = new Error('database unavailable');
+    await expect(rollbackCopiedMessageOnInsertFailure(
+      manager, account, 'Delegated', 5001, insertError, 42n,
+    )).rejects.toBe(insertError);
+    expect(manager.permanentDeleteMessage).toHaveBeenCalledWith(account, 5001, 'Delegated', { expectUidValidity: 42n });
+  });
+
+  it.each(['rejects', 'refuses', 'unknown validity'])('logs an uncompensated copy when rollback %s and preserves the insert error', async failure => {
+    const account = { id: 'rollback-log-fixture' };
+    const manager = { permanentDeleteMessage: failure === 'rejects'
+      ? vi.fn().mockRejectedValue(new Error('rollback connection lost'))
+      : vi.fn().mockResolvedValue(false) };
+    const insertError = new Error('insert failed');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(rollbackCopiedMessageOnInsertFailure(manager, account, 'Delegated', 5001, insertError,
+        failure === 'unknown validity' ? null : 42n)).rejects.toBe(insertError);
+      expect(log).toHaveBeenCalledOnce();
+      const message = log.mock.calls[0].join(' ');
+      const reason = failure === 'rejects' ? 'rollback connection lost' : 'Cannot safely roll back copy';
+      for (const part of [account.id, 'Delegated', '5001', reason]) expect(message).toContain(part);
+      if (failure === 'unknown validity') expect(manager.permanentDeleteMessage).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
+});
+
 // ── upsertDraftMessageRecord — the row a reopened draft is built from ───────
 
 describe('upsertDraftMessageRecord', () => {
@@ -637,6 +695,104 @@ describe('deleteMessageCopyRow', () => {
   });
 });
 
+describe('syncFolderOnDemand coalescing', () => {
+  it('a facade release cannot discard an in-progress core sync', async () => {
+    const mgr = new ImapManager({ clients: new Set() });
+    clearInterval(mgr._folderStatusTimer);
+    const acct = { id: 'core-owner', user_id: 'u' };
+    let finish;
+    const sync = vi.spyOn(mgr, 'syncFolderViaPool').mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const owner = mgr.syncFolderOnDemand(acct, 'Todo');
+    const entry = mgr.onDemandSyncing.get(`${acct.id}:Todo`);
+    try {
+      mgr.pluginFacade.releaseFolderSync(acct.id, 'Todo');
+      expect(mgr.onDemandSyncing.get(`${acct.id}:Todo`)).toBe(entry);
+      expect(mgr.pluginFacade.tryClaimFolderSync(acct.id, 'Todo')).toBe(false);
+      let settled = false;
+      const waiter = mgr.syncFolderOnDemand(acct, 'Todo').then(() => { settled = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      finish();
+      await Promise.all([owner, waiter]);
+      expect(sync).toHaveBeenCalledOnce();
+    } finally { finish(); await owner; sync.mockRestore(); }
+  });
+
+  it('keeps one 30-second wait budget across an active-claim handoff', async () => {
+    vi.useFakeTimers();
+    const mgr = new ImapManager({ clients: new Set() });
+    clearInterval(mgr._folderStatusTimer);
+    vi.clearAllTimers();
+    const acct = { id: 'handoff-owner', user_id: 'u' };
+    const sync = vi.spyOn(mgr, 'syncFolderViaPool').mockResolvedValue();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      mgr.pluginFacade.tryClaimFolderSync(acct.id, 'Todo');
+      let settled = false;
+      const waiting = mgr.syncFolderOnDemand(acct, 'Todo', { freshAfterActive: true }).finally(() => { settled = true; });
+      const failure = expect(waiting).rejects.toThrow(/timeout/i);
+      await vi.advanceTimersByTimeAsync(20000);
+      mgr.pluginFacade.releaseFolderSync(acct.id, 'Todo');
+      mgr.pluginFacade.tryClaimFolderSync(acct.id, 'Todo');
+      const replacement = mgr.onDemandSyncing.get(`${acct.id}:Todo`);
+      await vi.advanceTimersByTimeAsync(9999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await failure;
+      expect(settled).toBe(true);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(sync).not.toHaveBeenCalled();
+      expect(mgr.onDemandSyncing.get(`${acct.id}:Todo`)).toBe(replacement);
+      mgr.pluginFacade.releaseFolderSync(acct.id, 'Todo');
+    } finally { vi.useRealTimers(); vi.restoreAllMocks(); }
+  });
+
+  it('bounds a stuck claim wait without releasing its owner', async () => {
+    vi.useFakeTimers();
+    const mgr = new ImapManager({ clients: new Set() });
+    clearInterval(mgr._folderStatusTimer);
+    vi.clearAllTimers();
+    const acct = { id: 'stuck-claim', user_id: 'u' };
+    const sync = vi.spyOn(mgr, 'syncFolderViaPool').mockResolvedValue();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      mgr.pluginFacade.tryClaimFolderSync(acct.id, 'Todo');
+      const entry = mgr.onDemandSyncing.get(`${acct.id}:Todo`);
+      let settled = false;
+      const waiting = mgr.pluginFacade.syncFolderOnDemand(acct, 'Todo').finally(() => { settled = true; });
+      const failure = expect(waiting).rejects.toThrow(/timeout/i);
+      await vi.advanceTimersByTimeAsync(29999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/active folder sync.*timeout/i));
+      expect(mgr.onDemandSyncing.get(`${acct.id}:Todo`)).toBe(entry);
+      expect(sync).not.toHaveBeenCalled();
+      expect(mgr.pluginFacade.tryClaimFolderSync(acct.id, 'Todo')).toBe(false);
+      mgr.pluginFacade.releaseFolderSync(acct.id, 'Todo');
+      await failure;
+      await mgr.syncFolderOnDemand(acct, 'Todo');
+      expect(sync).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); vi.restoreAllMocks(); }
+  });
+
+  it('runs a fresh sync after an older claimed sync when post-copy freshness is required', async () => {
+    const mgr = new ImapManager({ clients: new Set() });
+    clearInterval(mgr._folderStatusTimer);
+    const acct = { id: 'acct-1', user_id: 'user-1', email_address: 'user@example.test' };
+    expect(mgr.pluginFacade.tryClaimFolderSync(acct.id, 'Delegated')).toBe(true);
+    const syncNow = vi.spyOn(mgr, 'syncFolderViaPool').mockResolvedValue(undefined);
+
+    const waiting = mgr.pluginFacade.syncFolderOnDemand(acct, 'Delegated', { freshAfterActive: true });
+    await Promise.resolve();
+    expect(syncNow).not.toHaveBeenCalled();
+    mgr.pluginFacade.releaseFolderSync(acct.id, 'Delegated');
+    await waiting;
+
+    expect(syncNow).toHaveBeenCalledTimes(1);
+    expect(syncNow).toHaveBeenCalledWith(acct, 'Delegated');
+  });
+});
 
 // ── ensureMailbox — provider-correct folder creation ─────────────────────────
 // The namespace matrix (no-prefix + '/', 'INBOX.' + '.') is resolved INSIDE imapflow's
@@ -722,6 +878,43 @@ describe('ensureMailbox — namespace + already-exists matrix', () => {
     const client = clientReturning(undefined);
     const res = await ensureMailbox(client, 'Reference');
     expect(res).toEqual({ path: 'Reference', created: false });
+  });
+});
+
+// ── ensureMailbox — a plain-NO already-exists on a nested name (D#751) ─────────
+// GreenMail (and other servers without RFC 5530 codes) answer a repeated CREATE with a plain NO and
+// no path. The path is then the one the CREATE asked for, spelled as imapflow spelled it: the bare
+// requested 'Reading/Later' named no folder on a '.'-delimited server, so every later COPY failed.
+describe('ensureMailbox — the path of a folder that already existed, without a code', () => {
+  const alreadyExists = () => Object.assign(new Error('Command failed'), { responseText: 'CREATE failed. Mailbox Reading.Later already exists.' });
+
+  it.each([
+    [{ prefix: '', delimiter: '.' }, 'Reading/Later', 'Reading.Later'],
+    [{ prefix: 'INBOX.', delimiter: '.' }, 'Reading/Later', 'INBOX.Reading.Later'],
+    [{ prefix: 'INBOX.', delimiter: '.' }, 'Receipt', 'INBOX.Receipt'],
+    [{ prefix: '', delimiter: '/' }, 'Reading/Later', 'Reading/Later'],
+    [{ prefix: 'INBOX.', delimiter: '.' }, 'inbox', 'INBOX'],
+  ])('namespace %j: %s is %s', async (namespace, requested, expected) => {
+    const client = { namespace, mailboxCreate: vi.fn().mockRejectedValue(alreadyExists()) };
+    expect(await ensureMailbox(client, requested)).toEqual({ path: expected, created: false });
+  });
+
+  it('then resolves the casing of that path, not of the bare name', async () => {
+    const client = {
+      namespace: { prefix: '', delimiter: '.' },
+      mailboxCreate: vi.fn().mockRejectedValue(alreadyExists()),
+      list: vi.fn().mockResolvedValue([{ path: 'INBOX' }, { path: 'Reading' }, { path: 'Reading.later' }]),
+    };
+    expect(await ensureMailbox(client, 'Reading/Later', { resolvePath: true })).toEqual({ path: 'Reading.later', created: false });
+  });
+
+  it('createdPathFor matches imapflow normalizePath for the arrays ensureMailbox hands it', async () => {
+    const { default: tools } = await import('imapflow/lib/tools.js');
+    for (const namespace of [{ prefix: '', delimiter: '.' }, { prefix: 'INBOX.', delimiter: '.' }, { prefix: '', delimiter: '/' }]) {
+      for (const name of ['Todo', 'Work/Todo', 'INBOX', 'INBOX.Todo', 'a/b/c']) {
+        expect(createdPathFor({ namespace }, name)).toBe(tools.normalizePath({ namespace }, name.split('/')));
+      }
+    }
   });
 });
 
@@ -1327,6 +1520,84 @@ describe('syncMessages — empty local cache vs nonempty server (wiring)', () =>
     expect(result).toEqual(expect.objectContaining({ insertedCount: 1 }));
   });
 
+  // A message a move dropped the row of (no new uid, #665) is filed again by this sync: it gets
+  // back what MailFlow knew and is not new mail. Any other new message still is.
+  it('gives a message filed again after a move without a new uid its kept state, and does not treat it as new', async () => {
+    const account = {
+      id: 'acct-sync-carry', user_id: 'user-1', email_address: 'me@example.com',
+      gtd_enabled: false, categorization_enabled: false, imap_host: 'imap.example.com',
+    };
+    const client = {
+      noop: vi.fn(async () => true),
+      getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      mailbox: { exists: 2, uidValidity: 100, highestModseq: 500n },
+      fetch: vi.fn(async function* () { yield { uid: 501 }; yield { uid: 502 }; }),
+    };
+    query.mockImplementation((sql, params) => {
+      if (sql.includes('SELECT uid_validity, highest_modseq FROM folders')) return Promise.resolve({ rows: [{ uid_validity: 100, highest_modseq: '500' }] });
+      if (sql.includes('COUNT(*) FILTER (WHERE is_read = false)')) return Promise.resolve({ rows: [{ n: 0 }] });
+      if (sql.includes('COALESCE(MAX(uid), 0)')) return Promise.resolve({ rows: [{ max_uid: 0 }] });
+      if (sql.includes('SELECT gtd_enabled, gtd_folders FROM email_accounts')) return Promise.resolve({ rows: [{ gtd_enabled: false, gtd_folders: {} }] });
+      if (sql.includes("preferences->>'categorizationEnabled'")) return Promise.resolve({ rows: [{ val: false }] });
+      if (sql.includes('INSERT INTO messages')) return Promise.resolve({ rows: [{ id: `row-${params[1]}`, is_new: true }] });
+      return Promise.resolve({ rows: [] });
+    });
+    const base = {
+      fromName: 'Them', fromEmail: 'them@example.com', to: [], cc: [], replyTo: [], inReplyTo: null, references: null,
+      snippet: 'hi', isStarred: false, hasAttachments: false, isBulk: false, parsedHeaders: {},
+    };
+    parseMessage
+      .mockResolvedValueOnce({ ...base, uid: 501, messageId: '<moved@x>', subject: 'Moved', date: new Date('2026-11-04T10:00:00Z'), isRead: false, flags: [] })
+      .mockResolvedValueOnce({ ...base, uid: 502, messageId: '<fresh@x>', subject: 'Fresh', date: new Date('2026-11-04T11:00:00Z'), isRead: true, flags: ['\\Seen'] });
+    clearCarries();
+    rememberDroppedRows('Archive', [{ account_id: 'acct-sync-carry', message_id: '<moved@x>', date: '2026-11-04T10:00:00Z', spam_analyzed_at: '2026-11-04T10:00:05Z', spam_user_override: 'ham', category: 'social' }]);
+    const mgr = { maybeClassifyNewMessage: vi.fn(), broadcast: vi.fn() };
+
+    const result = await ImapManager.prototype.syncMessages.call(mgr, account, client, 'Archive', 50, false, true);
+
+    expect(result).toEqual(expect.objectContaining({ insertedCount: 2 }));
+    const carry = query.mock.calls.find(([sql]) => sql.startsWith('UPDATE messages SET spam_'));
+    expect(carry).toEqual(['UPDATE messages SET spam_analyzed_at = $2, spam_user_override = $3, category = $4 WHERE id = $1', ['row-501', '2026-11-04T10:00:05Z', 'ham', 'social']]);
+    // Only the fresh message is classified; the moved one, though unread, raises no new mail.
+    expect(mgr.maybeClassifyNewMessage).toHaveBeenCalledTimes(1);
+    expect(mgr.maybeClassifyNewMessage.mock.calls[0][1]).toBe('row-502');
+    expect(mgr.broadcast.mock.calls.filter(([m]) => m?.type === 'new_messages')).toEqual([]);
+    expect(hasCarries()).toBe(false);
+  });
+
+  // A rule can move a message before its spam check lands; the re-filed copy still gets one.
+  it('still spam-checks a message filed again before it was ever analyzed', async () => {
+    const account = { id: 'acct-sync-carry2', user_id: 'user-1', email_address: 'me@example.com', gtd_enabled: false, categorization_enabled: false, imap_host: 'imap.example.com' };
+    const client = {
+      noop: vi.fn(async () => true),
+      getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      mailbox: { exists: 1, uidValidity: 100, highestModseq: 500n },
+      fetch: vi.fn(async function* () { yield { uid: 501 }; }),
+    };
+    query.mockImplementation((sql, params) => {
+      if (sql.includes('SELECT uid_validity, highest_modseq FROM folders')) return Promise.resolve({ rows: [{ uid_validity: 100, highest_modseq: '500' }] });
+      if (sql.includes('COUNT(*) FILTER (WHERE is_read = false)')) return Promise.resolve({ rows: [{ n: 0 }] });
+      if (sql.includes('COALESCE(MAX(uid), 0)')) return Promise.resolve({ rows: [{ max_uid: 0 }] });
+      if (sql.includes('SELECT gtd_enabled, gtd_folders FROM email_accounts')) return Promise.resolve({ rows: [{ gtd_enabled: false, gtd_folders: {} }] });
+      if (sql.includes('INSERT INTO messages')) return Promise.resolve({ rows: [{ id: `row-${params[1]}`, is_new: true }] });
+      return Promise.resolve({ rows: [] });
+    });
+    parseMessage.mockResolvedValueOnce({
+      uid: 501, messageId: '<early@x>', subject: 'Early', fromName: 'Them', fromEmail: 'them@example.com', to: [], cc: [], replyTo: [],
+      inReplyTo: null, references: null, date: new Date('2026-11-04T10:00:00Z'), snippet: 'hi', isRead: false, isStarred: false,
+      hasAttachments: false, flags: [], isBulk: false, parsedHeaders: {},
+    });
+    clearCarries();
+    rememberDroppedRows('Archive', [{ account_id: 'acct-sync-carry2', message_id: '<early@x>', date: '2026-11-04T10:00:00Z', spam_analyzed_at: null, category: 'social' }]);
+    const mgr = { maybeClassifyNewMessage: vi.fn(), broadcast: vi.fn() };
+
+    await ImapManager.prototype.syncMessages.call(mgr, account, client, 'Archive', 50, false, true);
+
+    expect(mgr.maybeClassifyNewMessage).toHaveBeenCalledTimes(1);
+    expect(mgr.maybeClassifyNewMessage.mock.calls[0][1]).toBe('row-501');
+    expect(mgr.broadcast.mock.calls.filter(([m]) => m?.type === 'new_messages')).toEqual([]);
+  });
+
   it('populated cache keeps the old UID-watermark behavior', async () => {
     const account = {
       id: 'acct-sync-watermark',
@@ -1365,6 +1636,48 @@ describe('syncMessages — empty local cache vs nonempty server (wiring)', () =>
       { uid: true }
     );
     expect(query.mock.calls.some(([sql]) => sql.includes('UPDATE folders SET highest_modseq'))).toBe(false);
+  });
+
+  // A read or star set elsewhere on old mail is pulled too: CHANGEDSINCE keeps the answer to what
+  // changed, so the scan covers the whole mailbox, except on a server that ignores it (iCloud).
+  describe('the flag delta scan', () => {
+    const deltaScanFor = async (account) => {
+      clearChangedSinceIgnored();
+      const client = {
+        noop: vi.fn(async () => true),
+        getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+        mailbox: { exists: 9000, uidValidity: 100, highestModseq: 500n },
+        fetch: vi.fn(async function* () {}),
+      };
+      query.mockImplementation((sql) => {
+        if (sql.includes('SELECT uid_validity, highest_modseq FROM folders')) {
+          return Promise.resolve({ rows: [{ uid_validity: 100, highest_modseq: '400' }] });
+        }
+        if (sql.includes('COUNT(*) FILTER (WHERE is_read = false)')) return Promise.resolve({ rows: [{ n: 0 }] });
+        if (sql.includes('COALESCE(MAX(uid), 0)')) return Promise.resolve({ rows: [{ max_uid: 9000 }] });
+        if (sql.includes('SELECT gtd_enabled, gtd_folders FROM email_accounts')) {
+          return Promise.resolve({ rows: [{ gtd_enabled: false, gtd_folders: {} }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
+      const mgr = { _applyFlagUpdates: vi.fn(async () => 0), broadcast: vi.fn() };
+      await ImapManager.prototype.syncMessages.call(mgr, account, client, 'Archive', 50, false, true);
+      return client.fetch.mock.calls.find(([, fields]) => fields.flags && !fields.envelope);
+    };
+    const base = {
+      user_id: 'user-1', email_address: 'me@example.com', gtd_enabled: false, categorization_enabled: false,
+    };
+
+    it('asks for every UID changed since the watermark, not only recent ones', async () => {
+      const call = await deltaScanFor({ ...base, id: 'acct-delta-gmail', imap_host: 'imap.gmail.com' });
+      expect(call[0]).toBe('1:*');
+      expect(call[2]).toEqual({ uid: true, changedSince: 400n });
+    });
+
+    it('keeps a recent window on iCloud, which ignores changedSince', async () => {
+      const call = await deltaScanFor({ ...base, id: 'acct-delta-icloud', imap_host: 'imap.mail.me.com' });
+      expect(call[0]).toBe('4001:*');
+    });
   });
 
   it('hands a newly-inserted INBOX row to the inboxIngest hook when a plugin is active', async () => {
@@ -1515,7 +1828,7 @@ describe('_syncSpamFolder — periodic spam poll guards', () => {
   it('no-ops when the account has no resolvable spam folder', async () => {
     query.mockReset();
     query.mockResolvedValue({ rows: [] }); // resolveSpamFolder finds nothing
-    const ctx = { _secondaryConnectBlocked: () => null, onDemandSyncing: new Set(), broadcast: vi.fn(), syncMessages: vi.fn() };
+    const ctx = { _secondaryConnectBlocked: () => null, onDemandSyncing: new Map(), broadcast: vi.fn(), syncMessages: vi.fn() };
     await ImapManager.prototype._syncSpamFolder.call(ctx, account);
     expect(ctx.syncMessages).not.toHaveBeenCalled();
     expect(ctx.broadcast).not.toHaveBeenCalled();
@@ -1526,7 +1839,13 @@ describe('_syncSpamFolder — periodic spam poll guards', () => {
     // resolveSpamFolder's special-use lookup (identified by its name-regex clause) yields "Junk".
     query.mockImplementation((sql) =>
       sql.includes('lower(name) ~') ? Promise.resolve({ rows: [{ path: 'Junk' }] }) : Promise.resolve({ rows: [] }));
-    const ctx = { _secondaryConnectBlocked: () => null, onDemandSyncing: new Set(['a1:Junk']), broadcast: vi.fn(), syncMessages: vi.fn() };
+    const ctx = {
+      _secondaryConnectBlocked: () => null,
+      onDemandSyncing: new Map([['a1:Junk', { promise: Promise.resolve(), release: null }]]),
+      _tryClaimFolderSync: ImapManager.prototype._tryClaimFolderSync,
+      broadcast: vi.fn(),
+      syncMessages: vi.fn(),
+    };
     await ImapManager.prototype._syncSpamFolder.call(ctx, account);
     expect(ctx.syncMessages).not.toHaveBeenCalled();
     expect(ctx.broadcast).not.toHaveBeenCalled();
@@ -2950,6 +3269,22 @@ describe('syncFolders pruning', () => {
     expect(del[1]).toEqual(['acct-1', ['Newsletter']]);
   });
 
+  it('reports the folder and thread from the returned deletion row', async () => {
+    query.mockImplementation(async sql => {
+      if (sql.includes('DELETE FROM folders')) return { rows: [{ path: 'Todo' }, { path: 'Delegated' }] };
+      if (sql.includes('DELETE FROM messages')) return { rows: [{ folder: 'Delegated', thread_key: 'a' }], rowCount: 1 };
+      return { rows: [] };
+    });
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+    try {
+      await ImapManager.prototype.syncFolders.call({}, account, { list: async () => [{ path: 'INBOX' }] });
+      expect(query.mock.calls.find(([sql]) => sql.includes('DELETE FROM messages'))[0]).toContain('RETURNING folder, thread_key');
+      expect(hook.mock.calls.filter(([name]) => name === 'messageRowsDeleted')).toEqual([
+        ['messageRowsDeleted', { account, folder: 'Delegated', threadKeys: ['a'] }],
+      ]);
+    } finally { hook.mockRestore(); }
+  });
+
   it('touches no message rows when no folder was pruned', async () => {
     query.mockImplementation(async () => ({ rows: [], rowCount: 0 }));
     const client = { list: vi.fn().mockResolvedValue([{ path: 'INBOX', name: 'INBOX', delimiter: '/' }]) };
@@ -3277,6 +3612,18 @@ describe('ensureFreshToken: a refresh that cannot succeed is remembered, not swa
     expect(refreshFailureFor('ms-9')).toBeNull();
   });
 
+  it('writes a refreshed token into the account object its caller keeps', async () => {
+    const later = new Date(Date.now() + 3600 * 1000).toISOString();
+    refreshMicrosoftToken.mockImplementationOnce(async (a) => ({
+      ...a, oauth_access_token: 'new', oauth_refresh_token: 'rotated', oauth_token_expiry: later,
+    }));
+    const held = account();
+    await ensureFreshToken(held);
+    expect(held).toMatchObject({ oauth_access_token: 'new', oauth_refresh_token: 'rotated', oauth_token_expiry: later });
+    await ensureFreshToken(held);
+    expect(refreshMicrosoftToken).toHaveBeenCalledOnce();
+  });
+
   it('forgets the failure once a refresh succeeds', async () => {
     noteRefreshFailure('ms-9', { code: 'oauth_reauth', detail: 'old' });
     refreshMicrosoftToken.mockImplementationOnce(async (a) => ({ ...a, oauth_access_token: 'new' }));
@@ -3539,7 +3886,9 @@ describe('hung IMAP transport recovery', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     query.mockReset();
-    query.mockResolvedValue({ rows: [] });
+    // The tick re-reads the account it holds: a live, enabled one here.
+    query.mockImplementation(async (sql) => (sql.startsWith('SELECT * FROM email_accounts')
+      ? { rows: [{ ...acct, enabled: true }] } : { rows: [] }));
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
   afterEach(() => {
@@ -3577,6 +3926,30 @@ describe('hung IMAP transport recovery', () => {
     expect(successor.close).not.toHaveBeenCalled();
     expect(mgr.connections.get(acct.id)).toBe(successor);
     expect(client.logout).not.toHaveBeenCalled();
+  });
+  it('applies a settings change made while connected on the next tick', async () => {
+    const { mgr } = setup();
+    const held = { ...acct, antispam_enabled: false };
+    query.mockImplementation(async (sql) => (sql.startsWith('SELECT * FROM email_accounts')
+      ? { rows: [{ ...acct, enabled: true, antispam_enabled: true }] } : { rows: [] }));
+    mgr.syncMessages = vi.fn(async (account) => { expect(account.antispam_enabled).toBe(true); return {}; });
+    await mgr._syncTick(held);
+    expect(mgr.syncMessages).toHaveBeenCalledOnce();
+    expect(held.antispam_enabled).toBe(true);
+  });
+  it('disconnects an account removed or disabled while connected, instead of syncing it', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    for (const rows of [[], [{ ...acct, enabled: false }]]) {
+      const { mgr, client } = setup();
+      query.mockImplementation(async () => ({ rows }));
+      mgr.syncIntervals.set(acct.id, setInterval(() => {}, 60000));
+      mgr.syncMessages = vi.fn();
+      await mgr._syncTick(acct);
+      expect(mgr.syncMessages).not.toHaveBeenCalled();
+      expect(client.close).toHaveBeenCalledOnce();
+      expect(mgr.connections.has(acct.id)).toBe(false);
+      expect(mgr.syncIntervals.has(acct.id)).toBe(false);
+    }
   });
   it('disconnect completes even when graceful logout would never settle', async () => {
     const { mgr, client } = setup();
@@ -3729,6 +4102,120 @@ describe('Gmail label memberships (#418)', () => {
       });
     }
   }
+  // A FETCH that names one message the server cannot produce fails as a whole (Gmail's "Some
+  // messages could not be FETCHed"). Backfill used to retry it forever at a batch of 10.
+  it('isolates a message the server refuses to hand over, skips it, and backfills the rest', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    serverUids = Array.from({ length: 30 }, (_, k) => k + 1);
+    ImapFlow.mockImplementation(function () {
+      const client = clientFor('INBOX');
+      const fetchAll = client.fetch;
+      client.fetch = vi.fn(function (range, ...rest) {
+        if (!range.includes(':') && range.split(',').map(Number).includes(17)) {
+          return (async function* () {
+            if (range) throw new Error('Some messages could not be FETCHed (Failure)');
+            yield null;
+          })();
+        }
+        return fetchAll(range, ...rest);
+      });
+      return client;
+    });
+    const pending = ImapManager.prototype.backfillMessages.call(manager(), acct, 'INBOX');
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(rows.filter(r => r.folder === 'INBOX').map(r => r.uid).sort((a, b) => a - b))
+      .toEqual(serverUids.filter(uid => uid !== 17));
+    const written = query.mock.calls.filter(([sql]) => sql.includes('INSERT INTO unfetchable_uids'));
+    expect(written.some(([, params]) => params[2].map(Number).includes(17))).toBe(true);
+  });
+  // Throttling or a dropped connection says nothing about the message a FETCH named: it must not
+  // count toward writing that message off, and a run that cannot get through ends instead.
+  // Dovecot's default for a corrupt message (imap_fetch_failure disconnect-immediately) drops the
+  // connection instead of answering NO. Every retry logs in again first, so a FETCH of one UID that
+  // keeps dropping a working connection is that message: it counts toward the write-off.
+  it('writes off a message whose FETCH drops the connection every time, and backfills the rest', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    serverUids = Array.from({ length: 30 }, (_, k) => k + 1);
+    ImapFlow.mockImplementation(function () {
+      const client = clientFor('INBOX');
+      const fetchAll = client.fetch;
+      client.fetch = vi.fn(function (range, ...rest) {
+        if (!range.includes(':') && range.split(',').map(Number).includes(17)) {
+          return (async function* () {
+            if (range) throw new Error('Connection not available');
+            yield null;
+          })();
+        }
+        return fetchAll(range, ...rest);
+      });
+      return client;
+    });
+    const pending = ImapManager.prototype.backfillMessages.call(manager(), acct, 'INBOX');
+    await vi.runAllTimersAsync();
+    await pending;
+    const written = query.mock.calls.filter(([sql]) => sql.includes('INSERT INTO unfetchable_uids'));
+    expect(written.some(([, params]) => params[2].map(Number).includes(17))).toBe(true);
+    expect(rows.filter(r => r.folder === 'INBOX').map(r => r.uid).sort((a, b) => a - b))
+      .toEqual(serverUids.filter(uid => uid !== 17));
+  });
+
+  it('writes nothing off when the failures are throttling, and ends the run', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    serverUids = Array.from({ length: 30 }, (_, k) => k + 1);
+    ImapFlow.mockImplementation(function () {
+      const client = clientFor('INBOX');
+      const fetchAll = client.fetch;
+      client.fetch = vi.fn(function (range, ...rest) {
+        if (!range.includes(':') && range.split(',').map(Number).includes(17)) {
+          return (async function* () {
+            if (range) throw new Error('NO [THROTTLED] Account exceeded command or bandwidth limits');
+            yield null;
+          })();
+        }
+        return fetchAll(range, ...rest);
+      });
+      return client;
+    });
+    const pending = ImapManager.prototype.backfillMessages.call(manager(), acct, 'INBOX');
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(query.mock.calls.some(([sql]) => sql.includes('INSERT INTO unfetchable_uids'))).toBe(false);
+    // Newest first: 30 down to 18 came in, and the run ended at 17 instead of writing it off.
+    expect(rows.filter(r => r.folder === 'INBOX').map(r => r.uid).sort((a, b) => a - b))
+      .toEqual(Array.from({ length: 13 }, (_, k) => k + 18));
+  });
+
+  it('grows the batch back after a failure streak passes', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    serverUids = Array.from({ length: 600 }, (_, k) => k + 1);
+    let failures = 3;
+    const sizes = [];
+    ImapFlow.mockImplementation(function () {
+      const client = clientFor('INBOX');
+      const fetchAll = client.fetch;
+      client.fetch = vi.fn(function (range, ...rest) {
+        if (!range.includes(':')) {
+          sizes.push(range.split(',').length);
+          if (failures-- > 0) {
+            return (async function* () { if (range) throw new Error('Connection not available'); yield null; })();
+          }
+        }
+        return fetchAll(range, ...rest);
+      });
+      return client;
+    });
+    const pending = ImapManager.prototype.backfillMessages.call(manager(), acct, 'INBOX');
+    await vi.runAllTimersAsync();
+    await pending;
+    // Three failures at 500, halved to 250, which passes; back to 500, which takes the other 350.
+    expect(sizes).toEqual([500, 500, 500, 250, 350]);
+  });
+
   it('repairs an older INBOX hole even when cached counts and maximum UID look complete', async () => {
     serverUids = [1, 2];
     rows = [{ folder: 'INBOX', uid: 2 }, { folder: 'INBOX', uid: 3 },
@@ -3849,17 +4336,34 @@ describe('folder integrity reconciliation safety', () => {
   });
   it('only removes old unguarded cached rows from a verified empty folder and checks the UID epoch in SQL', async () => {
     const { mgr } = setup([]);
+    const order = [];
     mgr._isMoveUidGuarded = (_a, _f, uid) => uid === 2;
-    query.mockResolvedValue({ rows: [{ uid: '1', synced_at: new Date(0) }, { uid: '2', synced_at: new Date(0) }, { uid: '3', synced_at: new Date(Date.now() + 60000) }], rowCount: 1 });
+    query.mockImplementation(async sql => {
+      if (sql.startsWith('SELECT uid,')) return { rows: [
+        { uid: '1', synced_at: new Date(0) }, { uid: '2', synced_at: new Date(0) },
+        { uid: '3', synced_at: new Date(Date.now() + 60000) },
+      ] };
+      if (sql.startsWith('DELETE')) return { rows: [{ thread_key: 'actual' }], rowCount: 1 };
+      if (sql.includes('UPDATE folders f')) order.push('recount');
+      return { rows: [], rowCount: 0 };
+    });
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockImplementation(async name => {
+      if (name === 'messageRowsDeleted') order.push('hook');
+      return [];
+    });
     await mgr._refreshObservedFolder(acct, 'Sent', observed);
     const deletion = query.mock.calls.find(([sql]) => sql.startsWith('DELETE'));
     expect(deletion[1][2]).toEqual([1]);
     expect(deletion[0]).toContain('uid_validity=$5');
+    expect(deletion[0]).toContain('RETURNING thread_key');
+    expect(hook).toHaveBeenCalledWith('messageRowsDeleted', { account: acct, folder: 'Sent', threadKeys: ['actual'] });
+    expect(order).toEqual(['recount', 'hook']);
   });
+
   it('backs off unresolved membership without blocking other folders or advancing a checkpoint', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const { mgr } = setup([]);
-    Object.assign(mgr, { _statusSyncBackoff: new Map(), _statusSyncRunning: new Set(), backfillRunning: new Set(), onDemandSyncing: new Set(), _secondaryConnectBlocked: () => null, _noteSecondaryRefusal: vi.fn(),
+    Object.assign(mgr, { _statusSyncBackoff: new Map(), _statusSyncRunning: new Set(), backfillRunning: new Set(), onDemandSyncing: new Map(), _secondaryConnectBlocked: () => null, _noteSecondaryRefusal: vi.fn(),
       _refreshObservedFolder: vi.fn().mockResolvedValue(false) });
     expect(mgr._queueObservedFolder(acct, 'INBOX', observed)).toBe(true);
     await new Promise(resolve => setImmediate(resolve));
@@ -3887,7 +4391,6 @@ describe('folder integrity reconciliation safety', () => {
     sem.release('host');
   });
 });
-
 
 describe('backfill optional metadata fallback', () => {
   const query = { uid: true, flags: true, envelope: true, bodyStructure: true, headers: true };
@@ -4781,6 +5284,33 @@ describe('backfill — a reconnect that cannot succeed', () => {
   });
 });
 
+// A folder the server lists as \\Noselect (a parent that only holds folders) cannot be selected,
+// so backfilling it failed on every pass. The folder query leaves those out.
+describe('backfillAllFolders — skips folders that cannot be selected', () => {
+  it('backfills INBOX and the selectable folders only', async () => {
+    const FOLDERS = [
+      { path: 'Archive', no_select: false },
+      { path: 'Reading', no_select: true },
+      { path: 'Reading.Later', no_select: false },
+    ];
+    query.mockReset().mockImplementation(async (sql) => {
+      if (/FROM folders WHERE account_id = \$1 AND path != 'INBOX'/.test(sql)) {
+        // The folder table answering this query, by its own filter.
+        return { rows: FOLDERS.filter(f => !/NOT no_select/.test(sql) || !f.no_select).map(({ path }) => ({ path })) };
+      }
+      if (/FROM email_accounts WHERE id = \$1 AND enabled/.test(sql)) return { rows: [] };
+      return { rows: [] };
+    });
+    const mgr = new ImapManager(null);
+    clearInterval(mgr._healthCheckTimer);
+    clearInterval(mgr._snippetSchedulerTimer);
+    mgr.backfillMessages = vi.fn(() => Promise.resolve());
+    mgr.broadcast = vi.fn();
+    await mgr.backfillAllFolders({ id: 'acc-ns', user_id: 'u1', imap_host: 'imap.example.com' });
+    expect(mgr.backfillMessages.mock.calls.map(([, folder]) => folder)).toEqual(['INBOX', 'Archive', 'Reading.Later']);
+  });
+});
+
 // ── Body prefetch circuit breaker (#474 follow-up) ───────────────────────────
 //
 // prefetchFolderBodies caught each failure and continued to the next UID. Every iteration
@@ -5604,8 +6134,8 @@ describe('CONDSTORE-less full sync (#495)', () => {
 // Each test uses its own account id because the pool is module-level.
 describe('secondary work over the pool (#474 round 5)', () => {
   let seq = 900;
-  function arrange({ connect } = {}) {
-    const account = { id: `acct-r5-${++seq}`, user_id: 'u1', imap_host: 'imap.mail.yahoo.com', email_address: 'y@example.test', auth_user: 'y', auth_pass: 'enc' };
+  function arrange({ connect, host = 'imap.mail.yahoo.com' } = {}) {
+    const account = { id: `acct-r5-${++seq}`, user_id: 'u1', imap_host: host, email_address: 'y@example.test', auth_user: 'y', auth_pass: 'enc' };
     ImapFlow.mockImplementation(function () {
       const client = new EventEmitter();
       client.usable = true;
@@ -5635,6 +6165,70 @@ describe('secondary work over the pool (#474 round 5)', () => {
     expect(ImapFlow).toHaveBeenCalledTimes(1);    // the second cycle reused the session
     expect(seen[1]).toBe(seen[0]);
     expect(seen[0].close).not.toHaveBeenCalled(); // still pooled, not torn down per cycle
+  });
+
+  it('zoho: folder status shares the one pooled session too, no login per cycle', async () => {
+    const { mgr, account } = arrange({ host: 'imappro.zoho.com' });
+    const seen = [];
+    await mgr._withCountClient(account, async c => { seen.push(c); });
+    await mgr._withCountClient(account, async c => { seen.push(c); });
+    expect(ImapFlow).toHaveBeenCalledTimes(1);
+    expect(seen[1]).toBe(seen[0]);
+    expect(seen[0].close).not.toHaveBeenCalled();
+  });
+
+  // The integrity pass holds the one pooled session; new INBOX mail it takes in runs the inbox
+  // rules, whose move asks the pool again. That waited for its own caller until it timed out
+  // as busy and the rule was not applied. Now it gets a one-off login.
+  it('zoho: work holding the pooled session that asks for another gets a one-off login, not a wait', async () => {
+    const { mgr, account } = arrange({ host: 'imappro.zoho.com' });
+    let outer;
+    let inner;
+    const started = Date.now();
+    await mgr._withCountClient(account, async c => {
+      outer = c;
+      await withFreshClient(account, async c2 => { inner = c2; });
+    });
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(ImapFlow).toHaveBeenCalledTimes(2);
+    expect(inner).not.toBe(outer);
+    expect(inner.close).toHaveBeenCalled();     // the one-off login is closed at once
+    expect(outer.close).not.toHaveBeenCalled(); // the pooled session stays pooled
+    // Afterwards the pool is used as before: the next request reuses the pooled session.
+    let after;
+    await withFreshClient(account, async c => { after = c; });
+    expect(after).toBe(outer);
+    expect(ImapFlow).toHaveBeenCalledTimes(2);
+  });
+
+  it('gmail: a nested request takes the second pooled session while one is free', async () => {
+    const { mgr, account } = arrange({ host: 'imap.gmail.com' });
+    let outer;
+    let inner;
+    await mgr._withCountClient(account, async c => {
+      outer = c;
+      await withFreshClient(account, async c2 => { inner = c2; });
+    });
+    expect(ImapFlow).toHaveBeenCalledTimes(2);
+    expect(inner).not.toBe(outer);
+    expect(inner.close).not.toHaveBeenCalled(); // pooled, not a one-off
+  });
+
+  it('two separate requests that do not hold the session still queue for the one pooled session', async () => {
+    const { account } = arrange({ host: 'imappro.zoho.com' });
+    let release;
+    const first = withFreshClient(account, () => new Promise(r => { release = r; }));
+    await new Promise(r => setTimeout(r, 30));
+    let second = null;
+    const queued = withFreshClient(account, async c => { second = c; });
+    await new Promise(r => setTimeout(r, 60));
+    expect(ImapFlow).toHaveBeenCalledTimes(1); // no extra login for unrelated work
+    expect(second).toBe(null);
+    release();
+    await first;
+    await queued;
+    expect(second).not.toBe(null);
+    expect(ImapFlow).toHaveBeenCalledTimes(1);
   });
 
   it('a reused pooled session does not clear the secondary ladder', async () => {
@@ -5926,6 +6520,36 @@ describe('reconcileDeletes — SEARCH result vs mailbox.exists (#472)', () => {
   }
   const deletes = () => query.mock.calls.filter(([sql]) => sql.includes('DELETE FROM messages'));
   afterEach(() => { vi.restoreAllMocks(); ImapFlow.mockReset(); });
+
+  it.each([false, true])('reports committed orphan rows after recount (recount fails: %s)', async fails => {
+    const { mgr, account } = arrange({ exists: 1, searchResult: [41], dbUids: [41, 42] });
+    clearInterval(mgr._folderStatusTimer);
+    const order = [];
+    const recountError = new Error('count update failed');
+    const originalQuery = query.getMockImplementation();
+    query.mockImplementation(async (sql, params) => {
+      if (sql.includes('DELETE FROM messages')) return { rowCount: 1, rows: [{ thread_key: 'thread-1' }] };
+      if (sql.includes('UPDATE folders f')) {
+        order.push('recount');
+        if (fails) throw recountError;
+      }
+      return originalQuery(sql, params);
+    });
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockImplementation(async name => {
+      if (name === 'messageRowsDeleted') order.push('hook');
+      return [];
+    });
+    const deletion = mgr.reconcileDeletes(account);
+    if (fails) await expect(deletion).rejects.toBe(recountError);
+    else await deletion;
+    const [sql, params] = deletes()[0];
+    expect(sql).toContain('RETURNING thread_key');
+    expect(sql).toContain('synced_at < $4');
+    expect(params[2]).toEqual([42]);
+    expect(params[3]).toBeInstanceOf(Date);
+    expect(order).toEqual(['recount', 'hook']);
+    expect(hook).toHaveBeenCalledWith('messageRowsDeleted', { account, folder: 'INBOX', threadKeys: ['thread-1'] });
+  });
 
   it('does NOT purge a folder when SEARCH returns nothing but the server says it is non-empty', async () => {
     // The reported case: 14 still on the server, SEARCH came back empty, 15 rows cached.
@@ -6389,6 +7013,103 @@ describe('server copy identity checks', () => {
     expect(await mgr.hasMessageCopy(account, 7, 'INBOX', '<invoice@example.test>')).toBe(false);
   });
 
+  it('does not delete a copied UID after the destination UID validity changes', async () => {
+    const { mgr, account, client } = arrange(new Map([[7, '<old@example.test>']]));
+    client.mailbox = { uidValidity: 43n };
+    expect(await mgr.permanentDeleteMessage(account, 7, 'Drafts', { expectUidValidity: 42n })).toBe(false);
+    expect(client.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it('requests a fresh post-copy pass for a non-UIDPLUS copy', async () => {
+    const { mgr, account, client } = arrange(new Map());
+    client.messageCopy = vi.fn().mockResolvedValue({});
+    const sync = vi.spyOn(mgr, 'syncFolderOnDemand').mockResolvedValue();
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+    try {
+      expect(await mgr.copyMessage(account.id, 7, 'INBOX', 'Todo')).toBeNull();
+      expect(sync).toHaveBeenCalledWith(account, 'Todo', { freshAfterActive: true });
+      expect(hook).toHaveBeenCalledWith('afterLabelCopy', expect.objectContaining({ destinationSync: sync.mock.results[0].value }));
+    } finally { hook.mockRestore(); }
+  });
+
+  it('passes the rejected post-copy sync to observers while logging it without blocking COPY', async () => {
+    const { mgr, account, client } = arrange(new Map());
+    clearInterval(mgr._folderStatusTimer);
+    client.messageCopy = vi.fn().mockResolvedValue({});
+    const error = new Error('destination FETCH failed');
+    const sync = vi.spyOn(mgr, 'syncFolderOnDemand').mockImplementation(() => Promise.reject(error));
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(await mgr.copyMessage(account.id, 7, 'INBOX', 'Todo')).toBeNull();
+      const destinationSync = hook.mock.calls.find(([name]) => name === 'afterLabelCopy')[1].destinationSync;
+      expect(destinationSync).toBe(sync.mock.results[0].value);
+      await expect(destinationSync).rejects.toBe(error);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('destination FETCH failed'));
+    } finally { hook.mockRestore(); warn.mockRestore(); sync.mockRestore(); }
+  });
+
+  it('rejects and compensates COPY when concurrent source removal leaves no cached destination', async () => {
+    const { mgr, account, client } = arrange(new Map());
+    clearInterval(mgr._folderStatusTimer);
+    client.messageCopy = vi.fn().mockResolvedValue({ uidValidity: 42n, uidMap: new Map([[7, 99]]) });
+    query.mockImplementation(async sql => ({ rows: sql.includes('FROM email_accounts') ? [account] : [] }));
+    const rollback = vi.spyOn(mgr, 'permanentDeleteMessage').mockResolvedValue(true);
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+    try {
+      const result = await mgr.copyMessage(account.id, 7, 'INBOX', 'Todo').catch(error => error);
+      expect(result).toBeInstanceOf(Error);
+      expect(rollback).toHaveBeenCalledWith(account, 99, 'Todo', { expectUidValidity: 42n });
+      expect(hook).not.toHaveBeenCalledWith('afterLabelCopy', expect.anything());
+    } finally { hook.mockRestore(); }
+  });
+
+  it.each([['42', 42n, true], ['41', 42n, false], ['42', undefined, false]])('accepts a cached COPY conflict only in its confirmed UID epoch (%s, %s)', async (cachedEpoch, copyEpoch, accepted) => {
+    const { mgr, account, client } = arrange(new Map());
+    clearInterval(mgr._folderStatusTimer);
+    client.messageCopy = vi.fn().mockResolvedValue({ uidValidity: copyEpoch, uidMap: new Map([[7, 99]]) });
+    query.mockImplementation(async (sql, params) => {
+      if (sql.includes('FROM email_accounts')) return { rows: [account] };
+      if (sql.includes('JOIN folders f')) return { rows: cachedEpoch === params[3] ? [{}] : [] };
+      return { rows: [] };
+    });
+    const rollback = vi.spyOn(mgr, 'permanentDeleteMessage').mockResolvedValue(true);
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await mgr.copyMessage(account.id, 7, 'INBOX', 'Todo').catch(error => error);
+      const [sql, params] = query.mock.calls.find(([sql]) => sql.includes('JOIN folders f'));
+      expect(params).toEqual([account.id, 'Todo', 99, String(copyEpoch ?? '')]);
+      for (const predicate of ['f.account_id = m.account_id', 'f.path = m.folder', 'm.account_id = $1', 'm.folder = $2', 'm.uid = $3', 'f.uid_validity::text = $4']) expect(sql).toContain(predicate);
+      if (accepted) {
+        expect(result).toBe(99);
+        expect(rollback).not.toHaveBeenCalled();
+        expect(hook).toHaveBeenCalledWith('afterLabelCopy', expect.objectContaining({ newUid: 99 }));
+      } else {
+        expect(result).toBeInstanceOf(Error);
+        if (copyEpoch == null) {
+          expect(rollback).not.toHaveBeenCalled();
+          expect(log).toHaveBeenCalledWith(expect.stringContaining('Cannot safely roll back copy'));
+        } else expect(rollback).toHaveBeenCalledWith(account, 99, 'Todo', { expectUidValidity: copyEpoch });
+        expect(hook).not.toHaveBeenCalledWith('afterLabelCopy', expect.anything());
+      }
+    } finally { hook.mockRestore(); log.mockRestore(); }
+  });
+
+  it('rolls back a server copy if inserting its local row fails', async () => {
+    const { mgr, account, client } = arrange(new Map());
+    const insertError = new Error('insert failed');
+    client.messageCopy = vi.fn().mockResolvedValue({ uidValidity: 42n, uidMap: new Map([[7, 99]]) });
+    query.mockResolvedValueOnce({ rows: [account] }).mockRejectedValueOnce(insertError);
+    const rollback = vi.spyOn(mgr, 'permanentDeleteMessage').mockResolvedValue(true);
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockResolvedValue([]);
+    try {
+      await expect(mgr.copyMessage(account.id, 7, 'INBOX', 'Todo')).rejects.toBe(insertError);
+      expect(rollback).toHaveBeenCalledWith(account, 99, 'Todo', { expectUidValidity: 42n });
+      expect(hook).not.toHaveBeenCalledWith('afterLabelCopy', expect.anything());
+    } finally { hook.mockRestore(); }
+  });
+
   it('deletes the uid when the server copy carries the expected Message-ID', async () => {
     const { mgr, account, client } = arrange(new Map([[7, '<old@example.test>']]));
     expect(await mgr.permanentDeleteMessage(account, 7, 'Drafts', { expectMessageId: '<old@example.test>' })).toBe(true);
@@ -6702,7 +7423,7 @@ describe('closeSockets', () => {
   it('waits a turn, so it also closes a socket that authenticates just after the call', async () => {
     const { sockets, ctx } = arrange();
     ImapManager.prototype.closeSockets.call(ctx, 'u1', { sessionId: 's1' });
-    // An upgrade whose session lookup was answered in the same read from Redis as the write
+    // An upgrade whose session lookup was answered in the same read from the store as the write
     // that ended the session authenticates a microtask after that write's callback.
     await Promise.resolve();
     Object.assign(sockets.authenticating, { userId: 'u1', sessionId: 's1' });
@@ -7026,5 +7747,158 @@ describe('prefetchBodyVerdict', () => {
   it('says never for a one-connection pool (Yahoo), even with that connection free', () => {
     const m = manager();
     expect(m.prefetchBodyVerdict(acct('imap.mail.yahoo.com'))).toBe('never');
+  });
+});
+
+// What ends a backfill run without counting toward writing the message off: the server limiting
+// us or in trouble. A dropped connection or a NO for that message counts.
+describe('isServerLimitFailure', () => {
+  it('knows the providers\' limit and trouble replies', () => {
+    for (const reply of [
+      'NO [LIMIT] UID FETCH Rate limit hit', 'NO [THROTTLED] Account exceeded command or bandwidth limits',
+      'NO [OVERQUOTA] Account exceeded bandwidth limits', 'Too many simultaneous connections',
+      'NO Request is throttled', 'NO [UNAVAILABLE] Temporary System Error', 'NO Temporary failure, try again',
+      'NO [AUTHENTICATIONFAILED] Invalid credentials',
+    ]) expect(isServerLimitFailure(reply), reply).toBe(true);
+  });
+  it('leaves message failures and dropped connections to count', () => {
+    for (const reply of [
+      'Some messages could not be FETCHed (Failure)', 'NO [SERVERBUG] Internal error occurred. Refer to server log for more information.',
+      'Connection not available', 'Connection closed',
+    ]) expect(isServerLimitFailure(reply), reply).toBe(false);
+  });
+});
+
+describe('snippet indexer batches (#768)', () => {
+  const plain = { type: 'text/plain' };
+  const alternative = { type: 'multipart/alternative', childNodes: [{ part: '1', type: 'text/plain' }, { part: '2', type: 'text/html' }] };
+  const mixed = { type: 'multipart/mixed', childNodes: [
+    { part: '1', type: 'multipart/alternative', childNodes: [{ part: '1.1', type: 'text/plain' }, { part: '1.2', type: 'text/html' }] },
+    { part: '2', type: 'application/pdf' },
+  ] };
+
+  // A server holding these messages. Strict, like Proton Mail Bridge's Gluon, fails the whole
+  // FETCH when any requested part is missing from any message in it; otherwise it answers
+  // with nothing for that part, as most servers do.
+  const server = (structures, { strict = false, refuse = () => false, drop = false } = {}) => {
+    const calls = [];
+    const client = {
+      fetch(range, items) {
+        calls.push({ uids: range.split(',').map(Number), parts: items.bodyParts ?? null });
+        const uids = range.split(',').map(Number);
+        return (async function* () {
+          if (drop) throw new Error('Connection not available');
+          if (items.bodyParts && (refuse(items.bodyParts) || (strict && uids.some((uid) =>
+            items.bodyParts.some((part) => !structureParts(structures[uid]).has(part)))))) {
+            throw Object.assign(new Error('Command failed'), { responseStatus: 'NO', responseText: 'no such parts exists' });
+          }
+          for (const uid of uids) {
+            const have = structureParts(structures[uid]);
+            yield { uid, bodyStructure: structures[uid],
+              ...(items.bodyParts ? { bodyParts: new Map(items.bodyParts.map((part) => [part, have.has(part) ? Buffer.from(`${uid}:${part}`) : null])) } : {}) };
+          }
+        })();
+      },
+    };
+    return { client, calls };
+  };
+  const collect = () => { const seen = []; return { seen, onMessage: async (msg) => { seen.push(msg); } }; };
+
+  it('numbers a single-part body 1 and lists every part of a multipart', () => {
+    expect([...structureParts(plain)]).toEqual(['1']);
+    expect([...structureParts(alternative)]).toEqual(['1', '2']);
+    expect([...structureParts(mixed)].sort()).toEqual(['1', '1.1', '1.2', '2']);
+    expect([...structureParts(undefined)]).toEqual(['1']);
+  });
+
+  it('asks once with the guessed parts where the server tolerates missing ones', async () => {
+    const { client, calls } = server({ 1: plain, 2: mixed });
+    const { seen, onMessage } = collect();
+    expect(await fetchSnippetBatch(client, [1, 2], onMessage)).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(seen.map((m) => m.uid)).toEqual([1, 2]);
+  });
+
+  it('on a Bridge-style refusal reads the structure and asks each message only for parts it has', async () => {
+    const { client, calls } = server({ 1: plain, 2: alternative, 3: plain, 4: mixed }, { strict: true });
+    const { seen, onMessage } = collect();
+    expect(await fetchSnippetBatch(client, [1, 2, 3, 4], onMessage)).toBe(true);
+    expect(seen.map((m) => m.uid).sort()).toEqual([1, 2, 3, 4]);
+    for (const msg of seen) {
+      const have = structureParts(msg.bodyStructure);
+      expect([...msg.bodyParts.keys()].every((part) => have.has(part)), `uid ${msg.uid}`).toBe(true);
+      expect(msg.bodyParts.get('1')?.length, `uid ${msg.uid}`).toBeGreaterThan(0);
+    }
+    // The refused guess, one structure read, then one FETCH per distinct set of parts.
+    expect(calls.map((c) => c.parts?.join(' ') ?? null)).toEqual([
+      '1 1.1 1.2 2 2.1 2.2 1.1.1 1.2.1', null, '1', '1 2', '1 1.1 1.2 2',
+    ]);
+    expect(calls[2].uids).toEqual([1, 3]);
+  });
+
+  it('skips the guess once the account is known to refuse it', async () => {
+    const { client, calls } = server({ 1: plain, 2: alternative }, { strict: true });
+    const { seen, onMessage } = collect();
+    expect(await fetchSnippetBatch(client, [1, 2], onMessage, { structureFirst: true })).toBe(false);
+    expect(calls[0].parts).toBe(null);
+    expect(seen.map((m) => m.uid).sort()).toEqual([1, 2]);
+  });
+
+  it('skips a set of parts the server still refuses instead of failing the batch', async () => {
+    const { client } = server({ 1: plain, 2: alternative }, { strict: true, refuse: (parts) => parts.includes('2') });
+    const { seen, onMessage } = collect();
+    expect(await fetchSnippetBatch(client, [1, 2], onMessage)).toBe(true);
+    expect(seen.map((m) => m.uid)).toEqual([1]);
+  });
+
+  it('still throws when the connection breaks, so the indexer reconnects', async () => {
+    const { client } = server({ 1: plain }, { drop: true });
+    await expect(fetchSnippetBatch(client, [1], async () => {})).rejects.toThrow('Connection not available');
+    await expect(fetchSnippetBatch(client, [1], async () => {}, { structureFirst: true })).rejects.toThrow('Connection not available');
+  });
+});
+
+describe('UIDVALIDITY purge notifications', () => {
+  afterEach(() => vi.restoreAllMocks());
+  it.each(['sync', 'backfill'])('%s reports returned thread keys after recounting the purged folder', async mode => {
+    const acct = { ...baseAccount, id: `purge-${mode}`, user_id: 'fixture-user', enabled: true };
+    const client = Object.assign(new EventEmitter(), {
+      usable: true, connect: vi.fn().mockResolvedValue(), close: vi.fn(),
+      noop: vi.fn().mockResolvedValue(), logout: vi.fn().mockResolvedValue(),
+      mailbox: { exists: 1, uidValidity: 8n },
+      getMailboxLock: vi.fn().mockResolvedValue({ release: vi.fn() }),
+      search: vi.fn().mockResolvedValue([]), fetch: async function* () {},
+    });
+    ImapFlow.mockImplementation(function () { return client; });
+    getConnectionPolicy.mockResolvedValue({ allowPrivateHosts: true, allowInsecureTls: true });
+    resolveForConnection.mockResolvedValue({ host: '127.0.0.1', addresses: ['127.0.0.1'], servername: null });
+    const order = [];
+    query.mockReset().mockImplementation(async sql => {
+      if (sql.includes('UPDATE folders f')) order.push('recount');
+      if (sql.includes('FROM email_accounts')) return { rows: [acct] };
+      if (sql.includes('COUNT(') || sql.includes('MAX(uid)')) return { rows: [{ n: '0', count: '0', max_uid: 0 }] };
+      if (sql.includes('SELECT uid_validity')) return { rows: [{ uid_validity: '7' }] };
+      if (sql.startsWith('DELETE FROM messages')) return { rowCount: 1, rows: [{ thread_key: 'removed' }] };
+      return { rows: [], rowCount: 0 };
+    });
+    const hook = vi.spyOn(pluginRegistry, 'runHook').mockImplementation(async name => {
+      if (name === 'messageRowsDeleted') order.push('hook');
+      return [];
+    });
+    const mgr = new ImapManager({ clients: new Set() });
+    clearInterval(mgr._folderStatusTimer);
+    vi.spyOn(mgr, 'broadcast').mockImplementation(() => {});
+    if (mode === 'sync') {
+      vi.spyOn(mgr, 'backfillMessages').mockResolvedValue();
+      try {
+        await mgr.syncMessages(acct, client, 'Todo', 20, false);
+      } finally {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      expect(mgr.backfillMessages).toHaveBeenCalledOnce();
+    } else await mgr.backfillMessages(acct, 'Todo');
+    if (mode === 'sync') expect(order.slice(0, 2)).toEqual(['recount', 'hook']);
+    expect(hook).toHaveBeenCalledWith('messageRowsDeleted', { account: acct, folder: 'Todo', threadKeys: ['removed'] });
+    expect(query.mock.calls.find(([sql]) => sql.startsWith('DELETE FROM messages'))[0]).toContain('RETURNING thread_key');
   });
 });
